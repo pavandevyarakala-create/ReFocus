@@ -1,0 +1,4 @@
+- `[x]` Fix YouTube Caption Expansion (Zero the 1500ms window)
+- `[x]` Fix Instagram Forward-Snap False Increment
+- `[x]` Hunt for additional User-Perspective Bugs (Ads, Overlays, etc)
+- `[x]` Write counter_production_hardening_final.md

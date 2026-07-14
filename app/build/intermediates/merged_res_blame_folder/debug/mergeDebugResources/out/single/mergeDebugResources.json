@@ -1,0 +1,6 @@
+[
+    {
+        "merged": "com.reeltrak.app-debug-60:/xml_accessibility_service_config.xml.flat",
+        "source": "com.reeltrak.app-main-62:/xml/accessibility_service_config.xml"
+    }
+]
