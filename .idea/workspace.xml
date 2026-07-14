@@ -4,7 +4,47 @@
     <option name="autoReloadType" value="NONE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="fa4532cf-7715-4827-9663-b5af4bfc2595" name="Changes" comment="" />
+    <list default="true" id="fa4532cf-7715-4827-9663-b5af4bfc2595" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/apk_counter_parity_final.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/brainpal_evidence_audit.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/brainpal_reverse_engineering_report.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/caption_expansion_structural_analysis.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/counter_debug_logging_system.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/counter_production_hardening_final.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/counter_stability_restoration.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/double_increment_root_cause.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/duplicate_commit_forensics.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/dynamic_reverse_engineering_plan.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/engagement_filter_final.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/execution_pipeline_audit.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/fast_scroll_double_increment_root_cause.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/final_increment_commit_barrier.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/final_production_bug_fixes.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/final_production_bugfix_implementation.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/implementation_plan.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_apk_behavioral_map.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_apk_delay_experiment.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_hybrid_transition_feasibility.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_phase3_migration.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_remaining_production_forensics.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/instagram_unified_safe_migration.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/interaction_false_increment_forensics.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/potential_missed_reels_root_cause_analysis.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/production_architecture_redesign.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/production_counter_release_audit.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/production_stability_patch.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/rare_edge_case_missed_reels_analysis.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/remaining_production_bug_verification.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/remaining_production_bugs.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scroll_event_origin_verification.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/state_sync_implementation.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/task.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/unified_transition_engine_feasibility.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/ux_performance_optimization_audit.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/verified_engagement_node_catalog.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/youtube_initial_session_false_increment.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/youtube_vs_instagram_complete_pipeline_forensics.md" beforeDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -36,6 +76,9 @@
       </state>
     </system>
   </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 3,
   &quot;fromUser&quot;: false
@@ -56,6 +99,7 @@
     "cf.first.check.clang-format": "false",
     "cidr.known.project.marker": "true",
     "dart.analysis.tool.window.visible": "false",
+    "git-widget-placeholder": "main",
     "kotlin-language-version-configured": "true",
     "last_opened_file_path": "C:/Users/pavan/OneDrive/Documents/REEL",
     "settings.editor.selected.configurable": "templates.modelproviders.configurable",
