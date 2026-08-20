@@ -6,56 +6,61 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.reeltrak.app.data.local.dao.DailyStatisticsDao
-import com.reeltrak.app.data.local.dao.GlobalStatisticsDao
-import com.reeltrak.app.data.local.entity.DailyStatisticsEntity
+import com.reeltrak.app.data.local.dao.DailyReelDataDao
+import com.reeltrak.app.data.local.entity.DailyReelData
+import com.reeltrak.app.data.local.entity.SessionData
 import com.reeltrak.app.domain.repository.PreferencesRepository
+import com.reeltrak.app.services.notifications.ReelNotificationManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import javax.inject.Inject
 import javax.inject.Singleton
+
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import com.reeltrak.app.core.sync.SyncManager
 
 @Singleton
 class DayManager @Inject constructor(
     @ApplicationContext private val context: Context,
-    private val dailyStatisticsDao: DailyStatisticsDao,
-    private val globalStatisticsDao: GlobalStatisticsDao,
-    private val preferencesRepository: PreferencesRepository
+    private val dailyReelDataDao: DailyReelDataDao,
+    private val preferencesRepository: PreferencesRepository,
+    private val notificationManager: ReelNotificationManager,
+    private val syncManager: SyncManager
 ) {
     private val exceptionHandler = CoroutineExceptionHandler { _, exception ->
         Log.e("DayManager", "Coroutine persistence failed: ${exception.message}", exception)
     }
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + exceptionHandler)
     
-    // Core state: The current system epoch day.
-    private val _currentEpochDay = MutableStateFlow(getCurrentSystemEpochDay())
-    val currentEpochDay: StateFlow<Long> = _currentEpochDay.asStateFlow()
+    // Core state: The current system date string YYYY-MM-DD.
+    private val _currentDateString = MutableStateFlow(getCurrentDateString())
+    val currentDateString: StateFlow<String> = _currentDateString.asStateFlow()
 
     // Core state: The loaded database row for the current day.
-    private val _currentDayStats = MutableStateFlow<DailyStatisticsEntity?>(null)
-    val currentDayStats: StateFlow<DailyStatisticsEntity?> = _currentDayStats.asStateFlow()
+    private val _currentDayStats = MutableStateFlow<DailyReelData?>(null)
+    val currentDayStats: StateFlow<DailyReelData?> = _currentDayStats.asStateFlow()
 
     private var isInitialized = false
-    private val lock = Any()
+    private var isRestoring = false
+    private val actionMutex = Mutex()
 
     init {
         setupBroadcastReceiver()
         managerScope.launch {
-            // Re-evaluate whenever the day changes
-            _currentEpochDay.collect { epochDay ->
-                loadOrCreateDay(epochDay)
+            _currentDateString.collect { dateStr ->
+                loadOrCreateDay(dateStr)
             }
         }
-        
-        // Only listen for date changes now. We do NOT listen to the global daily intent preference
-        // because each day manages its own independent goal state.
-        // setDailyGoal() already manually handles saving to both when a goal is explicitly set.
     }
 
-    private fun getCurrentSystemEpochDay(): Long {
-        return LocalDate.now().toEpochDay()
+    private fun getCurrentDateString(): String {
+        return LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE) // YYYY-MM-DD
     }
 
     private fun setupBroadcastReceiver() {
@@ -72,115 +77,213 @@ class DayManager @Inject constructor(
         ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
     }
 
-    /**
-     * Call this when resuming the app or from watchdog/services to ensure
-     * we haven't missed a day transition.
-     */
     fun checkDayTransition() {
-        val today = getCurrentSystemEpochDay()
-        val currentStoredDay = _currentEpochDay.value
-        
-        if (today > currentStoredDay) {
-            Log.i("DayManager", "MIDNIGHT(S) DETECTED: Finalizing days from $currentStoredDay to ${today - 1}")
-            managerScope.launch {
-                // Loop through every missed day (including the one that just ended)
-                for (epoch in currentStoredDay until today) {
-                    finalizeDay(epoch)
+        managerScope.launch {
+            actionMutex.withLock {
+                val todayStr = getCurrentDateString()
+                val currentStoredStr = _currentDateString.value
+                
+                if (todayStr != currentStoredStr) {
+                    Log.i("DayManager", "DATE CHANGED: $currentStoredStr to $todayStr")
+                    // Final End-Of-Day Sync for yesterday
+                    _currentDayStats.value?.let { 
+                        dailyReelDataDao.insertOrReplace(it)
+                    }
+                    syncManager.backupSpecificDay(currentStoredStr)
+                    
+                    _currentDateString.value = todayStr
+                    loadOrCreateDayLocked(todayStr)
                 }
             }
-            // Transition to new day
-            _currentEpochDay.value = today
-        } else if (today < currentStoredDay) {
-            Log.w("DayManager", "BACKWARD TIME TRAVEL DETECTED: Moving from $currentStoredDay back to $today.")
-            _currentEpochDay.value = today
         }
     }
 
-    private suspend fun finalizeDay(epochDay: Long) {
-        val stats = dailyStatisticsDao.getStatisticsForDate(epochDay)
-        val todayReels = stats?.totalReelsScrolled ?: 0
+    private fun checkMilestones(stats: DailyReelData) {
+        val goal = stats.dailyGoal
+        if (goal <= 0) return
         
-        // 1. Update Daily Stats (Performance indicators for the heatmap)
-        if (stats != null && stats.dailyGoal > 0) {
-            val percentage = (todayReels.toFloat() / stats.dailyGoal.toFloat()) * 100f
-            val level = when {
-                percentage <= 50f -> 1 // Dark Green
-                percentage <= 85f -> 2 // Medium Green
-                percentage <= 100f -> 3 // Soft Red
-                percentage <= 117f -> 4 // Medium Red
-                else -> 5 // Medium Dark Red
-            }
-            dailyStatisticsDao.finalizeDay(epochDay, percentage, level)
+        val count = stats.totalReelsCount
+        
+        when (count) {
+            goal -> notificationManager.showLimitReachedNotification()
+            (goal * 0.90f).toInt() -> notificationManager.showProgressMilestoneNotification(90, goal - count)
+            (goal * 0.75f).toInt() -> notificationManager.showProgressMilestoneNotification(75, goal - count)
+            (goal * 0.50f).toInt() -> notificationManager.showProgressMilestoneNotification(50, goal - count)
+            (goal * 0.25f).toInt() -> notificationManager.showProgressMilestoneNotification(25, goal - count)
         }
-        
-        // 2. Update Global Stats (Atomic update for Lifetime Reels + Completed Days)
-        globalStatisticsDao.incrementCompletedDay(todayReels)
-        
-        Log.d("DayManager", "Finalized day $epochDay: reels=$todayReels")
     }
 
-    private suspend fun loadOrCreateDay(epochDay: Long) {
-        synchronized(lock) {
-            // Pre-emptively clear current stats while loading
-            _currentDayStats.value = null
+    private suspend fun loadOrCreateDay(dateStr: String) {
+        actionMutex.withLock {
+            loadOrCreateDayLocked(dateStr)
         }
+    }
+    
+    private suspend fun loadOrCreateDayLocked(dateStr: String) {
+        _currentDayStats.value = null
         
-        var stats = dailyStatisticsDao.getStatisticsForDate(epochDay)
+        var stats = dailyReelDataDao.getDailyDataSync(dateStr)
         if (stats == null) {
-            stats = DailyStatisticsEntity(
-                dateEpochDay = epochDay,
-                totalReelsScrolled = 0,
-                dailyGoal = -1, // -1 explicitly indicates no goal set for today
-                lastUpdated = System.currentTimeMillis()
+            val lastStats = dailyReelDataDao.getLatestDailyDataSync()
+            val carryOverLimit = lastStats?.dailyGoal ?: preferencesRepository.defaultDailyLimit.first()
+            val carryOverStrictMode = lastStats?.isStrictModeOn ?: false
+            stats = DailyReelData(
+                dateString = dateStr,
+                totalReelsCount = 0,
+                dailyGoal = carryOverLimit,
+                isLimitLocked = false,
+                isStrictModeOn = carryOverStrictMode,
+                isStrictModeLocked = false,
+                updatedAt = System.currentTimeMillis()
             )
-            dailyStatisticsDao.insert(stats)
-            Log.d("DayManager", "Created new day row for $epochDay with goal -1 (Not Set)")
+            dailyReelDataDao.insertOrReplace(stats)
+            Log.d("DayManager", "Created new day row for $dateStr with goal $carryOverLimit")
         } else {
-            Log.d("DayManager", "Loaded existing day row for $epochDay with count ${stats.totalReelsScrolled}")
+            Log.d("DayManager", "Loaded existing day row for $dateStr with count ${stats.totalReelsCount}")
         }
         
         _currentDayStats.value = stats
         isInitialized = true
     }
 
-    /**
-     * Sets the goal for the CURRENT active day and persists it to preferences.
-     */
-    fun setDailyGoal(goal: Int) {
-        managerScope.launch {
-            val today = _currentEpochDay.value
-            
-            // 1. Save to preferences so it becomes the default for future days
-            preferencesRepository.setDailyIntent(goal)
-            preferencesRepository.setGoalSetDate(today)
-            
-            // 2. Update the DB for today
-            dailyStatisticsDao.updateGoal(today, goal)
-            
-            // 3. Reflect instantly in current memory
-            _currentDayStats.update { it?.copy(dailyGoal = goal) }
+    fun setRestoring(restoring: Boolean) {
+        isRestoring = restoring
+        if (!restoring) {
+            Log.d("DayManager", "Restore finished. Refreshing memory from DB.")
+            managerScope.launch {
+                loadOrCreateDay(_currentDateString.value)
+            }
         }
     }
 
-    /**
-     * Increments the reel count for the CURRENT active day.
-     */
-    fun incrementReelCount(amount: Int = 1) {
-        checkDayTransition() // Ensure we're on the right day before incrementing
-        val today = _currentEpochDay.value
-        val now = System.currentTimeMillis()
-        
-        // 1. Reflect instantly in current memory (optimistic update - completely synchronous for 0ms UI latency)
-        _currentDayStats.update { 
-            it?.copy(
-                totalReelsScrolled = it.totalReelsScrolled + amount,
-                lastUpdated = now
-            ) 
+    fun setDailyGoal(goal: Int) {
+        if (isRestoring) return
+        managerScope.launch {
+            actionMutex.withLock {
+                val currentStats = _currentDayStats.value ?: return@withLock
+                if (currentStats.isLimitLocked) {
+                    Log.d("DayManager", "Limit change rejected. Already locked for today.")
+                    return@withLock
+                }
+
+                // 1. Save to preferences so it becomes the default for future days if needed
+                preferencesRepository.setDailyIntent(goal)
+                preferencesRepository.setDefaultDailyLimit(goal)
+                // Storing current epoch day for legacy logic if needed
+                val todayEpoch = LocalDate.now().toEpochDay()
+                preferencesRepository.setGoalSetDate(todayEpoch)
+                preferencesRepository.setLastLimitChangeDate(todayEpoch)
+                
+                // 2. Update the DB for today and lock the limit
+                val updatedStats = currentStats.copy(
+                    dailyGoal = goal, 
+                    isLimitLocked = true,
+                    updatedAt = System.currentTimeMillis()
+                )
+                dailyReelDataDao.insertOrReplace(updatedStats)
+                _currentDayStats.value = updatedStats
+            }
         }
+    }
+
+    fun incrementReelCount(amount: Int = 1) {
+        if (isRestoring) return
         
         managerScope.launch {
-            // 2. Update DB asynchronously
-            dailyStatisticsDao.incrementCount(today, amount, now)
+            actionMutex.withLock {
+                val todayStr = getCurrentDateString()
+                val currentStoredStr = _currentDateString.value
+                
+                if (todayStr != currentStoredStr) {
+                    Log.i("DayManager", "MIDNIGHT SCROLL DETECTED: $currentStoredStr to $todayStr")
+                    // Final End-Of-Day Sync for yesterday
+                    _currentDayStats.value?.let { 
+                        dailyReelDataDao.insertOrReplace(it)
+                    }
+                    syncManager.backupSpecificDay(currentStoredStr)
+                    
+                    _currentDateString.value = todayStr
+                    loadOrCreateDayLocked(todayStr)
+                }
+                
+                val now = System.currentTimeMillis()
+                val currentStats = _currentDayStats.value ?: return@withLock
+                
+                val updated = currentStats.copy(
+                    totalReelsCount = currentStats.totalReelsCount + amount,
+                    updatedAt = now
+                )
+                
+                _currentDayStats.value = updated
+                checkMilestones(updated)
+                
+                dailyReelDataDao.insertOrReplace(updated)
+                // Real-time syncManager.backupToCloud() removed
+            }
+        }
+    }
+
+    fun appendSession(sessionData: SessionData) {
+        if (isRestoring) return
+        
+        managerScope.launch {
+            actionMutex.withLock {
+                val todayStr = getCurrentDateString()
+                val currentStoredStr = _currentDateString.value
+                
+                if (todayStr != currentStoredStr) {
+                    Log.i("DayManager", "MIDNIGHT SESSION DETECTED: $currentStoredStr to $todayStr")
+                    // Final End-Of-Day Sync for yesterday
+                    _currentDayStats.value?.let { 
+                        dailyReelDataDao.insertOrReplace(it)
+                    }
+                    syncManager.backupSpecificDay(currentStoredStr)
+                    
+                    _currentDateString.value = todayStr
+                    loadOrCreateDayLocked(todayStr)
+                }
+                
+                val now = System.currentTimeMillis()
+                val currentStats = _currentDayStats.value ?: return@withLock
+                
+                val updatedSessions = currentStats.sessions.toMutableList()
+                updatedSessions.add(sessionData)
+                val addedTime = sessionData.endTimeStamp - sessionData.startTimeStamp
+                
+                val updated = currentStats.copy(
+                    sessions = updatedSessions,
+                    totalTimeSpentMillis = currentStats.totalTimeSpentMillis + addedTime,
+                    updatedAt = now
+                )
+                
+                _currentDayStats.value = updated
+                dailyReelDataDao.insertOrReplace(updated)
+                // Real-time syncManager.backupToCloud() removed
+            }
+        }
+    }
+
+    fun setStrictMode(enabled: Boolean) {
+        if (isRestoring) return
+        
+        managerScope.launch {
+            actionMutex.withLock {
+                val currentStats = _currentDayStats.value ?: return@withLock
+                
+                if (currentStats.isStrictModeLocked) {
+                    Log.d("DayManager", "Strict Mode change rejected. Already locked for today.")
+                    return@withLock
+                }
+
+                val updated = currentStats.copy(
+                    isStrictModeOn = enabled,
+                    isStrictModeLocked = enabled, // One-Way Lock: Lock it immediately if turned ON
+                    updatedAt = System.currentTimeMillis()
+                )
+                
+                _currentDayStats.value = updated
+                dailyReelDataDao.insertOrReplace(updated)
+            }
         }
     }
 }

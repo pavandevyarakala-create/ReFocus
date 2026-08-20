@@ -1,0 +1,24 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Three Frosted Silver Vertical Pills -->
+    <path
+        android:fillColor="#E0E0E0"
+        android:pathData="M 39,37 L 39,71 A 5,5 0 0 1 29,71 L 29,37 A 5,5 0 0 1 39,37 Z" />
+    <path
+        android:fillColor="#E0E0E0"
+        android:pathData="M 59,37 L 59,71 A 5,5 0 0 1 49,71 L 49,37 A 5,5 0 0 1 59,37 Z" />
+    <path
+        android:fillColor="#E0E0E0"
+        android:pathData="M 79,37 L 79,71 A 5,5 0 0 1 69,71 L 69,37 A 5,5 0 0 1 79,37 Z" />
+
+    <!-- Indigo Blue Diagonal Tally Slash (Shortened) -->
+    <group android:rotation="45" android:pivotX="54" android:pivotY="54">
+        <path
+            android:fillColor="#6366F1"
+            android:pathData="M 30,49 L 78,49 A 5,5 0 0 1 78,59 L 30,59 A 5,5 0 0 1 30,49 Z" />
+    </group>
+</vector>

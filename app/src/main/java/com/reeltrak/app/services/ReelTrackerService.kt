@@ -3,7 +3,6 @@ package com.reeltrak.app.services
 import android.accessibilityservice.AccessibilityService
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
-import android.widget.Toast
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -11,10 +10,8 @@ import android.content.IntentFilter
 import android.os.PowerManager
 import android.app.KeyguardManager
 import androidx.core.content.ContextCompat
-import com.reeltrak.app.data.local.dao.SessionDao
-import com.reeltrak.app.data.local.entity.SessionEntity
+import com.reeltrak.app.data.local.entity.SessionData
 import com.reeltrak.app.domain.repository.PreferencesRepository
-import com.reeltrak.app.data.local.dao.DailyStatisticsDao
 import com.reeltrak.app.services.overlay.OverlayStateManager
 
 import com.reeltrak.app.services.tracking.SessionManager
@@ -23,8 +20,6 @@ import com.reeltrak.app.services.tracking.engine.detector.InstagramDetectorV2
 import com.reeltrak.app.services.tracking.engine.detector.YouTubeDetectorV2
 import com.reeltrak.app.services.tracking.engine.state.TransitionLedger
 import com.reeltrak.app.services.tracking.engine.core.IReelDetector
-import com.reeltrak.app.services.tracking.engine.model.DetectionSnapshot
-import com.reeltrak.app.services.tracking.engine.model.SnapshotClassification
 import com.reeltrak.app.services.accessibility.snapshot.DirectionStateManager
 import com.reeltrak.app.services.accessibility.snapshot.ScrollDirection
 import java.util.UUID
@@ -38,16 +33,13 @@ import javax.inject.Inject
 class ReelTrackerService : AccessibilityService() {
 
     @Inject
-    lateinit var sessionDao: SessionDao
-
-    @Inject
     lateinit var preferencesRepository: PreferencesRepository
 
     @Inject
-    lateinit var dailyStatisticsDao: DailyStatisticsDao
+    lateinit var dayManager: com.reeltrak.app.services.tracking.DayManager
 
     @Inject
-    lateinit var dayManager: com.reeltrak.app.services.tracking.DayManager
+    lateinit var syncManager: com.reeltrak.app.core.sync.SyncManager
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val processingChannel = kotlinx.coroutines.channels.Channel<Long>(capacity = 64, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
@@ -81,13 +73,15 @@ class ReelTrackerService : AccessibilityService() {
 
     private var lastScrollFromIndex = -1
     private var wasOverlayOpenLastFrame = false
-    private var watchTimerJob: Job? = null
 
     private var lastEventProcessingTime = 0L
     private val EVENT_DEBOUNCE_MS = 50L
     private var lastProcessedEpochDay = -1L
     private var lastStrictKickTime = 0L
     
+    private var isStrictModeEnabledCached = false
+    private var isStrictModeEnforcedInCurrentSession = false
+
     // Debug Harness
     // (Legacy debug variables removed for V2 Engine)
     private val debugReceiver = object : BroadcastReceiver() {
@@ -200,52 +194,34 @@ class ReelTrackerService : AccessibilityService() {
         
         // --- Unified Day & Stats Sync ---
         serviceScope.launch {
-            combine(
-                dayManager.currentEpochDay,
-                dayManager.currentDayStats
-            ) { today, stats ->
-                today to stats
-            }
-            .distinctUntilChanged()
-            .collect { (today, stats) ->
+            dayManager.currentDayStats.filterNotNull().collect { stats ->
                 pipelineMutex.withLock {
                     overlayStateManager.updateState { currentState ->
-                        var nextState = currentState.copy(currentDateEpochDay = today)
-                        
-                        // PARITY CHECK: Only update count if the stats belong to the currently active day.
-                        // This prevents "New Day + Old Stats" race conditions during midnight transitions.
-                        if (stats != null && stats.dateEpochDay == today) {
-                            val totalToday = stats.totalReelsScrolled
-                            val currentGoal = stats.dailyGoal
-                            nextState = nextState.copy(
-                                count = totalToday,
-                                isOverLimit = (currentGoal > 0 && totalToday > currentGoal),
-                                dailyGoal = currentGoal
-                            )
-                        } else {
-                            // Transient state or new day loading: Safely reset to 0/Not Set.
-                            nextState = nextState.copy(
-                                count = 0,
-                                isOverLimit = false,
-                                dailyGoal = -1
-                            )
-                        }
-                        nextState
+                        val totalToday = stats.totalReelsCount
+                        val currentGoal = stats.dailyGoal
+                        currentState.copy(
+                            count = totalToday,
+                            isOverLimit = (currentGoal > 0 && totalToday > currentGoal),
+                            dailyGoal = currentGoal
+                        )
                     }
                     
-                    if (lastProcessedEpochDay != -1L && today > lastProcessedEpochDay) {
+                    val dateStr = stats.dateString
+                    val lastDateStr = lastProcessedEpochDay.toString() // just for checking if date changed
+                    if (lastProcessedEpochDay != -1L && dateStr != lastDateStr) {
                          saveSessionToDb()
                          sessionManager.resetSessionCount()
                     }
-                    lastProcessedEpochDay = today
+                    // Hacky way to store string state in Long just for tracking changes
+                    lastProcessedEpochDay = dateStr.hashCode().toLong()
                 }
             }
         }
 
         // Observe Strict Mode preference
         serviceScope.launch {
-            preferencesRepository.isStrictModeEnabled.collect { isEnabled ->
-                overlayStateManager.updateState { it.copy(isStrictModeEnabled = isEnabled) }
+            dayManager.currentDayStats.collect { stats ->
+                isStrictModeEnabledCached = stats?.isStrictModeOn ?: false
             }
         }
 
@@ -289,6 +265,7 @@ class ReelTrackerService : AccessibilityService() {
         Log.d("OverlayDebug", "OverlayService started (onServiceConnected)")
     }
     
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         Log.e("PipelineAudit", "1. onAccessibilityEvent received")
         if (event == null) return
@@ -382,10 +359,8 @@ class ReelTrackerService : AccessibilityService() {
             // Lifecycle 2: V3 Engine Pipeline
             val detector = detectors.find { it.supports(activePackage) }
             if (detector != null) {
-                Log.e("PipelineAudit", "6. Detector invoked")
-                // Perform single-pass BFS analysis - Expensive IPC-heavy UI traversal
+                // Performing BFS analysis
                 val snapshot = detector.analyze(rootNode)
-                Log.e("PipelineAudit", "7. Detector returned")
                 
                 pipelineMutex.withLock {
                     // --- VISIBILITY HARDENING: Internal Overlay Logic ---
@@ -424,9 +399,13 @@ class ReelTrackerService : AccessibilityService() {
                     )
                     
                     // --- Strict Mode Enforcement ---
-                    val currentState = overlayStateManager.state.value
-                    if (currentState.isStrictModeEnabled && currentState.isOverLimit && isActiveScreen) {
-                        enforceStrictMode()
+                    val stateVal = overlayStateManager.state.value
+                    if (isStrictModeEnforcedInCurrentSession && stateVal.dailyGoal > 0 && stateVal.count >= stateVal.dailyGoal) {
+                        // Only enforce if we have positively detected a Reel or Short.
+                        // This allows users to use Feed, DMs, Stories, and Normal Videos while Strict Mode is on.
+                        if (snapshot.isCommitted || snapshot.isPending) {
+                            enforceStrictMode()
+                        }
                     }
                     
                     // 4. Drive the Transition Ledger
@@ -472,13 +451,13 @@ class ReelTrackerService : AccessibilityService() {
         lastStrictKickTime = now
 
         serviceScope.launch(Dispatchers.Main) {
-            Toast.makeText(
+            android.widget.Toast.makeText(
                 this@ReelTrackerService,
                 "Daily Reel limit reached. Strict Mode is active.",
-                Toast.LENGTH_LONG
+                android.widget.Toast.LENGTH_LONG
             ).show()
             
-            performGlobalAction(GLOBAL_ACTION_HOME)
+            performGlobalAction(GLOBAL_ACTION_BACK)
         }
     }
 
@@ -487,10 +466,6 @@ class ReelTrackerService : AccessibilityService() {
         sessionManager.incrementReel()
         dayManager.incrementReelCount(1)
         Log.d("PipelineAudit", "incrementProductionCount called. New reelsCount=${sessionManager.reelsCount}")
-        
-        // Single source of truth: 
-        // We no longer optimistically update overlayStateManager.count here.
-        // The count will be updated via the dayManager.currentDayStats collector in onServiceConnected.
     }
 
     private fun handleSessionStateChange(oldState: SessionState, newState: SessionState) {
@@ -513,8 +488,10 @@ class ReelTrackerService : AccessibilityService() {
                 overlayStateManager.updateState { 
                     it.copy(currentApp = sessionManager.currentApp) 
                 }
-                // REMOVED: overlayStateManager.evaluateVisibility(isOnReels = true, isSystemOverlay = false)
-                // Visibility is now strictly driven by onAccessibilityEvent
+                
+                // Freeze Strict Mode enforcement for the duration of this session
+                isStrictModeEnforcedInCurrentSession = isStrictModeEnabledCached
+                
                 startWatchdog()
             }
             SessionState.EXITING -> {
@@ -523,11 +500,11 @@ class ReelTrackerService : AccessibilityService() {
             }
             SessionState.IDLE -> {
                 stopWatchdog()
-                // Completely reset all temporary tracking variables linked to the viewing session
+
                 lastScrollFromIndex = -1
                 wasOverlayOpenLastFrame = false
                 directionManager.reset()
-                
+
                 hideJob?.cancel()
                 overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
                 
@@ -537,7 +514,7 @@ class ReelTrackerService : AccessibilityService() {
             SessionState.DESTROYED -> {
                 saveSessionToDb()
                 // Destroy synchronously to guarantee execution before serviceScope is cancelled
-                // (onDestroy runs on the main thread)
+                // (onDestroy runs on the companion thread)
                 try {
                     floatingCounterManager?.destroy()
                 } catch (e: Exception) {
@@ -575,15 +552,8 @@ class ReelTrackerService : AccessibilityService() {
                                 // Force state synchronization
                                 sessionManager.updateCurrentApp(activePackage)
                             } else if (isTracked) {
-                                // Standard inactivity timeout (15s). Closing session.
-                                val now = System.currentTimeMillis()
-                                val timeSinceLastDetection = now - sessionManager.lastSuccessfulDetection
-                                
-                                if (timeSinceLastDetection > 15000L) {
-                                    Log.d("ReelTrakEngine", "Watchdog: Inactivity timeout (15s). Closing session.")
-                                    sessionManager.transitionTo(SessionState.EXITING)
-                                    sessionManager.transitionTo(SessionState.IDLE)
-                                }
+                                // The user is still in the tracked app (e.g. watching a long reel or reading comments).
+                                // We removed the 15s inactivity timeout here so the widget stays visible.
                             }
                         } finally {
                             rootNode?.recycle()
@@ -610,14 +580,14 @@ class ReelTrackerService : AccessibilityService() {
         
         if (app != null && count > 0 && startTime > 0) {
             val endTime = System.currentTimeMillis()
-            val sessionToSave = SessionEntity(
+            val sessionToSave = SessionData(
                 appName = app,
                 startTimeStamp = startTime,
                 endTimeStamp = endTime,
                 reelsScrolled = count
             )
             serviceScope.launch {
-                sessionDao.insertSession(sessionToSave)
+                dayManager.appendSession(sessionToSave)
                 Log.d("ReelTrakEngine", "Saved session to DB: $sessionToSave")
             }
         }

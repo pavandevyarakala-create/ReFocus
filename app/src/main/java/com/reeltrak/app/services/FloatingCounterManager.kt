@@ -23,6 +23,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
@@ -88,6 +91,8 @@ class FloatingCounterManager(
 
     private val windowOffsetFlow = MutableStateFlow<Pair<Int, Int>?>(null)
     private var snapAnimator: ValueAnimator? = null
+    val snapStateFlow = MutableStateFlow("CENTER")
+    private var accumulatedInwardDrag = 0f
 
     init {
         savedStateRegistryController.performAttach()
@@ -128,9 +133,9 @@ class FloatingCounterManager(
         
         val currentX = params.x
         
-        val leftX = 0
+        val leftX = -(view.width * 0.35f).toInt()
         val centerX = maxX / 2
-        val rightX = maxX
+        val rightX = maxX + (view.width * 0.35f).toInt()
         
         val distLeft = Math.abs(currentX - leftX)
         val distCenter = Math.abs(currentX - centerX)
@@ -148,10 +153,26 @@ class FloatingCounterManager(
             else -> "CENTER"
         }
         
-        animateToPosition(targetX, safeTopInset)
+        snapStateFlow.value = targetSnap
+        
+        val currentY = params.y
+        val screenHeight = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowManager.currentWindowMetrics.bounds.height()
+        } else {
+            val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
+        }
+        val maxYVal = screenHeight - view.height - (16 * density).toInt()
+        val clampedY = currentY.coerceIn(safeTopInset, Math.max(safeTopInset, maxYVal))
+        
+        animateToPosition(targetX, clampedY)
         
         val prefs = context.getSharedPreferences("overlay_prefs", Context.MODE_PRIVATE)
-        prefs.edit().putString("overlay_snap", targetSnap).apply()
+        prefs.edit()
+            .putString("overlay_snap", targetSnap)
+            .putInt("overlay_x", targetX)
+            .putInt("overlay_y", clampedY)
+            .putInt("overlay_last_view_width", view.width)
+            .apply()
     }
 
     private fun animateToPosition(targetX: Int, targetY: Int) {
@@ -200,18 +221,52 @@ class FloatingCounterManager(
                         GenesisTheme {
                             Surface(color = Color.Transparent) {
                                 val state by stateFlow.collectAsStateWithLifecycle()
+                                val snapState by snapStateFlow.collectAsStateWithLifecycle()
                                 FloatingIcon(
                                     state = state,
+                                    snapState = snapState,
                                     onDrag = { dx, dy ->
                                         snapAnimator?.cancel()
                                         val view = composeView ?: return@FloatingIcon
                                         val params = view.layoutParams as? WindowManager.LayoutParams ?: return@FloatingIcon
-                                        windowOffsetFlow.value = Pair(
-                                            params.x + dx.toInt(),
-                                            params.y + dy.toInt()
-                                        )
+                                        val currentSnap = snapStateFlow.value
+                                        
+                                        if (currentSnap == "LEFT" || currentSnap == "RIGHT") {
+                                            val inwardDelta = if (currentSnap == "LEFT") dx else -dx
+                                            accumulatedInwardDrag += inwardDelta
+                                            if (accumulatedInwardDrag < 0f) {
+                                                accumulatedInwardDrag = 0f
+                                            }
+                                            
+                                            val density = context.resources.displayMetrics.density
+                                            val detachThreshold = 48f * density
+                                            
+                                            if (accumulatedInwardDrag >= detachThreshold) {
+                                                snapStateFlow.value = "CENTER"
+                                                accumulatedInwardDrag = 0f
+                                                val newX = if (currentSnap == "LEFT") {
+                                                    -(view.width * 0.35f).toInt() + detachThreshold.toInt()
+                                                } else {
+                                                    val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                                        windowManager.currentWindowMetrics.bounds.width()
+                                                    } else {
+                                                        val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
+                                                    }
+                                                    (screenWidth - (view.width * 0.65f).toInt()) - detachThreshold.toInt()
+                                                }
+                                                windowOffsetFlow.value = Pair(newX, params.y + dy.toInt())
+                                            } else {
+                                                windowOffsetFlow.value = Pair(params.x, params.y + dy.toInt())
+                                            }
+                                        } else {
+                                            windowOffsetFlow.value = Pair(
+                                                params.x + dx.toInt(),
+                                                params.y + dy.toInt()
+                                            )
+                                        }
                                     },
                                     onDragEnd = {
+                                        accumulatedInwardDrag = 0f
                                         saveWindowPosition()
                                     }
                                 )
@@ -225,16 +280,27 @@ class FloatingCounterManager(
                 
                 val prefs = context.getSharedPreferences("overlay_prefs", Context.MODE_PRIVATE)
                 val savedSnap = prefs.getString("overlay_snap", "CENTER") ?: "CENTER"
-                val estimatedWidth = 75 * density
+                val savedX = if (prefs.contains("overlay_x")) prefs.getInt("overlay_x", 0) else null
+                val savedY = if (prefs.contains("overlay_y")) prefs.getInt("overlay_y", 0) else null
+                
+                snapStateFlow.value = savedSnap
+                
                 val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     windowManager.currentWindowMetrics.bounds.width()
                 } else {
                     val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
                 }
-                
-                val initX = when (savedSnap) {
-                    "LEFT" -> 0
-                    "RIGHT" -> (screenWidth - estimatedWidth).toInt()
+                val screenHeight = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    windowManager.currentWindowMetrics.bounds.height()
+                } else {
+                    val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.y
+                }
+
+                // Initial position fallback logic
+                val estimatedWidth = 75 * density
+                val initX = savedX ?: when (savedSnap) {
+                    "LEFT" -> -(estimatedWidth * 0.35f).toInt()
+                    "RIGHT" -> (screenWidth - estimatedWidth * 0.65f).toInt()
                     else -> ((screenWidth - estimatedWidth) / 2).toInt()
                 }
                 
@@ -243,6 +309,23 @@ class FloatingCounterManager(
                     safeTopInset = windowManager.currentWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
                         WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()
                     ).top + (-4 * density).toInt()
+                }
+                val initY = savedY ?: safeTopInset
+
+                // Clamp to screen bounds if screen size changed
+                val finalX = if (savedX != null) {
+                    val lastViewWidth = prefs.getInt("overlay_last_view_width", estimatedWidth.toInt())
+                    // Simple clamping to ensure it's not totally off-screen
+                    initX.coerceIn(-(lastViewWidth * 0.8f).toInt(), screenWidth - (lastViewWidth * 0.2f).toInt())
+                } else {
+                    initX
+                }
+                
+                val finalY = if (savedY != null) {
+                    val estimatedHeight = 50 * density
+                    initY.coerceIn(0, screenHeight - estimatedHeight.toInt())
+                } else {
+                    initY
                 }
                 
                 val params = WindowManager.LayoutParams(
@@ -257,8 +340,8 @@ class FloatingCounterManager(
                     PixelFormat.TRANSLUCENT
                 ).apply {
                     gravity = Gravity.TOP or Gravity.START
-                    x = initX
-                    y = safeTopInset
+                    x = finalX
+                    y = finalY
                 }
                 
                 windowManager.addView(composeView, params)
@@ -324,9 +407,11 @@ class FloatingCounterManager(
 @Composable
 fun FloatingIcon(
     state: OverlayState,
+    snapState: String,
     onDrag: (Float, Float) -> Unit,
     onDragEnd: () -> Unit
 ) {
+    val context = LocalContext.current
     val currentReels = state.count
     val isLimitSet = state.dailyGoal > 0
     val dailyGoal = if (isLimitSet) state.dailyGoal else 1
@@ -356,19 +441,84 @@ fun FloatingIcon(
     } else {
         MaterialTheme.colorScheme.onSurface
     }
+
+    val contentOffset by androidx.compose.animation.core.animateDpAsState(
+        targetValue = when (snapState) {
+            "LEFT" -> 10.dp
+            "RIGHT" -> (-10).dp
+            else -> 0.dp
+        },
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 300, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+        label = "content_shift"
+    )
+
+    val reelsLabelAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (snapState == "CENTER") 0.7f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 300),
+        label = "label_alpha"
+    )
+
+    val yOffset by androidx.compose.animation.core.animateDpAsState(
+        targetValue = if (snapState == "CENTER") 0.dp else (-5).dp,
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 300),
+        label = "y_offset"
+    )
     
     Card(
         modifier = Modifier
             .padding(12.dp)
             .pointerInput(Unit) {
-                detectDragGestures(
-                    onDragEnd = { onDragEnd() },
-                    onDragCancel = { onDragEnd() },
-                    onDrag = { change, dragAmount ->
-                        change.consume()
-                        onDrag(dragAmount.x, dragAmount.y)
+                val touchSlop = 8.dp.toPx()
+                val tapTimeout = 300L
+                
+                awaitPointerEventScope {
+                    while (true) {
+                        val down = awaitFirstDown()
+                        val startTime = System.currentTimeMillis()
+                        val startPos = down.position
+                        var isDrag = false
+                        var clickCancelled = false
+                        
+                        do {
+                            val event = awaitPointerEvent()
+                            val pointerChange = event.changes.firstOrNull() ?: break
+                            
+                            if (pointerChange.pressed) {
+                                val currentPos = pointerChange.position
+                                val dist = (currentPos - startPos).getDistance()
+                                if (dist > touchSlop) {
+                                    isDrag = true
+                                    clickCancelled = true
+                                    val dragAmount = currentPos - pointerChange.previousPosition
+                                    onDrag(dragAmount.x, dragAmount.y)
+                                    pointerChange.consume()
+                                }
+                                if (System.currentTimeMillis() - startTime > tapTimeout) {
+                                    clickCancelled = true
+                                }
+                            } else {
+                                // Up event
+                                if (!clickCancelled && !isDrag) {
+                                    val duration = System.currentTimeMillis() - startTime
+                                    val finalPos = pointerChange.position
+                                    val finalDist = (finalPos - startPos).getDistance()
+                                    if (duration < tapTimeout && finalDist < touchSlop) {
+                                        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)?.apply {
+                                            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        if (intent != null) {
+                                            context.startActivity(intent)
+                                        }
+                                    }
+                                }
+                                if (isDrag) {
+                                    onDragEnd()
+                                }
+                                break
+                            }
+                        } while (true)
                     }
-                )
+                }
             },
         shape = CircleShape,
         colors = CardDefaults.cardColors(containerColor = containerColor),
@@ -376,13 +526,15 @@ fun FloatingIcon(
         elevation = CardDefaults.cardElevation(defaultElevation = 7.dp)
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 18.dp, vertical = 7.dp),
+            modifier = Modifier
+                .offset(x = contentOffset, y = yOffset)
+                .padding(horizontal = 18.dp, vertical = 7.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
                 text = "REELS", 
                 style = MaterialTheme.typography.labelSmall, 
-                color = contentColor.copy(alpha = 0.7f), 
+                color = contentColor.copy(alpha = reelsLabelAlpha), 
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 1.0.sp,
                 fontSize = 8.sp
@@ -394,16 +546,6 @@ fun FloatingIcon(
                 color = contentColor, 
                 fontWeight = FontWeight.ExtraBold
             )
-
-            if (state.dailyGoal == -1) {
-                Text(
-                    text = "Limit not set", 
-                    style = MaterialTheme.typography.labelSmall,
-                    fontSize = 8.sp,
-                    color = contentColor.copy(alpha = 0.7f),
-                    modifier = Modifier.padding(top = 2.dp)
-                )
-            }
         }
     }
 }

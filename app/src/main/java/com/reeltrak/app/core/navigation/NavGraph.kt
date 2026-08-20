@@ -28,7 +28,13 @@ fun ReelTrakNavGraph(
         }
         
         composable(Routes.MAIN) {
-            MainScreen()
+            MainScreen(
+                onNavigateToLogin = {
+                    navController.navigate(Routes.ONBOARDING) {
+                        popUpTo(Routes.MAIN) { inclusive = true }
+                    }
+                }
+            )
         }
     }
 }

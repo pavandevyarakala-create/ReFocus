@@ -7,21 +7,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 
 @Composable
 fun StrictModeCard(
     isStrictModeEnabled: Boolean,
     isLocked: Boolean,
+    isLoading: Boolean = false,
     onToggleStrictMode: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val subtitle = if (isLocked) {
-        "Locked until 12:00 AM"
-    } else {
-        "Protects you from excessive scrolling"
-    }
-
     Card(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -40,18 +38,31 @@ fun StrictModeCard(
                 Text(
                     text = "Strict Mode",
                     style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
+                val subtitle = if (isLoading) {
+                    "Loading..."
+                } else if (isLocked && !isStrictModeEnabled) {
+                    "Locked until tomorrow"
+                } else if (isStrictModeEnabled) {
+                    "Enforcement active (Cannot turn off)"
+                } else {
+                    "Prevent bypassing limits"
+                }
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (isLocked && !isStrictModeEnabled) MaterialTheme.colorScheme.primary 
+                            else if (isStrictModeEnabled) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
             Switch(
                 checked = isStrictModeEnabled,
-                onCheckedChange = onToggleStrictMode,
-                enabled = !isLocked
+                onCheckedChange = { onToggleStrictMode(it) },
+                enabled = !isLocked && !isLoading
             )
         }
     }

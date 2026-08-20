@@ -25,9 +25,18 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.reeltrak.app.core.navigation.Routes
 import com.reeltrak.app.features.analytics.ui.AnalyticsScreen
+import com.reeltrak.app.features.analytics.ui.CalendarScreen
 import com.reeltrak.app.features.dashboard.ui.DashboardScreen
 import com.reeltrak.app.features.settings.ui.SettingsScreen
 import com.reeltrak.app.services.ReelTrackerService
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.reeltrak.app.features.auth.LoginViewModel
+import com.reeltrak.app.features.auth.LoginState
+import com.reeltrak.app.core.auth.UserAuthData
+import com.reeltrak.app.features.auth.components.LogoutDialog
+import androidx.compose.ui.res.stringResource
+import com.reeltrak.app.R
 
 private fun isAccessibilityServiceEnabled(context: android.content.Context): Boolean {
     val expectedComponentName = android.content.ComponentName(context, ReelTrackerService::class.java)
@@ -43,7 +52,11 @@ private fun isAccessibilityServiceEnabled(context: android.content.Context): Boo
 }
 
 @Composable
-fun MainScreen() {
+fun MainScreen(
+    onNavigateToLogin: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
+    viewModel: LoginViewModel = hiltViewModel()
+) {
     val context = LocalContext.current
     val bottomNavController = rememberNavController()
     
@@ -83,7 +96,11 @@ fun MainScreen() {
             }
         )
     } else {
-        MainContent(bottomNavController)
+        MainContent(
+            bottomNavController = bottomNavController,
+            onNavigateToLogin = onNavigateToLogin,
+            viewModel = viewModel
+        )
     }
 }
 
@@ -116,7 +133,7 @@ fun PermissionRequiredScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "ReelTrak needs the following permissions to work correctly:",
+                text = stringResource(id = R.string.app_name) + " needs the following permissions to work correctly:",
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -135,7 +152,7 @@ fun PermissionRequiredScreen(
 
             PermissionItem(
                 title = "Accessibility Service",
-                description = "Required to track scrolls and enforce limits.",
+                description = "Required to track reels and usage time.",
                 isGranted = hasAccessibility,
                 onClick = onOpenAccessibilitySettings
             )
@@ -191,7 +208,47 @@ fun PermissionItem(
 }
 
 @Composable
-fun MainContent(bottomNavController: androidx.navigation.NavHostController) {
+fun MainContent(
+    bottomNavController: androidx.navigation.NavHostController,
+    onNavigateToLogin: () -> Unit,
+    viewModel: LoginViewModel
+) {
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val showLogoutDialog by viewModel.showLogoutDialog.collectAsStateWithLifecycle()
+    val showOfflineWarning by viewModel.showOfflineWarning.collectAsStateWithLifecycle()
+    val logoutCountdown by viewModel.logoutCountdown.collectAsStateWithLifecycle()
+
+    LaunchedEffect(uiState) {
+        if (uiState is LoginState.Idle) {
+            onNavigateToLogin()
+        }
+    }
+
+    if (showLogoutDialog) {
+        LogoutDialog(
+            countdown = logoutCountdown,
+            onConfirm = {
+                viewModel.signOut()
+            },
+            onCancel = {
+                viewModel.cancelLogout()
+            }
+        )
+    }
+
+    if (showOfflineWarning) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { viewModel.cancelLogout() },
+            title = { androidx.compose.material3.Text("No Internet Connection") },
+            text = { androidx.compose.material3.Text("You have unsynced progress. Logging out now will permanently delete this data. Please connect to the internet to back up your data before signing out.") },
+            confirmButton = {
+                androidx.compose.material3.Button(onClick = { viewModel.cancelLogout() }) {
+                    androidx.compose.material3.Text("Okay")
+                }
+            }
+        )
+    }
+
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -212,6 +269,51 @@ fun MainContent(bottomNavController: androidx.navigation.NavHostController) {
                         }
                     }
                 )
+
+                NavigationBarItem(
+                    icon = { Icon(Icons.Filled.BarChart, contentDescription = "Analytics") },
+                    label = { Text("Analytics") },
+                    selected = currentDestination?.hierarchy?.any { it.route == Routes.ANALYTICS } == true,
+                    onClick = {
+                        bottomNavController.navigate(Routes.ANALYTICS) {
+                            popUpTo(bottomNavController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
+
+                NavigationBarItem(
+                    icon = { Icon(Icons.Filled.DateRange, contentDescription = "Calendar") },
+                    label = { Text("Calendar") },
+                    selected = currentDestination?.hierarchy?.any { it.route == Routes.CALENDAR } == true,
+                    onClick = {
+                        bottomNavController.navigate(Routes.CALENDAR) {
+                            popUpTo(bottomNavController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
+
+                NavigationBarItem(
+                    icon = { Icon(Icons.Filled.Settings, contentDescription = "Settings") },
+                    label = { Text("Settings") },
+                    selected = currentDestination?.hierarchy?.any { it.route == Routes.SETTINGS } == true,
+                    onClick = {
+                        bottomNavController.navigate(Routes.SETTINGS) {
+                            popUpTo(bottomNavController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
             }
         }
     ) { innerPadding ->
@@ -220,7 +322,42 @@ fun MainContent(bottomNavController: androidx.navigation.NavHostController) {
             startDestination = Routes.DASHBOARD,
             modifier = Modifier.padding(innerPadding)
         ) {
-            composable(Routes.DASHBOARD) { DashboardScreen() }
+            composable(Routes.DASHBOARD) { 
+                DashboardScreen(
+                    onStreakClick = {
+                        bottomNavController.navigate(Routes.CALENDAR) {
+                            popUpTo(bottomNavController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
+                        }
+                    }
+                )
+            }
+            composable(Routes.ANALYTICS) { AnalyticsScreen() }
+            composable(Routes.CALENDAR) { CalendarScreen() }
+            composable(Routes.SETTINGS) { 
+                val userData = (uiState as? LoginState.Success)?.userData 
+                    ?: UserAuthData(
+                        idToken = "",
+                        email = "user@example.com",
+                        displayName = "User",
+                        profilePictureUri = ""
+                    )
+                
+                val settingsViewModel: com.reeltrak.app.features.settings.viewmodel.SettingsViewModel = hiltViewModel()
+                
+                SettingsScreen(
+                    userData = userData,
+                    onSignOutClick = {
+                        viewModel.initiateLogout()
+                    },
+                    onRestoreBackupClick = {
+                        settingsViewModel.restoreBackup()
+                    }
+                )
+            }
             composable(Routes.DEBUG_OVERLAY) { com.reeltrak.app.features.debug.ui.DebugOverlayScreen(onNavigateBack = { bottomNavController.popBackStack() }) }
         }
     }

@@ -20,8 +20,11 @@ import dagger.hilt.processor.internal.definecomponent.codegen._dagger_hilt_compo
 import hilt_aggregated_deps._com_reeltrak_app_MainActivity_GeneratedInjector;
 import hilt_aggregated_deps._com_reeltrak_app_ReelTrakApplication_GeneratedInjector;
 import hilt_aggregated_deps._com_reeltrak_app_core_di_DatabaseModule;
+import hilt_aggregated_deps._com_reeltrak_app_core_di_FirebaseModule;
 import hilt_aggregated_deps._com_reeltrak_app_core_di_PreferencesModule;
 import hilt_aggregated_deps._com_reeltrak_app_core_di_StateModule;
+import hilt_aggregated_deps._com_reeltrak_app_features_auth_LoginViewModel_HiltModules_BindsModule;
+import hilt_aggregated_deps._com_reeltrak_app_features_auth_LoginViewModel_HiltModules_KeyModule;
 import hilt_aggregated_deps._com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel_HiltModules_BindsModule;
 import hilt_aggregated_deps._com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel_HiltModules_KeyModule;
 import hilt_aggregated_deps._com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel_HiltModules_BindsModule;
@@ -72,8 +75,11 @@ import hilt_aggregated_deps._dagger_hilt_android_internal_modules_HiltWrapper_Ac
         _com_reeltrak_app_MainActivity_GeneratedInjector.class,
         _com_reeltrak_app_ReelTrakApplication_GeneratedInjector.class,
         _com_reeltrak_app_core_di_DatabaseModule.class,
+        _com_reeltrak_app_core_di_FirebaseModule.class,
         _com_reeltrak_app_core_di_PreferencesModule.class,
         _com_reeltrak_app_core_di_StateModule.class,
+        _com_reeltrak_app_features_auth_LoginViewModel_HiltModules_BindsModule.class,
+        _com_reeltrak_app_features_auth_LoginViewModel_HiltModules_KeyModule.class,
         _com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel_HiltModules_BindsModule.class,
         _com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel_HiltModules_KeyModule.class,
         _com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel_HiltModules_BindsModule.class,

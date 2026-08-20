@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ReelTrak</string>
+    <string name="app_name">Re:Focus</string>
+    <string name="default_web_client_id" translatable="false">524118238647-fhocd7sf7t3nkmdbbanf3a33bgqcgj90.apps.googleusercontent.com</string>
+    <string name="gcm_defaultSenderId" translatable="false">524118238647</string>
+    <string name="google_api_key" translatable="false">AIzaSyBilmiuqvT56rMlShcdW1R7X39d1vYj8MA</string>
+    <string name="google_app_id" translatable="false">1:524118238647:android:1af37f98b1c1b75dce3432</string>
+    <string name="google_crash_reporting_api_key" translatable="false">AIzaSyBilmiuqvT56rMlShcdW1R7X39d1vYj8MA</string>
+    <string name="google_storage_bucket" translatable="false">refocus-504119.firebasestorage.app</string>
+    <string name="project_id" translatable="false">refocus-504119</string>
     <style name="Theme.ReelTrak" parent="android:Theme.Material.Light.NoActionBar"/>
 </resources>

@@ -1,8 +1,10 @@
 package com.reeltrak.app;
 
 import com.reeltrak.app.core.di.DatabaseModule;
+import com.reeltrak.app.core.di.FirebaseModule;
 import com.reeltrak.app.core.di.PreferencesModule;
 import com.reeltrak.app.core.di.StateModule;
+import com.reeltrak.app.features.auth.LoginViewModel_HiltModules;
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel_HiltModules;
 import com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel_HiltModules;
 import com.reeltrak.app.features.settings.viewmodel.SettingsViewModel_HiltModules;
@@ -133,6 +135,7 @@ public final class ReelTrakApplication_HiltComponents {
       modules = {
           ApplicationContextModule.class,
           DatabaseModule.class,
+          FirebaseModule.class,
           HiltWrapper_FragmentGetContextFix_FragmentGetContextFixModule.class,
           PreferencesModule.class,
           ActivityRetainedCBuilderModule.class,
@@ -164,6 +167,7 @@ public final class ReelTrakApplication_HiltComponents {
           DashboardViewModel_HiltModules.KeyModule.class,
           HiltWrapper_ActivityRetainedComponentManager_LifecycleModule.class,
           HiltWrapper_SavedStateHandleModule.class,
+          LoginViewModel_HiltModules.KeyModule.class,
           OnboardingViewModel_HiltModules.KeyModule.class,
           ActivityCBuilderModule.class,
           ViewModelCBuilderModule.class,
@@ -205,6 +209,7 @@ public final class ReelTrakApplication_HiltComponents {
       modules = {
           DashboardViewModel_HiltModules.BindsModule.class,
           HiltWrapper_HiltViewModelFactory_ViewModelModule.class,
+          LoginViewModel_HiltModules.BindsModule.class,
           OnboardingViewModel_HiltModules.BindsModule.class,
           SettingsViewModel_HiltModules.BindsModule.class
       }

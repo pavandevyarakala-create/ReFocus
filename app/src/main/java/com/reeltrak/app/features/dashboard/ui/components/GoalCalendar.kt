@@ -10,10 +10,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.DailyBlocks
 import java.time.LocalDate
 import java.time.YearMonth
@@ -137,16 +142,20 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                                                       currentMonth.month == today.month && 
                                                       day == today.dayOfMonth
                                         
+                                        val date = currentMonth.atDay(day)
+                                        val dayData = statsMap[date.toEpochDay()]
+
                                         val cellColor = remember(day, statsMap, currentMonth) {
-                                            val date = currentMonth.atDay(day)
-                                            val dayData = statsMap[date.toEpochDay()]
-                                            when (dayData?.colorLevel ?: 0) {
-                                                1 -> Color(0xFF388E3C)
-                                                2 -> Color(0xFF81C784)
-                                                3 -> Color(0xFFEF9A9A)
-                                                4 -> Color(0xFFE57373)
-                                                5 -> Color(0xFFC62828)
-                                                else -> Color.Transparent
+                                            val data = statsMap[date.toEpochDay()]
+                                            if (data == null || data.percentage < 0f) {
+                                                Color.Transparent
+                                            } else if (data.isSkullDay) {
+                                                Color.Transparent
+                                            } else if (data.isGraceDay) {
+                                                Color(0xFFEF9A9A) // Light Red for Grace Zone
+                                            } else {
+                                                val fraction = data.percentage.coerceIn(0f, 1f)
+                                                androidx.compose.ui.graphics.lerp(Color(0xFF1B5E20), Color(0xFF81C784), fraction)
                                             }
                                         }
 
@@ -157,12 +166,16 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                                             border = if (isToday) BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)) else null
                                         ) {
                                             Box(contentAlignment = Alignment.Center) {
-                                                Text(
-                                                    text = day.toString(),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    fontWeight = if (isToday) FontWeight.Bold else FontWeight.Normal,
-                                                    color = if (cellColor != Color.Transparent) Color.White else if (isToday) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                                )
+                                                if (dayData?.isSkullDay == true) {
+                                                    Text(text = "💀", fontSize = 18.sp)
+                                                } else {
+                                                    Text(
+                                                        text = day.toString(),
+                                                        style = MaterialTheme.typography.bodyMedium,
+                                                        fontWeight = if (isToday) FontWeight.Bold else FontWeight.Normal,
+                                                        color = if (cellColor != Color.Transparent) Color.White else if (isToday) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                                    )
+                                                }
                                             }
                                         }
                                         dayCounter++
@@ -182,6 +195,64 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            // 4. COLOR LEGEND
+            Text(
+                "Color Legend", 
+                style = MaterialTheme.typography.labelMedium, 
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Gradient Item
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.5f)) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(
+                                brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
+                                    colors = listOf(Color(0xFF1B5E20), Color(0xFF81C784))
+                                )
+                            )
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("0% → 100%", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+
+                // Grace Zone Item
+                LegendItem(Color(0xFFEF9A9A), "Grace Zone", Modifier.weight(1f))
+
+                // Skull Day Item
+                LegendItem(Color.Transparent, "> Limit + 30", Modifier.weight(1f), isSkull = true)
+            }
         }
+    }
+}
+
+@Composable
+private fun LegendItem(color: Color, label: String, modifier: Modifier = Modifier, isSkull: Boolean = false) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(if (isSkull) MaterialTheme.colorScheme.surfaceVariant else color)
+                .then(if (isSkull) Modifier.border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(4.dp)) else Modifier),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isSkull) Text("💀", fontSize = 6.sp)
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(label, style = MaterialTheme.typography.labelSmall, fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

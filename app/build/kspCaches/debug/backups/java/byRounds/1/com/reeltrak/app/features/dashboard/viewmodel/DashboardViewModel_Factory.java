@@ -1,9 +1,8 @@
 package com.reeltrak.app.features.dashboard.viewmodel;
 
-import com.reeltrak.app.data.local.dao.DailyStatisticsDao;
-import com.reeltrak.app.data.local.dao.GlobalStatisticsDao;
-import com.reeltrak.app.data.local.dao.SessionDao;
+import com.reeltrak.app.data.local.dao.DailyReelDataDao;
 import com.reeltrak.app.domain.repository.PreferencesRepository;
+import com.reeltrak.app.services.notifications.ReelNotificationManager;
 import com.reeltrak.app.services.overlay.OverlayStateManager;
 import com.reeltrak.app.services.tracking.DayManager;
 import dagger.internal.DaggerGenerated;
@@ -30,49 +29,43 @@ import javax.inject.Provider;
 public final class DashboardViewModel_Factory implements Factory<DashboardViewModel> {
   private final Provider<PreferencesRepository> preferencesRepositoryProvider;
 
-  private final Provider<SessionDao> sessionDaoProvider;
-
-  private final Provider<DailyStatisticsDao> dailyStatisticsDaoProvider;
-
-  private final Provider<GlobalStatisticsDao> globalStatisticsDaoProvider;
+  private final Provider<DailyReelDataDao> dailyReelDataDaoProvider;
 
   private final Provider<OverlayStateManager> overlayStateManagerProvider;
 
   private final Provider<DayManager> dayManagerProvider;
 
+  private final Provider<ReelNotificationManager> notificationManagerProvider;
+
   public DashboardViewModel_Factory(Provider<PreferencesRepository> preferencesRepositoryProvider,
-      Provider<SessionDao> sessionDaoProvider,
-      Provider<DailyStatisticsDao> dailyStatisticsDaoProvider,
-      Provider<GlobalStatisticsDao> globalStatisticsDaoProvider,
+      Provider<DailyReelDataDao> dailyReelDataDaoProvider,
       Provider<OverlayStateManager> overlayStateManagerProvider,
-      Provider<DayManager> dayManagerProvider) {
+      Provider<DayManager> dayManagerProvider,
+      Provider<ReelNotificationManager> notificationManagerProvider) {
     this.preferencesRepositoryProvider = preferencesRepositoryProvider;
-    this.sessionDaoProvider = sessionDaoProvider;
-    this.dailyStatisticsDaoProvider = dailyStatisticsDaoProvider;
-    this.globalStatisticsDaoProvider = globalStatisticsDaoProvider;
+    this.dailyReelDataDaoProvider = dailyReelDataDaoProvider;
     this.overlayStateManagerProvider = overlayStateManagerProvider;
     this.dayManagerProvider = dayManagerProvider;
+    this.notificationManagerProvider = notificationManagerProvider;
   }
 
   @Override
   public DashboardViewModel get() {
-    return newInstance(preferencesRepositoryProvider.get(), sessionDaoProvider.get(), dailyStatisticsDaoProvider.get(), globalStatisticsDaoProvider.get(), overlayStateManagerProvider.get(), dayManagerProvider.get());
+    return newInstance(preferencesRepositoryProvider.get(), dailyReelDataDaoProvider.get(), overlayStateManagerProvider.get(), dayManagerProvider.get(), notificationManagerProvider.get());
   }
 
   public static DashboardViewModel_Factory create(
       Provider<PreferencesRepository> preferencesRepositoryProvider,
-      Provider<SessionDao> sessionDaoProvider,
-      Provider<DailyStatisticsDao> dailyStatisticsDaoProvider,
-      Provider<GlobalStatisticsDao> globalStatisticsDaoProvider,
+      Provider<DailyReelDataDao> dailyReelDataDaoProvider,
       Provider<OverlayStateManager> overlayStateManagerProvider,
-      Provider<DayManager> dayManagerProvider) {
-    return new DashboardViewModel_Factory(preferencesRepositoryProvider, sessionDaoProvider, dailyStatisticsDaoProvider, globalStatisticsDaoProvider, overlayStateManagerProvider, dayManagerProvider);
+      Provider<DayManager> dayManagerProvider,
+      Provider<ReelNotificationManager> notificationManagerProvider) {
+    return new DashboardViewModel_Factory(preferencesRepositoryProvider, dailyReelDataDaoProvider, overlayStateManagerProvider, dayManagerProvider, notificationManagerProvider);
   }
 
   public static DashboardViewModel newInstance(PreferencesRepository preferencesRepository,
-      SessionDao sessionDao, DailyStatisticsDao dailyStatisticsDao,
-      GlobalStatisticsDao globalStatisticsDao, OverlayStateManager overlayStateManager,
-      DayManager dayManager) {
-    return new DashboardViewModel(preferencesRepository, sessionDao, dailyStatisticsDao, globalStatisticsDao, overlayStateManager, dayManager);
+      DailyReelDataDao dailyReelDataDao, OverlayStateManager overlayStateManager,
+      DayManager dayManager, ReelNotificationManager notificationManager) {
+    return new DashboardViewModel(preferencesRepository, dailyReelDataDao, overlayStateManager, dayManager, notificationManager);
   }
 }

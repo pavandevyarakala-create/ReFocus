@@ -36,8 +36,7 @@ data class OverlayState(
     val currentSessionReels: Int = 0,
     val sessionStartTime: Long = 0L,
     val sessionState: SessionState = SessionState.IDLE,
-    val dailyGoal: Int = 0,
-    val isStrictModeEnabled: Boolean = false
+    val dailyGoal: Int = 0
 )
 
 /**

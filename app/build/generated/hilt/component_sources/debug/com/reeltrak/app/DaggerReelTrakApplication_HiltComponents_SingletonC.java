@@ -6,16 +6,21 @@ import android.view.View;
 import androidx.fragment.app.Fragment;
 import androidx.lifecycle.SavedStateHandle;
 import androidx.lifecycle.ViewModel;
-import com.reeltrak.app.core.di.DatabaseModule_ProvideDailyStatisticsDaoFactory;
-import com.reeltrak.app.core.di.DatabaseModule_ProvideGlobalStatisticsDaoFactory;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.firebase.firestore.FirebaseFirestore;
+import com.reeltrak.app.core.auth.GoogleAuthManager;
+import com.reeltrak.app.core.di.DatabaseModule_ProvideDailyReelDataDaoFactory;
 import com.reeltrak.app.core.di.DatabaseModule_ProvideReelTrakDatabaseFactory;
-import com.reeltrak.app.core.di.DatabaseModule_ProvideSessionDaoFactory;
+import com.reeltrak.app.core.di.FirebaseModule_ProvideFirebaseFirestoreFactory;
 import com.reeltrak.app.core.di.StateModule_ProvideOverlayStateManagerFactory;
-import com.reeltrak.app.data.local.dao.DailyStatisticsDao;
-import com.reeltrak.app.data.local.dao.GlobalStatisticsDao;
-import com.reeltrak.app.data.local.dao.SessionDao;
+import com.reeltrak.app.core.sync.SyncManager;
+import com.reeltrak.app.data.local.dao.DailyReelDataDao;
 import com.reeltrak.app.data.local.database.ReelTrakDatabase;
 import com.reeltrak.app.data.repository.PreferencesRepositoryImpl;
+import com.reeltrak.app.features.auth.LoginViewModel;
+import com.reeltrak.app.features.auth.LoginViewModel_HiltModules;
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel;
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel_HiltModules;
 import com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel;
@@ -24,6 +29,7 @@ import com.reeltrak.app.features.settings.viewmodel.SettingsViewModel;
 import com.reeltrak.app.features.settings.viewmodel.SettingsViewModel_HiltModules;
 import com.reeltrak.app.services.ReelTrackerService;
 import com.reeltrak.app.services.ReelTrackerService_MembersInjector;
+import com.reeltrak.app.services.notifications.ReelNotificationManager;
 import com.reeltrak.app.services.overlay.OverlayStateManager;
 import com.reeltrak.app.services.tracking.DayManager;
 import dagger.hilt.android.ActivityRetainedLifecycle;
@@ -42,14 +48,13 @@ import dagger.hilt.android.internal.managers.SavedStateHandleHolder;
 import dagger.hilt.android.internal.modules.ApplicationContextModule;
 import dagger.hilt.android.internal.modules.ApplicationContextModule_ProvideContextFactory;
 import dagger.internal.DaggerGenerated;
+import dagger.internal.DelegateFactory;
 import dagger.internal.DoubleCheck;
 import dagger.internal.IdentifierNameString;
 import dagger.internal.KeepFieldType;
 import dagger.internal.LazyClassKeyMap;
-import dagger.internal.MapBuilder;
 import dagger.internal.Preconditions;
 import dagger.internal.Provider;
-import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.processing.Generated;
@@ -386,7 +391,7 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     @Override
     public Map<Class<?>, Boolean> getViewModelKeys() {
-      return LazyClassKeyMap.<Boolean>of(MapBuilder.<String, Boolean>newMapBuilder(3).put(LazyClassKeyProvider.com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel, DashboardViewModel_HiltModules.KeyModule.provide()).put(LazyClassKeyProvider.com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel, OnboardingViewModel_HiltModules.KeyModule.provide()).put(LazyClassKeyProvider.com_reeltrak_app_features_settings_viewmodel_SettingsViewModel, SettingsViewModel_HiltModules.KeyModule.provide()).build());
+      return LazyClassKeyMap.<Boolean>of(ImmutableMap.<String, Boolean>of(LazyClassKeyProvider.com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel, DashboardViewModel_HiltModules.KeyModule.provide(), LazyClassKeyProvider.com_reeltrak_app_features_auth_LoginViewModel, LoginViewModel_HiltModules.KeyModule.provide(), LazyClassKeyProvider.com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel, OnboardingViewModel_HiltModules.KeyModule.provide(), LazyClassKeyProvider.com_reeltrak_app_features_settings_viewmodel_SettingsViewModel, SettingsViewModel_HiltModules.KeyModule.provide()));
     }
 
     @Override
@@ -406,20 +411,25 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     @IdentifierNameString
     private static final class LazyClassKeyProvider {
-      static String com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel = "com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel";
+      static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
 
       static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
 
-      static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
+      static String com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel = "com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel";
+
+      static String com_reeltrak_app_features_auth_LoginViewModel = "com.reeltrak.app.features.auth.LoginViewModel";
 
       @KeepFieldType
-      DashboardViewModel com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel2;
+      SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
 
       @KeepFieldType
       OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
 
       @KeepFieldType
-      SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
+      DashboardViewModel com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel2;
+
+      @KeepFieldType
+      LoginViewModel com_reeltrak_app_features_auth_LoginViewModel2;
     }
   }
 
@@ -431,6 +441,8 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
     private final ViewModelCImpl viewModelCImpl = this;
 
     private Provider<DashboardViewModel> dashboardViewModelProvider;
+
+    private Provider<LoginViewModel> loginViewModelProvider;
 
     private Provider<OnboardingViewModel> onboardingViewModelProvider;
 
@@ -450,36 +462,42 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
     private void initialize(final SavedStateHandle savedStateHandleParam,
         final ViewModelLifecycle viewModelLifecycleParam) {
       this.dashboardViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 0);
-      this.onboardingViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 1);
-      this.settingsViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 2);
+      this.loginViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 1);
+      this.onboardingViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 2);
+      this.settingsViewModelProvider = new SwitchingProvider<>(singletonCImpl, activityRetainedCImpl, viewModelCImpl, 3);
     }
 
     @Override
     public Map<Class<?>, javax.inject.Provider<ViewModel>> getHiltViewModelMap() {
-      return LazyClassKeyMap.<javax.inject.Provider<ViewModel>>of(MapBuilder.<String, javax.inject.Provider<ViewModel>>newMapBuilder(3).put(LazyClassKeyProvider.com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel, ((Provider) dashboardViewModelProvider)).put(LazyClassKeyProvider.com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel, ((Provider) onboardingViewModelProvider)).put(LazyClassKeyProvider.com_reeltrak_app_features_settings_viewmodel_SettingsViewModel, ((Provider) settingsViewModelProvider)).build());
+      return LazyClassKeyMap.<javax.inject.Provider<ViewModel>>of(ImmutableMap.<String, javax.inject.Provider<ViewModel>>of(LazyClassKeyProvider.com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel, ((Provider) dashboardViewModelProvider), LazyClassKeyProvider.com_reeltrak_app_features_auth_LoginViewModel, ((Provider) loginViewModelProvider), LazyClassKeyProvider.com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel, ((Provider) onboardingViewModelProvider), LazyClassKeyProvider.com_reeltrak_app_features_settings_viewmodel_SettingsViewModel, ((Provider) settingsViewModelProvider)));
     }
 
     @Override
     public Map<Class<?>, Object> getHiltViewModelAssistedMap() {
-      return Collections.<Class<?>, Object>emptyMap();
+      return ImmutableMap.<Class<?>, Object>of();
     }
 
     @IdentifierNameString
     private static final class LazyClassKeyProvider {
+      static String com_reeltrak_app_features_auth_LoginViewModel = "com.reeltrak.app.features.auth.LoginViewModel";
+
+      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
+
       static String com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel = "com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel";
 
       static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
 
-      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
+      @KeepFieldType
+      LoginViewModel com_reeltrak_app_features_auth_LoginViewModel2;
+
+      @KeepFieldType
+      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
 
       @KeepFieldType
       DashboardViewModel com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel2;
 
       @KeepFieldType
       SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
-
-      @KeepFieldType
-      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
     }
 
     private static final class SwitchingProvider<T> implements Provider<T> {
@@ -504,13 +522,16 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       public T get() {
         switch (id) {
           case 0: // com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel 
-          return (T) new DashboardViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.provideSessionDaoProvider.get(), singletonCImpl.provideDailyStatisticsDaoProvider.get(), singletonCImpl.provideGlobalStatisticsDaoProvider.get(), singletonCImpl.provideOverlayStateManagerProvider.get(), singletonCImpl.dayManagerProvider.get());
+          return (T) new DashboardViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.provideOverlayStateManagerProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.reelNotificationManagerProvider.get());
 
-          case 1: // com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel 
+          case 1: // com.reeltrak.app.features.auth.LoginViewModel 
+          return (T) new LoginViewModel(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.googleAuthManagerProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.syncManagerProvider.get(), singletonCImpl.provideReelTrakDatabaseProvider.get());
+
+          case 2: // com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel 
           return (T) new OnboardingViewModel(singletonCImpl.preferencesRepositoryImplProvider.get());
 
-          case 2: // com.reeltrak.app.features.settings.viewmodel.SettingsViewModel 
-          return (T) new SettingsViewModel(singletonCImpl.preferencesRepositoryImplProvider.get());
+          case 3: // com.reeltrak.app.features.settings.viewmodel.SettingsViewModel 
+          return (T) new SettingsViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.syncManagerProvider.get());
 
           default: throw new AssertionError(id);
         }
@@ -591,11 +612,11 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       injectReelTrackerService2(reelTrackerService);
     }
 
+    @CanIgnoreReturnValue
     private ReelTrackerService injectReelTrackerService2(ReelTrackerService instance) {
-      ReelTrackerService_MembersInjector.injectSessionDao(instance, singletonCImpl.provideSessionDaoProvider.get());
       ReelTrackerService_MembersInjector.injectPreferencesRepository(instance, singletonCImpl.preferencesRepositoryImplProvider.get());
-      ReelTrackerService_MembersInjector.injectDailyStatisticsDao(instance, singletonCImpl.provideDailyStatisticsDaoProvider.get());
       ReelTrackerService_MembersInjector.injectDayManager(instance, singletonCImpl.dayManagerProvider.get());
+      ReelTrackerService_MembersInjector.injectSyncManager(instance, singletonCImpl.syncManagerProvider.get());
       ReelTrackerService_MembersInjector.injectOverlayStateManager(instance, singletonCImpl.provideOverlayStateManagerProvider.get());
       return instance;
     }
@@ -610,15 +631,19 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     private Provider<ReelTrakDatabase> provideReelTrakDatabaseProvider;
 
-    private Provider<SessionDao> provideSessionDaoProvider;
-
-    private Provider<DailyStatisticsDao> provideDailyStatisticsDaoProvider;
-
-    private Provider<GlobalStatisticsDao> provideGlobalStatisticsDaoProvider;
+    private Provider<DailyReelDataDao> provideDailyReelDataDaoProvider;
 
     private Provider<OverlayStateManager> provideOverlayStateManagerProvider;
 
+    private Provider<ReelNotificationManager> reelNotificationManagerProvider;
+
+    private Provider<FirebaseFirestore> provideFirebaseFirestoreProvider;
+
     private Provider<DayManager> dayManagerProvider;
+
+    private Provider<SyncManager> syncManagerProvider;
+
+    private Provider<GoogleAuthManager> googleAuthManagerProvider;
 
     private SingletonCImpl(ApplicationContextModule applicationContextModuleParam) {
       this.applicationContextModule = applicationContextModuleParam;
@@ -630,11 +655,14 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
     private void initialize(final ApplicationContextModule applicationContextModuleParam) {
       this.preferencesRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<PreferencesRepositoryImpl>(singletonCImpl, 0));
       this.provideReelTrakDatabaseProvider = DoubleCheck.provider(new SwitchingProvider<ReelTrakDatabase>(singletonCImpl, 2));
-      this.provideSessionDaoProvider = DoubleCheck.provider(new SwitchingProvider<SessionDao>(singletonCImpl, 1));
-      this.provideDailyStatisticsDaoProvider = DoubleCheck.provider(new SwitchingProvider<DailyStatisticsDao>(singletonCImpl, 3));
-      this.provideGlobalStatisticsDaoProvider = DoubleCheck.provider(new SwitchingProvider<GlobalStatisticsDao>(singletonCImpl, 4));
-      this.provideOverlayStateManagerProvider = DoubleCheck.provider(new SwitchingProvider<OverlayStateManager>(singletonCImpl, 5));
-      this.dayManagerProvider = DoubleCheck.provider(new SwitchingProvider<DayManager>(singletonCImpl, 6));
+      this.provideDailyReelDataDaoProvider = DoubleCheck.provider(new SwitchingProvider<DailyReelDataDao>(singletonCImpl, 1));
+      this.provideOverlayStateManagerProvider = DoubleCheck.provider(new SwitchingProvider<OverlayStateManager>(singletonCImpl, 3));
+      this.reelNotificationManagerProvider = DoubleCheck.provider(new SwitchingProvider<ReelNotificationManager>(singletonCImpl, 5));
+      this.provideFirebaseFirestoreProvider = DoubleCheck.provider(new SwitchingProvider<FirebaseFirestore>(singletonCImpl, 7));
+      this.dayManagerProvider = new DelegateFactory<>();
+      this.syncManagerProvider = DoubleCheck.provider(new SwitchingProvider<SyncManager>(singletonCImpl, 6));
+      DelegateFactory.setDelegate(dayManagerProvider, DoubleCheck.provider(new SwitchingProvider<DayManager>(singletonCImpl, 4)));
+      this.googleAuthManagerProvider = DoubleCheck.provider(new SwitchingProvider<GoogleAuthManager>(singletonCImpl, 8));
     }
 
     @Override
@@ -643,7 +671,7 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     @Override
     public Set<Boolean> getDisableFragmentGetContextFix() {
-      return Collections.<Boolean>emptySet();
+      return ImmutableSet.<Boolean>of();
     }
 
     @Override
@@ -673,23 +701,29 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
           case 0: // com.reeltrak.app.data.repository.PreferencesRepositoryImpl 
           return (T) new PreferencesRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
 
-          case 1: // com.reeltrak.app.data.local.dao.SessionDao 
-          return (T) DatabaseModule_ProvideSessionDaoFactory.provideSessionDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
+          case 1: // com.reeltrak.app.data.local.dao.DailyReelDataDao 
+          return (T) DatabaseModule_ProvideDailyReelDataDaoFactory.provideDailyReelDataDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
 
           case 2: // com.reeltrak.app.data.local.database.ReelTrakDatabase 
           return (T) DatabaseModule_ProvideReelTrakDatabaseFactory.provideReelTrakDatabase(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
 
-          case 3: // com.reeltrak.app.data.local.dao.DailyStatisticsDao 
-          return (T) DatabaseModule_ProvideDailyStatisticsDaoFactory.provideDailyStatisticsDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
-
-          case 4: // com.reeltrak.app.data.local.dao.GlobalStatisticsDao 
-          return (T) DatabaseModule_ProvideGlobalStatisticsDaoFactory.provideGlobalStatisticsDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
-
-          case 5: // com.reeltrak.app.services.overlay.OverlayStateManager 
+          case 3: // com.reeltrak.app.services.overlay.OverlayStateManager 
           return (T) StateModule_ProvideOverlayStateManagerFactory.provideOverlayStateManager();
 
-          case 6: // com.reeltrak.app.services.tracking.DayManager 
-          return (T) new DayManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideDailyStatisticsDaoProvider.get(), singletonCImpl.provideGlobalStatisticsDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get());
+          case 4: // com.reeltrak.app.services.tracking.DayManager 
+          return (T) new DayManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.reelNotificationManagerProvider.get(), singletonCImpl.syncManagerProvider.get());
+
+          case 5: // com.reeltrak.app.services.notifications.ReelNotificationManager 
+          return (T) new ReelNotificationManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 6: // com.reeltrak.app.core.sync.SyncManager 
+          return (T) new SyncManager(singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.dayManagerProvider));
+
+          case 7: // com.google.firebase.firestore.FirebaseFirestore 
+          return (T) FirebaseModule_ProvideFirebaseFirestoreFactory.provideFirebaseFirestore();
+
+          case 8: // com.reeltrak.app.core.auth.GoogleAuthManager 
+          return (T) new GoogleAuthManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
 
           default: throw new AssertionError(id);
         }

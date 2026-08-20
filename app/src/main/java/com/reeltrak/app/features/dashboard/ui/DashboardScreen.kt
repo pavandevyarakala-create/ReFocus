@@ -19,26 +19,24 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 @Composable
 fun DashboardScreen(
-    viewModel: DashboardViewModel = hiltViewModel()
+    viewModel: DashboardViewModel = hiltViewModel(),
+    onStreakClick: () -> Unit = {}
 ) {
     val dailyIntentState = viewModel.dailyIntent.collectAsStateWithLifecycle()
     val reelsScrolledTodayState = viewModel.reelsScrolledToday.collectAsStateWithLifecycle()
-    val totalLifetimeReels by viewModel.totalLifetimeReels.collectAsStateWithLifecycle()
-    val avgReelsPerDay by viewModel.avgReelsPerDay.collectAsStateWithLifecycle()
     
-    val weeklyActivityData by viewModel.weeklyActivityData.collectAsStateWithLifecycle()
-    val habitTrackerData by viewModel.habitTrackerData.collectAsStateWithLifecycle()
     val liveState by viewModel.liveSessionState.collectAsStateWithLifecycle()
 
-    val isStrictMode by viewModel.isStrictModeEnabled.collectAsStateWithLifecycle()
+    val isStrictMode: Boolean? by viewModel.isStrictModeEnabled.collectAsStateWithLifecycle()
     val isStrictModeLocked by viewModel.isStrictModeLocked.collectAsStateWithLifecycle()
-    val isDailyLimitLocked by viewModel.isDailyLimitLocked.collectAsStateWithLifecycle()
+    val isLimitChangeRestricted by viewModel.isLimitChangeRestricted.collectAsStateWithLifecycle(initialValue = false)
 
-    var showStrictModeDialog by remember { mutableStateOf(false) }
     var showDailyLimitDialog by remember { mutableStateOf<Int?>(null) }
-
+    var showStrictModeConfirmation by remember { mutableStateOf(false) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedSession by remember { mutableStateOf<TimeBlock?>(null) }
+
+    val streakStats by viewModel.streakStats.collectAsStateWithLifecycle()
 
     LazyColumn(
         modifier = Modifier
@@ -51,30 +49,34 @@ fun DashboardScreen(
         item {
             HeroProgressCard(
                 dailyIntentProvider = { dailyIntentState.value }, 
-                currentReelsProvider = { reelsScrolledTodayState.value }
+                currentReelsProvider = { reelsScrolledTodayState.value },
+                streakStatsProvider = { streakStats },
+                isLimitLocked = isLimitChangeRestricted,
+                onSaveGoal = { newGoal ->
+                    showDailyLimitDialog = newGoal
+                },
+                onStreakClick = onStreakClick
             )
         }
         item {
             StrictModeCard(
-                isStrictModeEnabled = isStrictMode,
-                isLocked = isStrictModeLocked,
-                onToggleStrictMode = { 
-                    if (it) {
-                        showStrictModeDialog = true
+                isStrictModeEnabled = isStrictMode ?: false,
+                isLocked = isStrictModeLocked || isStrictMode == true || isStrictMode == null,
+                isLoading = isStrictMode == null,
+                onToggleStrictMode = { enabled ->
+                    if (enabled) {
+                        showStrictModeConfirmation = true
                     } else {
-                        // Logic already prevents turning it off if locked
                         viewModel.setStrictMode(false)
                     }
                 }
             )
         }
         item {
-            TodayGoalCard(
-                currentSavedGoalProvider = { dailyIntentState.value },
-                isLocked = isDailyLimitLocked,
-                onSaveGoal = { newGoal ->
-                    showDailyLimitDialog = newGoal
-                }
+            TodaysStatusCard(
+                dailyIntentProvider = { dailyIntentState.value },
+                currentReelsProvider = { reelsScrolledTodayState.value },
+                streakStatsProvider = { streakStats }
             )
         }
         item {
@@ -86,55 +88,15 @@ fun DashboardScreen(
                 )
             }
         }
-        item {
-            WeeklyActivityGraph(
-                weeklyData = weeklyActivityData,
-                onSessionClick = { session ->
-                    selectedSession = session
-                }
-            )
-        }
-        item {
-            GoalCalendar(dailyStats = habitTrackerData)
-        }
-        item {
-            LifetimeStatsGrid(
-                lifetimeReels = totalLifetimeReels,
-                avgReels = avgReelsPerDay
-            )
-        }
     }
     
     // --- Confirmation Dialogs ---
 
-    if (showStrictModeDialog) {
-        AlertDialog(
-            onDismissRequest = { showStrictModeDialog = false },
-            title = { Text("Enable Strict Mode?") },
-            text = { Text("Once enabled, Strict Mode cannot be turned off until today's reset at 12:00 AM.\n\nAre you sure you want to continue?") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.setStrictMode(true)
-                        showStrictModeDialog = false
-                    }
-                ) {
-                    Text("Enable")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showStrictModeDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
     showDailyLimitDialog?.let { goal ->
         AlertDialog(
             onDismissRequest = { showDailyLimitDialog = null },
-            title = { Text("Set Today's Reel Limit?") },
-            text = { Text("Once saved, today's reel limit cannot be changed until the daily reset at 12:00 AM.\n\nAre you sure you want to continue?") },
+            title = { Text("Set Daily Reel Limit?") },
+            text = { Text("This will become your default daily limit and will automatically apply every day. You won't need to set it again unless you decide to change it.\n\nLimit changes are allowed only once per calendar day.") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -153,6 +115,36 @@ fun DashboardScreen(
         )
     }
 
+    if (showStrictModeConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showStrictModeConfirmation = false },
+            title = { Text("Enable Strict Mode?") },
+            text = {
+                Text(
+                    "Once enabled, Strict Mode cannot be turned off until the current day ends (daily reset).\n\n" +
+                    "• You will not be able to disable it manually.\n" +
+                    "• When the daily reel limit is reached, access to Reels/Shorts will be prevented by simulating a Back action.\n\n" +
+                    "Only enable this if you are fully committed to your goals."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.setStrictMode(true)
+                        showStrictModeConfirmation = false
+                    }
+                ) {
+                    Text("Enable Strict Mode")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showStrictModeConfirmation = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     selectedSession?.let { session ->
         ModalBottomSheet(
             onDismissRequest = { selectedSession = null },
@@ -160,5 +152,19 @@ fun DashboardScreen(
         ) {
             SessionDetailSheet(session = session)
         }
+    }
+
+    val pendingBadge by viewModel.pendingCelebrationBadge.collectAsStateWithLifecycle()
+    pendingBadge?.let { milestone ->
+        CelebrationDialog(
+            milestone = milestone,
+            onDismiss = {
+                viewModel.dismissCelebration(milestone)
+            },
+            onViewCollection = {
+                viewModel.dismissCelebration(milestone)
+                onStreakClick()
+            }
+        )
     }
 }

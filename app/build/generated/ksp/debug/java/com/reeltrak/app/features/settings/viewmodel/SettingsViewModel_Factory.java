@@ -1,6 +1,8 @@
 package com.reeltrak.app.features.settings.viewmodel;
 
+import com.reeltrak.app.core.sync.SyncManager;
 import com.reeltrak.app.domain.repository.PreferencesRepository;
+import com.reeltrak.app.services.tracking.DayManager;
 import dagger.internal.DaggerGenerated;
 import dagger.internal.Factory;
 import dagger.internal.QualifierMetadata;
@@ -25,21 +27,30 @@ import javax.inject.Provider;
 public final class SettingsViewModel_Factory implements Factory<SettingsViewModel> {
   private final Provider<PreferencesRepository> preferencesRepositoryProvider;
 
-  public SettingsViewModel_Factory(Provider<PreferencesRepository> preferencesRepositoryProvider) {
+  private final Provider<DayManager> dayManagerProvider;
+
+  private final Provider<SyncManager> syncManagerProvider;
+
+  public SettingsViewModel_Factory(Provider<PreferencesRepository> preferencesRepositoryProvider,
+      Provider<DayManager> dayManagerProvider, Provider<SyncManager> syncManagerProvider) {
     this.preferencesRepositoryProvider = preferencesRepositoryProvider;
+    this.dayManagerProvider = dayManagerProvider;
+    this.syncManagerProvider = syncManagerProvider;
   }
 
   @Override
   public SettingsViewModel get() {
-    return newInstance(preferencesRepositoryProvider.get());
+    return newInstance(preferencesRepositoryProvider.get(), dayManagerProvider.get(), syncManagerProvider.get());
   }
 
   public static SettingsViewModel_Factory create(
-      Provider<PreferencesRepository> preferencesRepositoryProvider) {
-    return new SettingsViewModel_Factory(preferencesRepositoryProvider);
+      Provider<PreferencesRepository> preferencesRepositoryProvider,
+      Provider<DayManager> dayManagerProvider, Provider<SyncManager> syncManagerProvider) {
+    return new SettingsViewModel_Factory(preferencesRepositoryProvider, dayManagerProvider, syncManagerProvider);
   }
 
-  public static SettingsViewModel newInstance(PreferencesRepository preferencesRepository) {
-    return new SettingsViewModel(preferencesRepository);
+  public static SettingsViewModel newInstance(PreferencesRepository preferencesRepository,
+      DayManager dayManager, SyncManager syncManager) {
+    return new SettingsViewModel(preferencesRepository, dayManager, syncManager);
   }
 }
