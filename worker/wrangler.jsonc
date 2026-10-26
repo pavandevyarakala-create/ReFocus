@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "refocus-razorpay-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "triggers": {
+    "crons": [
+      "0 3 * * *"
+    ]
+  },
+  "vars": {
+    "FIREBASE_PROJECT_ID": "refocus-504119",
+    "FIREBASE_PROJECT_NUMBER": "524118238647",
+    "APP_CHECK_ENFORCEMENT_MODE": "audit",
+    "RAZORPAY_PLAN_ID": "plan_TdtgehXIhzQ8U9"
+  },
+  "env": {
+    "staging": {
+      "name": "refocus-razorpay-worker-staging",
+      "triggers": {
+        "crons": []
+      },
+      "vars": {
+        "FIREBASE_PROJECT_ID": "PLACEHOLDER_STAGING_FIREBASE_PROJECT_ID",
+        "FIREBASE_PROJECT_NUMBER": "PLACEHOLDER_STAGING_FIREBASE_PROJECT_NUMBER",
+        "APP_CHECK_ENFORCEMENT_MODE": "audit",
+        "RAZORPAY_PLAN_ID": "PLACEHOLDER_STAGING_RAZORPAY_TEST_PLAN_ID"
+      }
+    }
+  }
+}
+

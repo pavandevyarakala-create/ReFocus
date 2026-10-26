@@ -2,23 +2,53 @@ package com.reeltrak.app;
 
 import android.app.Activity;
 import android.app.Service;
+import android.content.Context;
 import android.view.View;
 import androidx.fragment.app.Fragment;
+import androidx.hilt.work.HiltWorkerFactory;
+import androidx.hilt.work.WorkerAssistedFactory;
+import androidx.hilt.work.WorkerFactoryModule_ProvideFactoryFactory;
 import androidx.lifecycle.SavedStateHandle;
 import androidx.lifecycle.ViewModel;
+import androidx.work.ListenableWorker;
+import androidx.work.WorkerParameters;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.firebase.firestore.FirebaseFirestore;
+import com.reeltrak.app.core.ads.RewardedAdManager;
 import com.reeltrak.app.core.auth.GoogleAuthManager;
+import com.reeltrak.app.core.di.CoroutinesModule_ProvideApplicationScopeFactory;
+import com.reeltrak.app.core.di.CoroutinesModule_ProvideDefaultDispatcherFactory;
+import com.reeltrak.app.core.di.CoroutinesModule_ProvideIoDispatcherFactory;
 import com.reeltrak.app.core.di.DatabaseModule_ProvideDailyReelDataDaoFactory;
+import com.reeltrak.app.core.di.DatabaseModule_ProvideLocalRestoreJournalDaoFactory;
 import com.reeltrak.app.core.di.DatabaseModule_ProvideReelTrakDatabaseFactory;
 import com.reeltrak.app.core.di.FirebaseModule_ProvideFirebaseFirestoreFactory;
+import com.reeltrak.app.core.di.NetworkModule_ProvideOkHttpClientFactory;
 import com.reeltrak.app.core.di.StateModule_ProvideOverlayStateManagerFactory;
+import com.reeltrak.app.core.sync.RestoreAckWorker;
+import com.reeltrak.app.core.sync.RestoreAckWorker_AssistedFactory;
+import com.reeltrak.app.core.sync.RestoreReconciler;
 import com.reeltrak.app.core.sync.SyncManager;
+import com.reeltrak.app.core.sync.SyncWorker;
+import com.reeltrak.app.core.sync.SyncWorker_AssistedFactory;
+import com.reeltrak.app.core.update.InAppUpdateManager;
 import com.reeltrak.app.data.local.dao.DailyReelDataDao;
+import com.reeltrak.app.data.local.dao.LocalRestoreJournalDao;
 import com.reeltrak.app.data.local.database.ReelTrakDatabase;
+import com.reeltrak.app.data.repository.AccountRepositoryImpl;
+import com.reeltrak.app.data.repository.LocalBackupRepositoryImpl;
+import com.reeltrak.app.data.repository.LocalRestoreRepositoryImpl;
+import com.reeltrak.app.data.repository.OnboardingRepositoryImpl;
 import com.reeltrak.app.data.repository.PreferencesRepositoryImpl;
+import com.reeltrak.app.data.repository.SubscriptionRepositoryImpl;
+import com.reeltrak.app.data.security.SubscriptionTimeAuthority;
+import com.reeltrak.app.data.security.authorization.AppAuthorizationManager;
+import com.reeltrak.app.data.security.authorization.AppIntegrityManager;
+import com.reeltrak.app.data.services.RazorpaySubscriptionPurchaseServiceImpl;
+import com.reeltrak.app.domain.managers.SubscriptionManager;
+import com.reeltrak.app.domain.repository.SubscriptionRepository;
 import com.reeltrak.app.features.auth.LoginViewModel;
 import com.reeltrak.app.features.auth.LoginViewModel_HiltModules;
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel;
@@ -55,9 +85,12 @@ import dagger.internal.KeepFieldType;
 import dagger.internal.LazyClassKeyMap;
 import dagger.internal.Preconditions;
 import dagger.internal.Provider;
+import dagger.internal.SingleCheck;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.processing.Generated;
+import kotlinx.coroutines.CoroutineScope;
+import okhttp3.OkHttpClient;
 
 @DaggerGenerated
 @Generated(
@@ -382,6 +415,7 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     @Override
     public void injectMainActivity(MainActivity mainActivity) {
+      injectMainActivity2(mainActivity);
     }
 
     @Override
@@ -409,27 +443,38 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       return new ViewCBuilder(singletonCImpl, activityRetainedCImpl, activityCImpl);
     }
 
+    @CanIgnoreReturnValue
+    private MainActivity injectMainActivity2(MainActivity instance) {
+      MainActivity_MembersInjector.injectSubscriptionManager(instance, DoubleCheck.lazy(singletonCImpl.subscriptionManagerProvider));
+      MainActivity_MembersInjector.injectRazorpayPurchaseService(instance, singletonCImpl.razorpaySubscriptionPurchaseServiceImplProvider.get());
+      MainActivity_MembersInjector.injectRewardedAdManager(instance, DoubleCheck.lazy(singletonCImpl.rewardedAdManagerProvider));
+      MainActivity_MembersInjector.injectInAppUpdateManager(instance, singletonCImpl.inAppUpdateManagerProvider.get());
+      MainActivity_MembersInjector.injectPreferencesRepository(instance, singletonCImpl.preferencesRepositoryImplProvider.get());
+      MainActivity_MembersInjector.injectDayManager(instance, DoubleCheck.lazy(singletonCImpl.dayManagerProvider));
+      return instance;
+    }
+
     @IdentifierNameString
     private static final class LazyClassKeyProvider {
-      static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
-
-      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
-
       static String com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel = "com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel";
+
+      static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
 
       static String com_reeltrak_app_features_auth_LoginViewModel = "com.reeltrak.app.features.auth.LoginViewModel";
 
-      @KeepFieldType
-      SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
-
-      @KeepFieldType
-      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
+      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
 
       @KeepFieldType
       DashboardViewModel com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel2;
 
       @KeepFieldType
+      SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
+
+      @KeepFieldType
       LoginViewModel com_reeltrak_app_features_auth_LoginViewModel2;
+
+      @KeepFieldType
+      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
     }
   }
 
@@ -479,25 +524,25 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     @IdentifierNameString
     private static final class LazyClassKeyProvider {
-      static String com_reeltrak_app_features_auth_LoginViewModel = "com.reeltrak.app.features.auth.LoginViewModel";
-
-      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
-
       static String com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel = "com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel";
 
       static String com_reeltrak_app_features_settings_viewmodel_SettingsViewModel = "com.reeltrak.app.features.settings.viewmodel.SettingsViewModel";
 
-      @KeepFieldType
-      LoginViewModel com_reeltrak_app_features_auth_LoginViewModel2;
+      static String com_reeltrak_app_features_auth_LoginViewModel = "com.reeltrak.app.features.auth.LoginViewModel";
 
-      @KeepFieldType
-      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
+      static String com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel = "com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel";
 
       @KeepFieldType
       DashboardViewModel com_reeltrak_app_features_dashboard_viewmodel_DashboardViewModel2;
 
       @KeepFieldType
       SettingsViewModel com_reeltrak_app_features_settings_viewmodel_SettingsViewModel2;
+
+      @KeepFieldType
+      LoginViewModel com_reeltrak_app_features_auth_LoginViewModel2;
+
+      @KeepFieldType
+      OnboardingViewModel com_reeltrak_app_features_onboarding_viewmodel_OnboardingViewModel2;
     }
 
     private static final class SwitchingProvider<T> implements Provider<T> {
@@ -522,16 +567,16 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       public T get() {
         switch (id) {
           case 0: // com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel 
-          return (T) new DashboardViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.provideOverlayStateManagerProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.reelNotificationManagerProvider.get());
+          return (T) new DashboardViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.provideOverlayStateManagerProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.reelNotificationManagerProvider.get(), singletonCImpl.subscriptionManagerProvider.get(), singletonCImpl.rewardedAdManagerProvider.get(), singletonCImpl.appAuthorizationManagerProvider.get());
 
           case 1: // com.reeltrak.app.features.auth.LoginViewModel 
-          return (T) new LoginViewModel(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.googleAuthManagerProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.syncManagerProvider.get(), singletonCImpl.provideReelTrakDatabaseProvider.get());
+          return (T) new LoginViewModel(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.googleAuthManagerProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.syncManagerProvider.get(), singletonCImpl.subscriptionManagerProvider.get(), singletonCImpl.provideReelTrakDatabaseProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.provideApplicationScopeProvider.get(), CoroutinesModule_ProvideIoDispatcherFactory.provideIoDispatcher());
 
           case 2: // com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel 
-          return (T) new OnboardingViewModel(singletonCImpl.preferencesRepositoryImplProvider.get());
+          return (T) new OnboardingViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.appAuthorizationManagerProvider));
 
           case 3: // com.reeltrak.app.features.settings.viewmodel.SettingsViewModel 
-          return (T) new SettingsViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.syncManagerProvider.get());
+          return (T) new SettingsViewModel(singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), singletonCImpl.onboardingRepositoryImplProvider.get(), singletonCImpl.subscriptionManagerProvider.get(), singletonCImpl.razorpaySubscriptionPurchaseServiceImplProvider.get(), singletonCImpl.dayManagerProvider.get(), singletonCImpl.syncManagerProvider.get(), singletonCImpl.appAuthorizationManagerProvider.get());
 
           default: throw new AssertionError(id);
         }
@@ -617,6 +662,10 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       ReelTrackerService_MembersInjector.injectPreferencesRepository(instance, singletonCImpl.preferencesRepositoryImplProvider.get());
       ReelTrackerService_MembersInjector.injectDayManager(instance, singletonCImpl.dayManagerProvider.get());
       ReelTrackerService_MembersInjector.injectSyncManager(instance, singletonCImpl.syncManagerProvider.get());
+      ReelTrackerService_MembersInjector.injectSubscriptionManager(instance, singletonCImpl.subscriptionManagerProvider.get());
+      ReelTrackerService_MembersInjector.injectAccountRepository(instance, singletonCImpl.accountRepositoryImplProvider.get());
+      ReelTrackerService_MembersInjector.injectAppAuthorizationManager(instance, singletonCImpl.appAuthorizationManagerProvider.get());
+      ReelTrackerService_MembersInjector.injectInAppUpdateManager(instance, singletonCImpl.inAppUpdateManagerProvider.get());
       ReelTrackerService_MembersInjector.injectOverlayStateManager(instance, singletonCImpl.provideOverlayStateManagerProvider.get());
       return instance;
     }
@@ -627,23 +676,59 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     private final SingletonCImpl singletonCImpl = this;
 
-    private Provider<PreferencesRepositoryImpl> preferencesRepositoryImplProvider;
-
     private Provider<ReelTrakDatabase> provideReelTrakDatabaseProvider;
 
-    private Provider<DailyReelDataDao> provideDailyReelDataDaoProvider;
+    private Provider<LocalRestoreJournalDao> provideLocalRestoreJournalDaoProvider;
 
-    private Provider<OverlayStateManager> provideOverlayStateManagerProvider;
+    private Provider<OkHttpClient> provideOkHttpClientProvider;
 
-    private Provider<ReelNotificationManager> reelNotificationManagerProvider;
+    private Provider<RestoreAckWorker_AssistedFactory> restoreAckWorker_AssistedFactoryProvider;
 
     private Provider<FirebaseFirestore> provideFirebaseFirestoreProvider;
 
+    private Provider<DailyReelDataDao> provideDailyReelDataDaoProvider;
+
+    private Provider<AccountRepositoryImpl> accountRepositoryImplProvider;
+
+    private Provider<SubscriptionTimeAuthority> subscriptionTimeAuthorityProvider;
+
+    private Provider<SubscriptionRepositoryImpl> subscriptionRepositoryImplProvider;
+
+    private Provider<AppIntegrityManager> appIntegrityManagerProvider;
+
+    private Provider<AppAuthorizationManager> appAuthorizationManagerProvider;
+
+    private Provider<SubscriptionManager> subscriptionManagerProvider;
+
+    private Provider<SyncWorker_AssistedFactory> syncWorker_AssistedFactoryProvider;
+
+    private Provider<RazorpaySubscriptionPurchaseServiceImpl> razorpaySubscriptionPurchaseServiceImplProvider;
+
+    private Provider<RewardedAdManager> rewardedAdManagerProvider;
+
+    private Provider<InAppUpdateManager> inAppUpdateManagerProvider;
+
+    private Provider<PreferencesRepositoryImpl> preferencesRepositoryImplProvider;
+
+    private Provider<ReelNotificationManager> reelNotificationManagerProvider;
+
     private Provider<DayManager> dayManagerProvider;
+
+    private Provider<LocalBackupRepositoryImpl> localBackupRepositoryImplProvider;
+
+    private Provider<LocalRestoreRepositoryImpl> localRestoreRepositoryImplProvider;
+
+    private Provider<RestoreReconciler> restoreReconcilerProvider;
+
+    private Provider<CoroutineScope> provideApplicationScopeProvider;
 
     private Provider<SyncManager> syncManagerProvider;
 
+    private Provider<OverlayStateManager> provideOverlayStateManagerProvider;
+
     private Provider<GoogleAuthManager> googleAuthManagerProvider;
+
+    private Provider<OnboardingRepositoryImpl> onboardingRepositoryImplProvider;
 
     private SingletonCImpl(ApplicationContextModule applicationContextModuleParam) {
       this.applicationContextModule = applicationContextModuleParam;
@@ -651,22 +736,50 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
 
     }
 
+    private Map<String, javax.inject.Provider<WorkerAssistedFactory<? extends ListenableWorker>>> mapOfStringAndProviderOfWorkerAssistedFactoryOf(
+        ) {
+      return ImmutableMap.<String, javax.inject.Provider<WorkerAssistedFactory<? extends ListenableWorker>>>of("com.reeltrak.app.core.sync.RestoreAckWorker", ((Provider) restoreAckWorker_AssistedFactoryProvider), "com.reeltrak.app.core.sync.SyncWorker", ((Provider) syncWorker_AssistedFactoryProvider));
+    }
+
+    private HiltWorkerFactory hiltWorkerFactory() {
+      return WorkerFactoryModule_ProvideFactoryFactory.provideFactory(mapOfStringAndProviderOfWorkerAssistedFactoryOf());
+    }
+
     @SuppressWarnings("unchecked")
     private void initialize(final ApplicationContextModule applicationContextModuleParam) {
-      this.preferencesRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<PreferencesRepositoryImpl>(singletonCImpl, 0));
       this.provideReelTrakDatabaseProvider = DoubleCheck.provider(new SwitchingProvider<ReelTrakDatabase>(singletonCImpl, 2));
-      this.provideDailyReelDataDaoProvider = DoubleCheck.provider(new SwitchingProvider<DailyReelDataDao>(singletonCImpl, 1));
-      this.provideOverlayStateManagerProvider = DoubleCheck.provider(new SwitchingProvider<OverlayStateManager>(singletonCImpl, 3));
-      this.reelNotificationManagerProvider = DoubleCheck.provider(new SwitchingProvider<ReelNotificationManager>(singletonCImpl, 5));
-      this.provideFirebaseFirestoreProvider = DoubleCheck.provider(new SwitchingProvider<FirebaseFirestore>(singletonCImpl, 7));
+      this.provideLocalRestoreJournalDaoProvider = DoubleCheck.provider(new SwitchingProvider<LocalRestoreJournalDao>(singletonCImpl, 1));
+      this.provideOkHttpClientProvider = DoubleCheck.provider(new SwitchingProvider<OkHttpClient>(singletonCImpl, 3));
+      this.restoreAckWorker_AssistedFactoryProvider = SingleCheck.provider(new SwitchingProvider<RestoreAckWorker_AssistedFactory>(singletonCImpl, 0));
+      this.provideFirebaseFirestoreProvider = DoubleCheck.provider(new SwitchingProvider<FirebaseFirestore>(singletonCImpl, 5));
+      this.provideDailyReelDataDaoProvider = DoubleCheck.provider(new SwitchingProvider<DailyReelDataDao>(singletonCImpl, 6));
+      this.accountRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<AccountRepositoryImpl>(singletonCImpl, 7));
+      this.subscriptionTimeAuthorityProvider = DoubleCheck.provider(new SwitchingProvider<SubscriptionTimeAuthority>(singletonCImpl, 10));
+      this.subscriptionRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<SubscriptionRepositoryImpl>(singletonCImpl, 9));
+      this.appIntegrityManagerProvider = DoubleCheck.provider(new SwitchingProvider<AppIntegrityManager>(singletonCImpl, 12));
+      this.appAuthorizationManagerProvider = DoubleCheck.provider(new SwitchingProvider<AppAuthorizationManager>(singletonCImpl, 11));
+      this.subscriptionManagerProvider = DoubleCheck.provider(new SwitchingProvider<SubscriptionManager>(singletonCImpl, 8));
+      this.syncWorker_AssistedFactoryProvider = SingleCheck.provider(new SwitchingProvider<SyncWorker_AssistedFactory>(singletonCImpl, 4));
+      this.razorpaySubscriptionPurchaseServiceImplProvider = DoubleCheck.provider(new SwitchingProvider<RazorpaySubscriptionPurchaseServiceImpl>(singletonCImpl, 13));
+      this.rewardedAdManagerProvider = DoubleCheck.provider(new SwitchingProvider<RewardedAdManager>(singletonCImpl, 14));
+      this.inAppUpdateManagerProvider = DoubleCheck.provider(new SwitchingProvider<InAppUpdateManager>(singletonCImpl, 15));
+      this.preferencesRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<PreferencesRepositoryImpl>(singletonCImpl, 16));
+      this.reelNotificationManagerProvider = DoubleCheck.provider(new SwitchingProvider<ReelNotificationManager>(singletonCImpl, 18));
       this.dayManagerProvider = new DelegateFactory<>();
-      this.syncManagerProvider = DoubleCheck.provider(new SwitchingProvider<SyncManager>(singletonCImpl, 6));
-      DelegateFactory.setDelegate(dayManagerProvider, DoubleCheck.provider(new SwitchingProvider<DayManager>(singletonCImpl, 4)));
-      this.googleAuthManagerProvider = DoubleCheck.provider(new SwitchingProvider<GoogleAuthManager>(singletonCImpl, 8));
+      this.localBackupRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<LocalBackupRepositoryImpl>(singletonCImpl, 20));
+      this.localRestoreRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<LocalRestoreRepositoryImpl>(singletonCImpl, 21));
+      this.restoreReconcilerProvider = DoubleCheck.provider(new SwitchingProvider<RestoreReconciler>(singletonCImpl, 22));
+      this.provideApplicationScopeProvider = DoubleCheck.provider(new SwitchingProvider<CoroutineScope>(singletonCImpl, 23));
+      this.syncManagerProvider = DoubleCheck.provider(new SwitchingProvider<SyncManager>(singletonCImpl, 19));
+      DelegateFactory.setDelegate(dayManagerProvider, DoubleCheck.provider(new SwitchingProvider<DayManager>(singletonCImpl, 17)));
+      this.provideOverlayStateManagerProvider = DoubleCheck.provider(new SwitchingProvider<OverlayStateManager>(singletonCImpl, 24));
+      this.googleAuthManagerProvider = DoubleCheck.provider(new SwitchingProvider<GoogleAuthManager>(singletonCImpl, 25));
+      this.onboardingRepositoryImplProvider = DoubleCheck.provider(new SwitchingProvider<OnboardingRepositoryImpl>(singletonCImpl, 26));
     }
 
     @Override
     public void injectReelTrakApplication(ReelTrakApplication reelTrakApplication) {
+      injectReelTrakApplication2(reelTrakApplication);
     }
 
     @Override
@@ -684,6 +797,12 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       return new ServiceCBuilder(singletonCImpl);
     }
 
+    @CanIgnoreReturnValue
+    private ReelTrakApplication injectReelTrakApplication2(ReelTrakApplication instance) {
+      ReelTrakApplication_MembersInjector.injectWorkerFactory(instance, hiltWorkerFactory());
+      return instance;
+    }
+
     private static final class SwitchingProvider<T> implements Provider<T> {
       private final SingletonCImpl singletonCImpl;
 
@@ -698,32 +817,96 @@ public final class DaggerReelTrakApplication_HiltComponents_SingletonC {
       @Override
       public T get() {
         switch (id) {
-          case 0: // com.reeltrak.app.data.repository.PreferencesRepositoryImpl 
-          return (T) new PreferencesRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+          case 0: // com.reeltrak.app.core.sync.RestoreAckWorker_AssistedFactory 
+          return (T) new RestoreAckWorker_AssistedFactory() {
+            @Override
+            public RestoreAckWorker create(Context appContext, WorkerParameters workerParams) {
+              return new RestoreAckWorker(appContext, workerParams, singletonCImpl.provideLocalRestoreJournalDaoProvider.get(), singletonCImpl.provideOkHttpClientProvider.get());
+            }
+          };
 
-          case 1: // com.reeltrak.app.data.local.dao.DailyReelDataDao 
-          return (T) DatabaseModule_ProvideDailyReelDataDaoFactory.provideDailyReelDataDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
+          case 1: // com.reeltrak.app.data.local.dao.LocalRestoreJournalDao 
+          return (T) DatabaseModule_ProvideLocalRestoreJournalDaoFactory.provideLocalRestoreJournalDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
 
           case 2: // com.reeltrak.app.data.local.database.ReelTrakDatabase 
           return (T) DatabaseModule_ProvideReelTrakDatabaseFactory.provideReelTrakDatabase(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
 
-          case 3: // com.reeltrak.app.services.overlay.OverlayStateManager 
-          return (T) StateModule_ProvideOverlayStateManagerFactory.provideOverlayStateManager();
+          case 3: // okhttp3.OkHttpClient 
+          return (T) NetworkModule_ProvideOkHttpClientFactory.provideOkHttpClient();
 
-          case 4: // com.reeltrak.app.services.tracking.DayManager 
-          return (T) new DayManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.reelNotificationManagerProvider.get(), singletonCImpl.syncManagerProvider.get());
+          case 4: // com.reeltrak.app.core.sync.SyncWorker_AssistedFactory 
+          return (T) new SyncWorker_AssistedFactory() {
+            @Override
+            public SyncWorker create(Context appContext2, WorkerParameters workerParams2) {
+              return new SyncWorker(appContext2, workerParams2, singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), singletonCImpl.subscriptionManagerProvider.get());
+            }
+          };
 
-          case 5: // com.reeltrak.app.services.notifications.ReelNotificationManager 
-          return (T) new ReelNotificationManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
-
-          case 6: // com.reeltrak.app.core.sync.SyncManager 
-          return (T) new SyncManager(singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.dayManagerProvider));
-
-          case 7: // com.google.firebase.firestore.FirebaseFirestore 
+          case 5: // com.google.firebase.firestore.FirebaseFirestore 
           return (T) FirebaseModule_ProvideFirebaseFirestoreFactory.provideFirebaseFirestore();
 
-          case 8: // com.reeltrak.app.core.auth.GoogleAuthManager 
+          case 6: // com.reeltrak.app.data.local.dao.DailyReelDataDao 
+          return (T) DatabaseModule_ProvideDailyReelDataDaoFactory.provideDailyReelDataDao(singletonCImpl.provideReelTrakDatabaseProvider.get());
+
+          case 7: // com.reeltrak.app.data.repository.AccountRepositoryImpl 
+          return (T) new AccountRepositoryImpl(singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 8: // com.reeltrak.app.domain.managers.SubscriptionManager 
+          return (T) new SubscriptionManager((SubscriptionRepository) ((Provider) singletonCImpl.subscriptionRepositoryImplProvider).get(), singletonCImpl.subscriptionTimeAuthorityProvider.get(), singletonCImpl.appAuthorizationManagerProvider.get());
+
+          case 9: // com.reeltrak.app.data.repository.SubscriptionRepositoryImpl 
+          return (T) new SubscriptionRepositoryImpl(singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.subscriptionTimeAuthorityProvider.get(), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 10: // com.reeltrak.app.data.security.SubscriptionTimeAuthority 
+          return (T) new SubscriptionTimeAuthority(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 11: // com.reeltrak.app.data.security.authorization.AppAuthorizationManager 
+          return (T) new AppAuthorizationManager((SubscriptionRepository) ((Provider) singletonCImpl.subscriptionRepositoryImplProvider).get(), singletonCImpl.subscriptionTimeAuthorityProvider.get(), singletonCImpl.appIntegrityManagerProvider.get(), ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 12: // com.reeltrak.app.data.security.authorization.AppIntegrityManager 
+          return (T) new AppIntegrityManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 13: // com.reeltrak.app.data.services.RazorpaySubscriptionPurchaseServiceImpl 
+          return (T) new RazorpaySubscriptionPurchaseServiceImpl(DoubleCheck.lazy(((Provider) singletonCImpl.subscriptionRepositoryImplProvider)), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 14: // com.reeltrak.app.core.ads.RewardedAdManager 
+          return (T) new RewardedAdManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 15: // com.reeltrak.app.core.update.InAppUpdateManager 
+          return (T) new InAppUpdateManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 16: // com.reeltrak.app.data.repository.PreferencesRepositoryImpl 
+          return (T) new PreferencesRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), DoubleCheck.lazy(singletonCImpl.appAuthorizationManagerProvider));
+
+          case 17: // com.reeltrak.app.services.tracking.DayManager 
+          return (T) new DayManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.reelNotificationManagerProvider.get(), singletonCImpl.syncManagerProvider.get(), singletonCImpl.appAuthorizationManagerProvider.get(), DoubleCheck.lazy(singletonCImpl.subscriptionManagerProvider));
+
+          case 18: // com.reeltrak.app.services.notifications.ReelNotificationManager 
+          return (T) new ReelNotificationManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.preferencesRepositoryImplProvider.get());
+
+          case 19: // com.reeltrak.app.core.sync.SyncManager 
+          return (T) new SyncManager(singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.dayManagerProvider), DoubleCheck.lazy(singletonCImpl.subscriptionManagerProvider), singletonCImpl.localBackupRepositoryImplProvider.get(), singletonCImpl.localRestoreRepositoryImplProvider.get(), singletonCImpl.restoreReconcilerProvider.get(), singletonCImpl.provideApplicationScopeProvider.get(), CoroutinesModule_ProvideIoDispatcherFactory.provideIoDispatcher(), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 20: // com.reeltrak.app.data.repository.LocalBackupRepositoryImpl 
+          return (T) new LocalBackupRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.subscriptionManagerProvider), CoroutinesModule_ProvideIoDispatcherFactory.provideIoDispatcher(), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 21: // com.reeltrak.app.data.repository.LocalRestoreRepositoryImpl 
+          return (T) new LocalRestoreRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideReelTrakDatabaseProvider.get(), singletonCImpl.provideDailyReelDataDaoProvider.get(), singletonCImpl.provideLocalRestoreJournalDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.accountRepositoryImplProvider.get(), DoubleCheck.lazy(singletonCImpl.subscriptionManagerProvider), CoroutinesModule_ProvideIoDispatcherFactory.provideIoDispatcher(), singletonCImpl.provideOkHttpClientProvider.get());
+
+          case 22: // com.reeltrak.app.core.sync.RestoreReconciler 
+          return (T) new RestoreReconciler(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideLocalRestoreJournalDaoProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get());
+
+          case 23: // @com.reeltrak.app.core.di.ApplicationScope kotlinx.coroutines.CoroutineScope 
+          return (T) CoroutinesModule_ProvideApplicationScopeFactory.provideApplicationScope(CoroutinesModule_ProvideDefaultDispatcherFactory.provideDefaultDispatcher());
+
+          case 24: // com.reeltrak.app.services.overlay.OverlayStateManager 
+          return (T) StateModule_ProvideOverlayStateManagerFactory.provideOverlayStateManager();
+
+          case 25: // com.reeltrak.app.core.auth.GoogleAuthManager 
           return (T) new GoogleAuthManager(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule));
+
+          case 26: // com.reeltrak.app.data.repository.OnboardingRepositoryImpl 
+          return (T) new OnboardingRepositoryImpl(ApplicationContextModule_ProvideContextFactory.provideContext(singletonCImpl.applicationContextModule), singletonCImpl.provideFirebaseFirestoreProvider.get(), singletonCImpl.preferencesRepositoryImplProvider.get(), singletonCImpl.accountRepositoryImplProvider.get());
 
           default: throw new AssertionError(id);
         }

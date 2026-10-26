@@ -1,0 +1,23 @@
+{
+  "name": "reel",
+  "version": "1.0.0",
+  "description": "Re:Focus Monorepo",
+  "private": true,
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node worker/test_runner.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pavandevyarakala-create/ReelTrak.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/pavandevyarakala-create/ReelTrak/issues"
+  },
+  "homepage": "https://github.com/pavandevyarakala-create/ReelTrak#readme"
+}

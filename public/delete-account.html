@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delete Account &amp; Data - Re:Focus by FOCRAMEX</title>
+    <meta name="description" content="Request deletion of your Re:Focus account and associated personal data in accordance with Google Play developer policies and privacy standards.">
+    <link rel="stylesheet" href="styles.css">
+    
+    <!-- Firebase App & Auth SDKs (Compat v10 for clean, robust CDN execution) -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+</head>
+<body>
+    <!-- Accessible Navigation -->
+    <nav class="nav-wrapper" aria-label="Main Navigation">
+        <div class="container nav-container glass-nav" style="border-radius: var(--radius-pill); margin-top: var(--space-sm); padding: 0 var(--space-md);">
+            <a href="/" class="logo" aria-label="Re:Focus Home">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                Re:<span>Focus</span>
+            </a>
+            
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="/#problem">About</a>
+                <a href="/#features">Features</a>
+                <a href="/#faq">FAQ</a>
+                <a href="support.html">Support</a>
+                <a href="privacy.html">Privacy</a>
+            </div>
+
+            <a href="/" class="btn btn-primary" style="padding: 0.5rem 1.25rem; font-size: var(--text-sm);">Return to Site</a>
+            
+            <button type="button" class="mobile-menu-btn" aria-label="Open Mobile Menu" aria-expanded="false" aria-controls="mobile-menu" onclick="window.location.href='/'">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+        </div>
+    </nav>
+
+    <main class="legal-section container">
+        <div class="legal-content">
+            <h1>Account &amp; Data Deletion Request</h1>
+            <p class="meta">Application: Re:Focus | Developer: FOCRAMEX | Last Updated: October 2026</p>
+
+            <div class="legal-alert">
+                <p><strong>Google Play Compliance Notice:</strong> This official web portal allows registered users of <strong>Re:Focus</strong> to initiate account deletion, manage deletion grace periods, or submit manual deletion requests without needing the mobile app installed.</p>
+            </div>
+
+            <h2>1. How to Delete Your Account (In-App Procedure)</h2>
+            <p>If you currently have the Re:Focus Android app installed on your device, you can delete your account directly inside the app at any time:</p>
+            <ol style="padding-left: var(--space-md); margin-bottom: var(--space-md); color: var(--text-secondary);">
+                <li style="margin-bottom: var(--space-xs);">Open the <strong>Re:Focus</strong> app on your Android device.</li>
+                <li style="margin-bottom: var(--space-xs);">Tap the <strong>Settings</strong> tab in the navigation bar.</li>
+                <li style="margin-bottom: var(--space-xs);">Scroll down to the <strong>Account</strong> or <strong>Danger Zone</strong> section.</li>
+                <li style="margin-bottom: var(--space-xs);">Tap <strong>Delete Account</strong>.</li>
+                <li style="margin-bottom: var(--space-xs);">Review the confirmation details and tap <strong>Confirm Delete</strong>.</li>
+            </ol>
+            <p style="font-size: var(--text-sm); color: var(--text-muted); margin-bottom: var(--space-lg);">
+                <em>What happens immediately:</em> Your active session ends and local device databases (Room SQLite cache, DataStore preferences) are wiped immediately from your phone. Your cloud profile enters the 7-day safety grace period.
+            </p>
+
+            <h2>2. Request Account Deletion Online (Without the App)</h2>
+            <p>If you have uninstalled the app or do not have your Android device accessible, you can initiate account deletion right here. To verify account ownership, sign in below with the Google account associated with your Re:Focus profile.</p>
+
+            <!-- Interactive Deletion Panel -->
+            <div class="deletion-panel" id="deletion-panel">
+                <div id="auth-signed-out">
+                    <h3>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                        Step 1: Verify Account Ownership
+                    </h3>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">
+                        Sign in with the Google account you used to register in the Re:Focus Android app. We never ask for or collect passwords directly.
+                    </p>
+                    <button type="button" id="btn-google-signin" class="btn btn-google">
+                        <svg width="18" height="18" viewBox="0 0 24 24">
+                            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+                            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+                        </svg>
+                        Verify with Google Account
+                    </button>
+                </div>
+
+                <div id="auth-signed-in" style="display: none;">
+                    <div class="auth-status-card">
+                        <div class="auth-user-info">
+                            <img id="user-photo" src="" alt="User Avatar" class="user-avatar" style="display: none;">
+                            <div>
+                                <div id="user-name" style="font-weight: 600; color: var(--text-primary); font-size: var(--text-sm);">User</div>
+                                <div id="user-email" style="font-size: 0.8125rem; color: var(--text-secondary);">user@example.com</div>
+                            </div>
+                        </div>
+                        <div id="status-badge-container">
+                            <span class="status-badge active" id="status-badge">Checking...</span>
+                        </div>
+                    </div>
+
+                    <!-- State A: ACTIVE Account -->
+                    <div id="state-active" style="display: none;">
+                        <h3>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                            Step 2: Request Account Deletion
+                        </h3>
+                        <p style="font-size: var(--text-sm); margin-bottom: var(--space-sm);">
+                            Submitting a deletion request will immediately initiate a <strong>7-day recovery grace period</strong>. 
+                            Your cloud sync will be paused, your recurring Razorpay subscription mandate (if active) will be scheduled for cancellation, and after 7 days, your account and all associated cloud data will be permanently wiped.
+                        </p>
+                        
+                        <div style="background: rgba(239, 68, 68, 0.05); border: 1px solid rgba(239, 68, 68, 0.2); border-radius: var(--radius-sm); padding: 1rem; margin-bottom: var(--space-md);">
+                            <label style="display: flex; align-items: flex-start; gap: 10px; font-size: var(--text-sm); color: var(--text-primary); cursor: pointer;">
+                                <input type="checkbox" id="confirm-check" style="margin-top: 3px;">
+                                <span>I understand that this action schedules my Re:Focus account for permanent deletion after 7 days, and all cloud streaks, tracking stats, and backups will be irrevocably destroyed.</span>
+                            </label>
+                        </div>
+
+                        <div style="display: flex; gap: var(--space-sm); flex-wrap: wrap;">
+                            <button type="button" id="btn-request-delete" class="btn btn-destructive" disabled>
+                                Request Account Deletion
+                            </button>
+                            <button type="button" id="btn-signout" class="btn btn-secondary" style="background: transparent;">
+                                Sign Out
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- State B: PENDING_DELETION Account -->
+                    <div id="state-pending" style="display: none;">
+                        <h3 style="color: #D97706;">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                            Account Deletion is Pending
+                        </h3>
+                        <div class="countdown-box">
+                            <p style="margin-bottom: 0.25rem;"><strong>Status: 7-Day Recovery Grace Period Active</strong></p>
+                            <p id="pending-details" style="font-size: 0.875rem; margin-bottom: 0;">Scheduled permanent purge date: <span id="scheduled-date">Calculating...</span></p>
+                        </div>
+                        <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">
+                            If you changed your mind or initiated this by mistake, you can restore your account right now before the grace period expires.
+                        </p>
+                        <div style="display: flex; gap: var(--space-sm); flex-wrap: wrap;">
+                            <button type="button" id="btn-cancel-delete" class="btn btn-primary">
+                                Cancel Deletion &amp; Restore Account
+                            </button>
+                            <button type="button" id="btn-signout-pending" class="btn btn-secondary" style="background: transparent;">
+                                Sign Out
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- State C: DELETED Account -->
+                    <div id="state-deleted" style="display: none;">
+                        <h3 style="color: #DC2626;">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
+                            Account Permanently Purged
+                        </h3>
+                        <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">
+                            Your Re:Focus account, Firestore records, streak analytics, and cloud backups have already been permanently and irreversibly purged from our infrastructure.
+                        </p>
+                        <button type="button" id="btn-signout-deleted" class="btn btn-secondary">
+                            Sign Out
+                        </button>
+                    </div>
+
+                    <!-- Notification Feedback Area -->
+                    <div id="action-message" style="display: none; margin-top: var(--space-md); padding: 0.75rem 1rem; border-radius: var(--radius-sm); font-size: var(--text-sm);"></div>
+                </div>
+            </div>
+
+            <h2>3. What Data Is Deleted Upon Account Deletion</h2>
+            <p>When your deletion request is processed and the 7-day grace period concludes, our automated Cloudflare backend executes a complete server-authoritative purge across all systems:</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Data Category</th>
+                        <th>Specific Records Removed</th>
+                        <th>Storage Location</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Authentication Identity</strong></td>
+                        <td>Firebase Auth UID, registered email address, Google Sign-In profile link</td>
+                        <td>Google Identity Toolkit</td>
+                    </tr>
+                    <tr>
+                        <td><strong>User Profile Document</strong></td>
+                        <td>User display name, avatar URL, creation timestamp, account settings (<code>/users/{uid}</code>)</td>
+                        <td>Cloud Firestore</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Reel Tracking History</strong></td>
+                        <td>Daily watch metrics, short-form video tallies, timestamps (<code>/users/{uid}/daily_data/*</code>)</td>
+                        <td>Cloud Firestore</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Cloud Backups</strong></td>
+                        <td>All periodic cloud snapshots and restored checkpoints (<code>/users/{uid}/backup/*</code>)</td>
+                        <td>Cloud Firestore</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Subscription Status</strong></td>
+                        <td>App entitlement records, trial metadata (<code>/users/{uid}/subscription/*</code>)</td>
+                        <td>Cloud Firestore</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Device-Local Data</strong></td>
+                        <td>Room SQLite database, active session logs, DataStore preferences</td>
+                        <td>Android Local Storage (Device)</td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2>4. What Data May Be Retained &amp; Why</h2>
+            <p>In accordance with applicable statutory laws, tax frameworks, and fraud prevention regulations, the following limited records are retained:</p>
+            <ul>
+                <li><strong>Statutory Financial &amp; Tax Records:</strong> If you purchased a Pro membership, billing invoices, payment IDs, and transaction tax records are maintained by our payment partner (Razorpay) to comply with Indian GST laws and accounting audits. These records contain zero browsing, reel-watching, or device metrics. Retention period: Up to statutory tax requirement (typically 7-8 financial years).</li>
+                <li><strong>Anti-Abuse Fraud Prevention:</strong> Cryptographic hashes of completed Razorpay webhook event IDs (<code>razorpay_events/{eventId}</code>) are retained to prevent double-crediting and replay attacks. They contain no personal user browsing history.</li>
+            </ul>
+
+            <h2>5. The 7-Day Waiting Period Explained</h2>
+            <p>To prevent malicious account deletion from hijacked devices or accidental misclicks:</p>
+            <ul>
+                <li><strong>Transition to PENDING_DELETION:</strong> Submitting a deletion request places your account into a 7-day grace period.</li>
+                <li><strong>Cancellation &amp; Restoration:</strong> During these 7 days, you can cancel the request at any time either by signing in to this web portal and clicking "Cancel Deletion &amp; Restore Account", or by signing into the Re:Focus Android app.</li>
+                <li><strong>Permanent Purge:</strong> When the 7 days elapse, any incoming synchronization or status check triggers an irreversible backend purge of your Firestore subcollections, backups, and Firebase Authentication user.</li>
+                <li><strong>Autopay Mandates:</strong> Requesting deletion proactively cancels any upcoming auto-renewal cycles with Razorpay so you are not billed during or after the waiting period.</li>
+            </ul>
+
+            <h2>6. Alternative: Manual Deletion Request via Email</h2>
+            <p>If you cannot sign in using your Google account or have uninstalled the app and need assistance, you can submit a manual deletion request to our privacy team:</p>
+            <div class="contact-card">
+                <p><strong>Support Email:</strong> <a href="mailto:support.refocus@gmail.com?subject=Account%20Deletion%20Request%20-%20Re:Focus">support.refocus@gmail.com</a></p>
+                <p><strong>Subject:</strong> <code>Account Deletion Request - Re:Focus</code></p>
+                <p><strong>Requirements:</strong> Please send your request from the exact Google email address associated with your Re:Focus account. For security, we verify email ownership before manually scheduling deletion.</p>
+                <p><strong>Processing Time:</strong> Manual email requests are acknowledged within 24 hours and scheduled within 48 to 72 business hours.</p>
+            </div>
+
+            <h2>7. Legal &amp; Policy Links</h2>
+            <p>For more information on our data practices and terms, please review:</p>
+            <ul>
+                <li><a href="privacy.html">Privacy Policy</a> — Detailed explanation of on-device counting and zero video content capture.</li>
+                <li><a href="terms.html">Terms &amp; Conditions</a> — Membership billing, cancellations, and usage conditions.</li>
+                <li><a href="support.html">Help &amp; Troubleshooting</a> — Frequently asked questions and setup guides.</li>
+            </ul>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="/" class="logo" style="margin-bottom: var(--space-sm);" aria-label="Re:Focus Home">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        Re:<span>Focus</span>
+                    </a>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">Official companion website for the Re:Focus Android digital wellness application by FOCRAMEX.</p>
+                    <p style="font-size: var(--text-sm); color: var(--text-muted);">&copy; 2026 Re:Focus by FOCRAMEX. All rights reserved.</p>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <a href="/#problem">About Re:Focus</a>
+                    <a href="/#features">Features</a>
+                    <a href="/#faq">FAQ</a>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Support &amp; Compliance</h4>
+                    <a href="/#faq">FAQ</a>
+                    <a href="support.html">Help &amp; Troubleshooting</a>
+                    <a href="delete-account.html">Account &amp; Data Deletion</a>
+                    <a href="mailto:support.refocus@gmail.com">Contact Support</a>
+                </div>
+
+                <div class="footer-col">
+                    <h4>Legal</h4>
+                    <a href="privacy.html">Privacy Policy</a>
+                    <a href="terms.html">Terms &amp; Conditions</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Account Deletion Client Script -->
+    <script>
+        const FIREBASE_CONFIG = {
+            apiKey: "AIzaSyBilmiuqvT56rMlShcdW1R7X39d1vYj8MA",
+            authDomain: "refocus-504119.firebaseapp.com",
+            projectId: "refocus-504119",
+            storageBucket: "refocus-504119.firebasestorage.app",
+            messagingSenderId: "524118238647",
+            appId: "1:524118238647:web:8e16f7396694e24efd229e"
+        };
+
+        const WORKER_BASE_URL = "https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev";
+
+        // Initialize Firebase
+        if (!firebase.apps.length) {
+            firebase.initializeApp(FIREBASE_CONFIG);
+        }
+        const auth = firebase.auth();
+
+        // DOM elements
+        const signedOutView = document.getElementById("auth-signed-out");
+        const signedInView = document.getElementById("auth-signed-in");
+        const btnGoogleSignIn = document.getElementById("btn-google-signin");
+        const userPhoto = document.getElementById("user-photo");
+        const userName = document.getElementById("user-name");
+        const userEmail = document.getElementById("user-email");
+        const statusBadge = document.getElementById("status-badge");
+        const stateActive = document.getElementById("state-active");
+        const statePending = document.getElementById("state-pending");
+        const stateDeleted = document.getElementById("state-deleted");
+        const confirmCheck = document.getElementById("confirm-check");
+        const btnRequestDelete = document.getElementById("btn-request-delete");
+        const btnCancelDelete = document.getElementById("btn-cancel-delete");
+        const btnSignOut = document.getElementById("btn-signout");
+        const btnSignOutPending = document.getElementById("btn-signout-pending");
+        const btnSignOutDeleted = document.getElementById("btn-signout-deleted");
+        const scheduledDate = document.getElementById("scheduled-date");
+        const actionMessage = document.getElementById("action-message");
+
+        function showMessage(msg, isError = false) {
+            actionMessage.style.display = "block";
+            actionMessage.style.background = isError ? "rgba(239, 68, 68, 0.1)" : "rgba(34, 197, 94, 0.1)";
+            actionMessage.style.border = isError ? "1px solid #EF4444" : "1px solid #22C55E";
+            actionMessage.style.color = isError ? "#B91C1C" : "#15803D";
+            actionMessage.textContent = msg;
+        }
+
+        function clearMessage() {
+            actionMessage.style.display = "none";
+            actionMessage.textContent = "";
+        }
+
+        // Checkbox enables button
+        confirmCheck.addEventListener("change", (e) => {
+            btnRequestDelete.disabled = !e.target.checked;
+        });
+
+        // Google Sign In
+        btnGoogleSignIn.addEventListener("click", async () => {
+            clearMessage();
+            btnGoogleSignIn.disabled = true;
+            btnGoogleSignIn.textContent = "Connecting to Google...";
+            const provider = new firebase.auth.GoogleAuthProvider();
+            try {
+                await auth.signInWithPopup(provider);
+            } catch (err) {
+                console.error("Sign-in error:", err);
+                btnGoogleSignIn.disabled = false;
+                btnGoogleSignIn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg> Verify with Google Account`;
+                showMessage("Authentication was cancelled or failed. Please try again.", true);
+            }
+        });
+
+        // Sign Out handler
+        const handleSignOut = () => {
+            clearMessage();
+            auth.signOut();
+        };
+        btnSignOut.addEventListener("click", handleSignOut);
+        btnSignOutPending.addEventListener("click", handleSignOut);
+        btnSignOutDeleted.addEventListener("click", handleSignOut);
+
+        // Fetch Account Status from Worker
+        async function loadAccountStatus(user) {
+            clearMessage();
+            statusBadge.className = "status-badge";
+            statusBadge.textContent = "Checking...";
+            stateActive.style.display = "none";
+            statePending.style.display = "none";
+            stateDeleted.style.display = "none";
+
+            try {
+                const token = await user.getIdToken();
+                const res = await fetch(`${WORKER_BASE_URL}/api/account/status`, {
+                    headers: { "Authorization": `Bearer ${token}` }
+                });
+
+                if (res.status === 410) {
+                    statusBadge.className = "status-badge deleted";
+                    statusBadge.textContent = "DELETED";
+                    stateDeleted.style.display = "block";
+                    return;
+                }
+
+                if (!res.ok) {
+                    showMessage("Unable to verify account status with the server. Please try again later.", true);
+                    return;
+                }
+
+                const data = await res.json();
+                const status = data.accountStatus || "ACTIVE";
+
+                if (status === "PENDING_DELETION") {
+                    statusBadge.className = "status-badge pending";
+                    statusBadge.textContent = "PENDING DELETION";
+                    statePending.style.display = "block";
+                    
+                    if (data.deletionScheduledFor) {
+                        const dateObj = new Date(data.deletionScheduledFor);
+                        scheduledDate.textContent = dateObj.toLocaleDateString(undefined, { 
+                            year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" 
+                        });
+                    } else {
+                        scheduledDate.textContent = "In 7 days";
+                    }
+                } else if (status === "DELETED") {
+                    statusBadge.className = "status-badge deleted";
+                    statusBadge.textContent = "DELETED";
+                    stateDeleted.style.display = "block";
+                } else {
+                    statusBadge.className = "status-badge active";
+                    statusBadge.textContent = "ACTIVE";
+                    stateActive.style.display = "block";
+                    confirmCheck.checked = false;
+                    btnRequestDelete.disabled = true;
+                }
+            } catch (err) {
+                console.error("Status load error:", err);
+                showMessage("Connection error when communicating with Re:Focus servers.", true);
+            }
+        }
+
+        // Request Account Deletion Action
+        btnRequestDelete.addEventListener("click", async () => {
+            const user = auth.currentUser;
+            if (!user) return;
+
+            clearMessage();
+            btnRequestDelete.disabled = true;
+            btnRequestDelete.textContent = "Scheduling Deletion...";
+
+            try {
+                const token = await user.getIdToken();
+                const res = await fetch(`${WORKER_BASE_URL}/api/account/request-deletion`, {
+                    method: "POST",
+                    headers: { 
+                        "Authorization": `Bearer ${token}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({})
+                });
+
+                const data = await res.json();
+                if (res.ok) {
+                    showMessage("Deletion scheduled successfully. Your 7-day grace period has begun.");
+                    await loadAccountStatus(user);
+                } else {
+                    showMessage(data.error || "Failed to schedule account deletion. Please try again.", true);
+                    btnRequestDelete.disabled = false;
+                    btnRequestDelete.textContent = "Request Account Deletion";
+                }
+            } catch (err) {
+                console.error("Request deletion error:", err);
+                showMessage("Network error while submitting deletion request.", true);
+                btnRequestDelete.disabled = false;
+                btnRequestDelete.textContent = "Request Account Deletion";
+            }
+        });
+
+        // Cancel Deletion Action
+        btnCancelDelete.addEventListener("click", async () => {
+            const user = auth.currentUser;
+            if (!user) return;
+
+            clearMessage();
+            btnCancelDelete.disabled = true;
+            btnCancelDelete.textContent = "Restoring Account...";
+
+            try {
+                const token = await user.getIdToken();
+                const res = await fetch(`${WORKER_BASE_URL}/api/account/cancel-deletion`, {
+                    method: "POST",
+                    headers: { 
+                        "Authorization": `Bearer ${token}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({})
+                });
+
+                const data = await res.json();
+                if (res.ok) {
+                    showMessage("Your account deletion has been cancelled! Your account is active.");
+                    await loadAccountStatus(user);
+                } else {
+                    showMessage(data.error || "Failed to cancel deletion.", true);
+                    btnCancelDelete.disabled = false;
+                    btnCancelDelete.textContent = "Cancel Deletion & Restore Account";
+                }
+            } catch (err) {
+                console.error("Cancel deletion error:", err);
+                showMessage("Network error while cancelling deletion.", true);
+                btnCancelDelete.disabled = false;
+                btnCancelDelete.textContent = "Cancel Deletion & Restore Account";
+            }
+        });
+
+        // Auth State Observer
+        auth.onAuthStateChanged((user) => {
+            if (user) {
+                signedOutView.style.display = "none";
+                signedInView.style.display = "block";
+                userName.textContent = user.displayName || "Re:Focus User";
+                userEmail.textContent = user.email || "";
+                if (user.photoURL) {
+                    userPhoto.src = user.photoURL;
+                    userPhoto.style.display = "block";
+                } else {
+                    userPhoto.style.display = "none";
+                }
+                loadAccountStatus(user);
+            } else {
+                signedInView.style.display = "none";
+                signedOutView.style.display = "block";
+                btnGoogleSignIn.disabled = false;
+                btnGoogleSignIn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg> Verify with Google Account`;
+            }
+        });
+    </script>
+</body>
+</html>

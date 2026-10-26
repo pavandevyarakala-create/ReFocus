@@ -7,6 +7,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -33,12 +34,16 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
+import com.reeltrak.app.BuildConfig
+import com.reeltrak.app.core.ui.theme.ReFocusColors
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.text.font.FontWeight
@@ -59,9 +64,11 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.reeltrak.app.core.ui.theme.GenesisTheme
 import com.reeltrak.app.services.overlay.OverlayLifecycleState
+import com.reeltrak.app.services.overlay.OverlayAttachmentRetryPolicy
 import com.reeltrak.app.services.overlay.OverlayState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -87,7 +94,14 @@ class FloatingCounterManager(
     @Volatile
     private var isDestroyed = false
 
+    private val attachmentPolicy = OverlayAttachmentRetryPolicy()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var attachRequestPending = false
+    private var pendingAttachRunnable: Runnable? = null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var stateCollectorJob: Job? = null
+    private var windowOffsetCollectorJob: Job? = null
 
     private val windowOffsetFlow = MutableStateFlow<Pair<Int, Int>?>(null)
     private var snapAnimator: ValueAnimator? = null
@@ -100,36 +114,48 @@ class FloatingCounterManager(
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
     }
 
+    private data class ScreenDimensions(val width: Int, val height: Int)
+
+    private fun getScreenDimensions(): ScreenDimensions {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            ScreenDimensions(bounds.width(), bounds.height())
+        } else {
+            @Suppress("DEPRECATION")
+            val display = windowManager.defaultDisplay
+            val point = android.graphics.Point()
+            @Suppress("DEPRECATION")
+            display.getSize(point)
+            ScreenDimensions(point.x, point.y)
+        }
+    }
+
+    private fun getSafeTopInset(density: Float, extraPadding: Int = (-4 * density).toInt()): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val insets = windowManager.currentWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
+                WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()
+            )
+            val top = insets.top
+            if (top > 0) top + extraPadding else (24 * density).toInt() + extraPadding
+        } else {
+            val resourceId = context.resources.getIdentifier("status_bar_height", "dimen", "android")
+            if (resourceId > 0) {
+                context.resources.getDimensionPixelSize(resourceId) + extraPadding
+            } else {
+                (24 * density).toInt() + extraPadding
+            }
+        }
+    }
+
     private fun saveWindowPosition() {
         val view = composeView ?: return
         val params = view.layoutParams as? WindowManager.LayoutParams ?: return
         
         val density = context.resources.displayMetrics.density
-        val extraPadding = (-4 * density).toInt() 
-        
-        var maxX = 0
-        var safeTopInset = 0
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val metrics = windowManager.currentWindowMetrics
-            val bounds = metrics.bounds
-            val insets = metrics.windowInsets.getInsetsIgnoringVisibility(
-                WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()
-            )
-            safeTopInset = insets.top
-            if (safeTopInset > 0) safeTopInset += extraPadding
-            maxX = bounds.width() - view.width
-        } else {
-            val display = windowManager.defaultDisplay
-            val point = android.graphics.Point()
-            display.getSize(point)
-            maxX = point.x - view.width
-            val resourceId = context.resources.getIdentifier("status_bar_height", "dimen", "android")
-            if (resourceId > 0) {
-                safeTopInset = context.resources.getDimensionPixelSize(resourceId) + extraPadding
-            } else {
-                safeTopInset = (24 * density).toInt()
-            }
-        }
+        val extraPadding = (-4 * density).toInt()
+        val screenDimensions = getScreenDimensions()
+        val safeTopInset = getSafeTopInset(density, extraPadding)
+        val maxX = screenDimensions.width - view.width
         
         val currentX = params.x
         
@@ -156,11 +182,7 @@ class FloatingCounterManager(
         snapStateFlow.value = targetSnap
         
         val currentY = params.y
-        val screenHeight = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.currentWindowMetrics.bounds.height()
-        } else {
-            val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
-        }
+        val screenHeight = screenDimensions.height
         val maxYVal = screenHeight - view.height - (16 * density).toInt()
         val clampedY = currentY.coerceIn(safeTopInset, Math.max(safeTopInset, maxYVal))
         
@@ -202,14 +224,26 @@ class FloatingCounterManager(
         }
     }
 
+    @Synchronized
     fun attach() {
         Log.d("OverlayDebug", "[FloatingCounterManager] attach() called.")
-        if (composeView != null) return
-        
-        Handler(Looper.getMainLooper()).post {
-            if (isDestroyed) return@post
+        if (isDestroyed || attachRequestPending || attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHING) return
+        if (attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHED && composeView?.isAttachedToWindow == true) return
+
+        attachRequestPending = true
+        val attachRunnable = Runnable {
+            synchronized(this) {
+                attachRequestPending = false
+                pendingAttachRunnable = null
+            }
+            if (isDestroyed) return@Runnable
             try {
-                if (composeView != null) return@post
+                if (attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHED) {
+                    if (composeView?.isAttachedToWindow == true) return@Runnable
+                    releaseViewAfterFailedAttachment()
+                    attachmentPolicy.windowDetached()
+                }
+                if (!attachmentPolicy.beginAttempt(SystemClock.elapsedRealtime())) return@Runnable
                 
                 composeView = ComposeView(context).apply {
                     setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
@@ -218,10 +252,16 @@ class FloatingCounterManager(
                     setViewTreeViewModelStoreOwner(this@FloatingCounterManager)
                     
                     setContent {
-                        GenesisTheme {
+                        val state by stateFlow.collectAsState()
+                        val snapState by snapStateFlow.collectAsState()
+
+                        val isCounterDark = when (state.counterThemeMode) {
+                            com.reeltrak.app.domain.models.ThemeMode.LIGHT -> false
+                            com.reeltrak.app.domain.models.ThemeMode.DARK -> true
+                        }
+
+                        GenesisTheme(darkTheme = isCounterDark) {
                             Surface(color = Color.Transparent) {
-                                val state by stateFlow.collectAsStateWithLifecycle()
-                                val snapState by snapStateFlow.collectAsStateWithLifecycle()
                                 FloatingIcon(
                                     state = state,
                                     snapState = snapState,
@@ -247,11 +287,7 @@ class FloatingCounterManager(
                                                 val newX = if (currentSnap == "LEFT") {
                                                     -(view.width * 0.35f).toInt() + detachThreshold.toInt()
                                                 } else {
-                                                    val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                                        windowManager.currentWindowMetrics.bounds.width()
-                                                    } else {
-                                                        val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
-                                                    }
+                                                    val screenWidth = getScreenDimensions().width
                                                     (screenWidth - (view.width * 0.65f).toInt()) - detachThreshold.toInt()
                                                 }
                                                 windowOffsetFlow.value = Pair(newX, params.y + dy.toInt())
@@ -285,16 +321,9 @@ class FloatingCounterManager(
                 
                 snapStateFlow.value = savedSnap
                 
-                val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    windowManager.currentWindowMetrics.bounds.width()
-                } else {
-                    val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.x
-                }
-                val screenHeight = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    windowManager.currentWindowMetrics.bounds.height()
-                } else {
-                    val p = android.graphics.Point(); windowManager.defaultDisplay.getSize(p); p.y
-                }
+                val screenDimensions = getScreenDimensions()
+                val screenWidth = screenDimensions.width
+                val screenHeight = screenDimensions.height
 
                 // Initial position fallback logic
                 val estimatedWidth = 75 * density
@@ -304,12 +333,7 @@ class FloatingCounterManager(
                     else -> ((screenWidth - estimatedWidth) / 2).toInt()
                 }
                 
-                var safeTopInset = (24 * density).toInt()
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    safeTopInset = windowManager.currentWindowMetrics.windowInsets.getInsetsIgnoringVisibility(
-                        WindowInsets.Type.statusBars() or WindowInsets.Type.displayCutout()
-                    ).top + (-4 * density).toInt()
-                }
+                val safeTopInset = getSafeTopInset(density, (-4 * density).toInt())
                 val initY = savedY ?: safeTopInset
 
                 // Clamp to screen bounds if screen size changed
@@ -346,16 +370,66 @@ class FloatingCounterManager(
                 
                 windowManager.addView(composeView, params)
                 
-                // Binary Visibility Controller: Instantly sync View visibility with state
-                // This eliminates all fading/translucency issues.
-                scope.launch {
+                // Binary Visibility Controller & Samsung Display Synchronizer:
+                // Instantly sync View visibility with state, and force a ViewRootImpl traversal
+                // (invalidate) when state changes while visible.
+                // On Samsung One UI, non-focused accessibility overlay windows have their display list
+                // update/VSYNC throttled by the compositor if no touch events or View traversals occur.
+                stateCollectorJob?.cancel()
+                stateCollectorJob = scope.launch {
+                    var lastRenderedCount: Int? = null
+                    var lastRenderedThemeMode: com.reeltrak.app.domain.models.ThemeMode? = null
+                    var lastRenderedUpdateRequired: Boolean? = null
+                    var lastRenderedVisibility: Boolean? = null
+
                     stateFlow.collect { state ->
                         val isVisible = state.lifecycleState == OverlayLifecycleState.VISIBLE
-                        composeView?.visibility = if (isVisible) View.VISIBLE else View.GONE
+                        composeView?.let { view ->
+                            val visibilityChanged = (lastRenderedVisibility != isVisible)
+                            if (visibilityChanged) {
+                                view.visibility = if (isVisible) View.VISIBLE else View.GONE
+                                lastRenderedVisibility = isVisible
+                            }
+
+                            if (isVisible) {
+                                val countChanged = lastRenderedCount != null && lastRenderedCount != state.count
+                                val themeChanged = lastRenderedThemeMode != null && lastRenderedThemeMode != state.counterThemeMode
+                                val updateChanged = lastRenderedUpdateRequired != null && lastRenderedUpdateRequired != state.isUpdateRequired
+
+                                if (countChanged || themeChanged || updateChanged) {
+                                    val digitCountChanged = lastRenderedCount != null &&
+                                        (lastRenderedCount.toString().length != state.count.toString().length)
+
+                                    if (BuildConfig.DEBUG) {
+                                        Log.d(
+                                            "COUNTER_DIAG",
+                                            "[POINT_4_UI_CONSUMED] State consumed: count=${state.count} (prev=$lastRenderedCount), theme=${state.counterThemeMode}, updateRequired=${state.isUpdateRequired}, invalidate=true, requestLayout=$digitCountChanged"
+                                        )
+                                    }
+                                    // Always invalidate so ViewRootImpl performs performDraw() on Samsung One UI
+                                    view.invalidate()
+
+                                    // Only request layout pass if dimensions could genuinely change
+                                    // (e.g. digit count expanded 9->10, or theme/update state changed)
+                                    if (digitCountChanged || themeChanged || updateChanged) {
+                                        view.requestLayout()
+                                    }
+                                } else if (lastRenderedCount == null && BuildConfig.DEBUG) {
+                                    Log.d(
+                                        "COUNTER_DIAG",
+                                        "[POINT_4_UI_CONSUMED] Initial state consumed: count=${state.count}, theme=${state.counterThemeMode}"
+                                    )
+                                }
+                            }
+                        }
+                        lastRenderedCount = state.count
+                        lastRenderedThemeMode = state.counterThemeMode
+                        lastRenderedUpdateRequired = state.isUpdateRequired
                     }
                 }
                 
-                scope.launch {
+                windowOffsetCollectorJob?.cancel()
+                windowOffsetCollectorJob = scope.launch {
                     windowOffsetFlow.collect { offset ->
                         if (offset != null) {
                             val view = composeView ?: return@collect
@@ -371,22 +445,68 @@ class FloatingCounterManager(
                 
                 lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
                 lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+                attachmentPolicy.attachmentSucceeded()
                 
             } catch (e: Exception) {
-                Log.e("OverlayDebug", "[FloatingCounterManager] Error in attach loop: ${e.message}", e)
+                Log.e("OverlayDebug", "[FloatingCounterManager] Overlay attachment failed; a later eligible event may retry: ${e.message}", e)
+                attachmentPolicy.attachmentFailed(SystemClock.elapsedRealtime())
+                releaseViewAfterFailedAttachment()
+            }
+        }
+        pendingAttachRunnable = attachRunnable
+        mainHandler.post(attachRunnable)
+    }
+
+    /** Reopens the bounded retry window when Android reconnects the accessibility service. */
+    fun allowRetryAfterLifecycle() {
+        attachmentPolicy.allowLifecycleRetry()
+        attach()
+    }
+
+    private fun releaseViewAfterFailedAttachment() {
+        stateCollectorJob?.cancel()
+        stateCollectorJob = null
+        windowOffsetCollectorJob?.cancel()
+        windowOffsetCollectorJob = null
+        composeView?.let { view ->
+            try {
+                if (view.isAttachedToWindow) {
+                    view.visibility = View.GONE
+                    windowManager.removeView(view)
+                }
+            } catch (cleanupFailure: Exception) {
+                Log.e("OverlayDebug", "Failed to remove partially attached overlay view", cleanupFailure)
+            } finally {
+                composeView = null
             }
         }
     }
     
+    fun detachForLifecycle() {
+        if (isDestroyed) return
+        detach()
+    }
+
+    @Synchronized
     private fun detach() {
         Log.d("OverlayDebug", "[FloatingCounterManager] detach() called.")
+        pendingAttachRunnable?.let(mainHandler::removeCallbacks)
+        pendingAttachRunnable = null
+        attachRequestPending = false
+        attachmentPolicy.detached()
+        stateCollectorJob?.cancel()
+        stateCollectorJob = null
+        windowOffsetCollectorJob?.cancel()
+        windowOffsetCollectorJob = null
+        snapAnimator?.cancel()
+        snapAnimator = null
         composeView?.let { view ->
             try {
                 // Safety: Force GONE before removal
                 view.visibility = View.GONE
-                windowManager.removeView(view)
+                if (view.isAttachedToWindow) windowManager.removeView(view)
             } catch (e: Exception) {
-                Log.e("OverlayDebug", "[FloatingCounterManager] Error detaching counter: ${e.message}")
+                Log.e("OverlayDebug", "[FloatingCounterManager] Error detaching counter: ${e.message}", e)
             } finally {
                 composeView = null
             }
@@ -397,6 +517,7 @@ class FloatingCounterManager(
     
     fun destroy() {
         isDestroyed = true
+        attachmentPolicy.destroy()
         detach()
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         store.clear()
@@ -411,35 +532,48 @@ fun FloatingIcon(
     onDrag: (Float, Float) -> Unit,
     onDragEnd: () -> Unit
 ) {
+    if (BuildConfig.DEBUG) {
+        Log.d(
+            "COUNTER_DIAG",
+            "[POINT_5_RECOMPOSE] FloatingIcon recomposed with count=${state.count}, snapState=$snapState, thread=${Thread.currentThread().name}"
+        )
+    }
+
     val context = LocalContext.current
     val currentReels = state.count
     val isLimitSet = state.dailyGoal > 0
     val dailyGoal = if (isLimitSet) state.dailyGoal else 1
     
     val progress = if (isLimitSet) currentReels.toFloat() / dailyGoal.toFloat() else 0f
+    val isOverLimit = if (isLimitSet) progress >= 1f else false
     
-    val startColor = MaterialTheme.colorScheme.surface
-    val targetRed = Color(0xFFEF9A9A) // Soft coral red
+    val startColor = ReFocusColors.counterSurface
+    val targetWarning = ReFocusColors.counterSurfaceOverLimit
     
     val cappedProgress = progress.coerceIn(0f, 1f)
     
-    val backgroundColor = if (progress > 0) {
-        lerp(startColor, targetRed.copy(alpha = 0.4f), cappedProgress)
-    } else {
-        startColor
+    val backgroundColor = when {
+        state.isUpdateRequired -> ReFocusColors.errorSoft
+        isOverLimit -> ReFocusColors.counterSurfaceOverLimit
+        progress > 0.5f -> lerp(startColor, targetWarning, (cappedProgress - 0.5f) * 2f)
+        else -> startColor
     }
     
-    val isOverLimit = if (isLimitSet) progress >= 1f else false
     val containerColor = backgroundColor.copy(alpha = 1.0f) // Forced 100% opacity
-    val borderColor = if (isOverLimit) {
-        MaterialTheme.colorScheme.error.copy(alpha = 0.5f)
-    } else {
-        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+    val borderColor = when {
+        state.isUpdateRequired -> ReFocusColors.error.copy(alpha = 0.8f)
+        isOverLimit -> ReFocusColors.counterBorderOverLimit
+        else -> ReFocusColors.counterBorder
     }
-    val contentColor = if (isOverLimit) {
-        MaterialTheme.colorScheme.error
-    } else {
-        MaterialTheme.colorScheme.onSurface
+    val contentColor = when {
+        state.isUpdateRequired -> ReFocusColors.error
+        isOverLimit -> ReFocusColors.warningText
+        else -> ReFocusColors.counterTextPrimary
+    }
+    val labelColor = when {
+        state.isUpdateRequired -> ReFocusColors.error
+        isOverLimit -> ReFocusColors.warningText
+        else -> ReFocusColors.counterTextSecondary
     }
 
     val contentOffset by androidx.compose.animation.core.animateDpAsState(
@@ -467,6 +601,15 @@ fun FloatingIcon(
     Card(
         modifier = Modifier
             .padding(12.dp)
+            .drawWithContent {
+                if (BuildConfig.DEBUG) {
+                    Log.d(
+                        "COUNTER_DIAG",
+                        "[POINT_5_DRAW] FloatingIcon drawWithContent executed for count=${state.count}"
+                    )
+                }
+                drawContent()
+            }
             .pointerInput(Unit) {
                 val touchSlop = 8.dp.toPx()
                 val tapTimeout = 300L
@@ -474,6 +617,12 @@ fun FloatingIcon(
                 awaitPointerEventScope {
                     while (true) {
                         val down = awaitFirstDown()
+                        if (BuildConfig.DEBUG) {
+                            Log.d(
+                                "COUNTER_DIAG",
+                                "[POINT_6_TOUCH_EVENT] Touch down detected at pos=${down.position}, current count=${state.count}"
+                            )
+                        }
                         val startTime = System.currentTimeMillis()
                         val startPos = down.position
                         var isDrag = false
@@ -490,6 +639,12 @@ fun FloatingIcon(
                                     isDrag = true
                                     clickCancelled = true
                                     val dragAmount = currentPos - pointerChange.previousPosition
+                                    if (BuildConfig.DEBUG) {
+                                        Log.d(
+                                            "COUNTER_DIAG",
+                                            "[POINT_6_DRAG_EVENT] Drag event detected, dragAmount=($dragAmount), current count=${state.count}"
+                                        )
+                                    }
                                     onDrag(dragAmount.x, dragAmount.y)
                                     pointerChange.consume()
                                 }
@@ -497,7 +652,6 @@ fun FloatingIcon(
                                     clickCancelled = true
                                 }
                             } else {
-                                // Up event
                                 if (!clickCancelled && !isDrag) {
                                     val duration = System.currentTimeMillis() - startTime
                                     val finalPos = pointerChange.position
@@ -531,21 +685,40 @@ fun FloatingIcon(
                 .padding(horizontal = 18.dp, vertical = 7.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = "REELS", 
-                style = MaterialTheme.typography.labelSmall, 
-                color = contentColor.copy(alpha = reelsLabelAlpha), 
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 1.0.sp,
-                fontSize = 8.sp
-            )
-            Text(
-                text = "${state.count}", 
-                style = MaterialTheme.typography.titleLarge, 
-                fontSize = 22.sp,
-                color = contentColor, 
-                fontWeight = FontWeight.ExtraBold
-            )
+            if (state.isUpdateRequired) {
+                Text(
+                    text = "RE:FOCUS", 
+                    style = MaterialTheme.typography.labelSmall, 
+                    color = contentColor.copy(alpha = reelsLabelAlpha), 
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.0.sp,
+                    fontSize = 8.sp
+                )
+                Text(
+                    text = "UPDATE", 
+                    style = MaterialTheme.typography.titleMedium, 
+                    fontSize = 14.sp,
+                    color = contentColor, 
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 0.5.sp
+                )
+            } else {
+                Text(
+                    text = "REELS", 
+                    style = MaterialTheme.typography.labelSmall, 
+                    color = labelColor.copy(alpha = reelsLabelAlpha), 
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.0.sp,
+                    fontSize = 8.sp
+                )
+                Text(
+                    text = "${state.count}", 
+                    style = MaterialTheme.typography.titleLarge, 
+                    fontSize = 22.sp,
+                    color = contentColor, 
+                    fontWeight = FontWeight.ExtraBold
+                )
+            }
         }
     }
 }

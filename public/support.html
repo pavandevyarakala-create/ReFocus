@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Support &amp; Troubleshooting - Re:Focus by FOCRAMEX</title>
+    <meta name="description" content="Official support, troubleshooting guide, permission repair steps, and contact information for Re:Focus by FOCRAMEX.">
+    <link rel="stylesheet" href="styles.css">
+    <script>
+        const CONFIG = {
+            SUPPORT_EMAIL: "support.refocus@gmail.com"
+        };
+    </script>
+</head>
+<body>
+    <!-- Accessible Navigation -->
+    <nav class="nav-wrapper" aria-label="Main Navigation">
+        <div class="container nav-container glass-nav" style="border-radius: var(--radius-pill); margin-top: var(--space-sm); padding: 0 var(--space-md);">
+            <a href="/" class="logo" aria-label="Re:Focus Home">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                Re:<span>Focus</span>
+            </a>
+            
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="/#problem">About</a>
+                <a href="/#features">Features</a>
+                <a href="/#faq">FAQ</a>
+                <a href="delete-account.html">Account &amp; Data Deletion</a>
+                <a href="privacy.html">Privacy</a>
+            </div>
+
+            <a href="/" class="btn btn-primary" style="padding: 0.5rem 1.25rem; font-size: var(--text-sm);">Return to Site</a>
+            
+            <button type="button" class="mobile-menu-btn" aria-label="Open Mobile Menu" aria-expanded="false" aria-controls="mobile-menu" onclick="window.location.href='/'">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+        </div>
+    </nav>
+
+    <main class="legal-section container">
+        <div class="legal-content">
+            <h1>Support &amp; Troubleshooting Guide</h1>
+            <p class="meta">Re:Focus Help Center | Maintained by FOCRAMEX Support</p>
+
+            <div class="legal-alert">
+                <p><strong>Need Immediate Help?</strong> We are here to assist you. If you encounter any bugs, unexpected detection behavior, or billing issues, please reach out directly to our engineering desk at <a href="mailto:support.refocus@gmail.com">support.refocus@gmail.com</a>.</p>
+            </div>
+
+            <h2>1. Common Troubleshooting Steps</h2>
+
+            <h3>A. Reel Counter Bubble Not Appearing</h3>
+            <p>If the floating reel counter does not show up when watching Instagram Reels or YouTube Shorts:</p>
+            <ul>
+                <li><strong>Verify Overlay Permission:</strong> Go to your phone's <em>Settings &rarr; Apps &rarr; Special App Access &rarr; Display over other apps</em>, and ensure Re:Focus is enabled.</li>
+                <li><strong>Verify Accessibility Service:</strong> Go to <em>Settings &rarr; Accessibility &rarr; Installed Services</em>, find <strong>Re:Focus</strong>, and confirm that the service toggle is switched ON.</li>
+                <li><strong>Aggressive Battery Optimization:</strong> Some phone manufacturers (such as Xiaomi/MIUI, Samsung/OneUI, Oppo, and Vivo) aggressively kill background services. Please exclude Re:Focus from Battery Optimization (<em>Settings &rarr; Apps &rarr; Re:Focus &rarr; Battery &rarr; Unrestricted</em>).</li>
+            </ul>
+
+            <h3>B. Reel Counter Not Incrementing on Swipe</h3>
+            <p>Re:Focus detects swipes and transitions between short-form video items:</p>
+            <ul>
+                <li>Ensure you are in the vertical full-screen short-form video player of Instagram (Reels tab) or YouTube (Shorts tab). Standard in-feed carousel posts or horizontal video feeds are not counted as short-form reels.</li>
+                <li>If Instagram or YouTube recently updated, toggle the Re:Focus Accessibility service OFF and back ON once to re-bind the accessibility window listener.</li>
+            </ul>
+
+            <h3>C. Strict Mode Back Navigation Not Working</h3>
+            <p>Strict Mode uses standard Android <code>GLOBAL_ACTION_BACK</code> accessibility triggers:</p>
+            <ul>
+                <li>Ensure Strict Mode is toggled <strong>ON</strong> in your Re:Focus dashboard.</li>
+                <li>Check that your daily limit has indeed been reached or exceeded for the day.</li>
+                <li>Ensure the Accessibility Service remains enabled in system settings.</li>
+            </ul>
+
+            <h3>D. Cloud Sync or Backup Fails</h3>
+            <ul>
+                <li><strong>Active Subscription or Trial Required:</strong> Cloud synchronization and on-demand cloud backups require an active Trial or Pro membership. Free-tier accounts operate exclusively in local device-only mode.</li>
+                <li><strong>24-Hour Backup Restriction:</strong> To protect server integrity, cloud backups can only be created once per 24 hours per user. If you already backed up today, the app will show your next eligible backup time.</li>
+                <li><strong>Internet Connection:</strong> Ensure your phone has a stable Wi-Fi or cellular internet connection.</li>
+            </ul>
+
+            <h2>2. In-App Subscription Management</h2>
+            <h3>How do I manage or cancel an active subscription?</h3>
+            <p>Subscriptions are managed directly within the Android mobile application:</p>
+            <ol style="padding-left: var(--space-md); margin-bottom: var(--space-md); color: var(--text-secondary);">
+                <li>Open <strong>Re:Focus</strong> on your Android phone and navigate to <strong>Settings</strong>.</li>
+                <li>Tap <strong>Manage Subscription</strong>.</li>
+                <li>Tap <strong>Cancel Autopay</strong> and confirm your choice.</li>
+            </ol>
+            <p>Your subscription mandate will be cancelled immediately with zero further billing cycles. Your Pro features will remain unlocked until the current paid period concludes.</p>
+
+            <h2>3. Contacting FOCRAMEX Support</h2>
+            <div class="contact-card">
+                <h3>Submit a Support Ticket</h3>
+                <p>When sending an email, please include the following details so we can resolve your issue quickly:</p>
+                <ul>
+                    <li>Your device model (e.g., Samsung Galaxy S23, Pixel 8)</li>
+                    <li>Android OS version</li>
+                    <li>The email address tied to your Google account in Re:Focus</li>
+                    <li>A brief description of the issue or screenshot if applicable</li>
+                </ul>
+                <p style="margin-top: var(--space-md);">
+                    <strong>Direct Email:</strong> <a href="mailto:support.refocus@gmail.com" class="btn btn-primary" style="display: inline-block; padding: 0.5rem 1.25rem; font-size: var(--text-sm);">Email support.refocus@gmail.com</a>
+                </p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="/" class="logo" style="margin-bottom: var(--space-sm);" aria-label="Re:Focus Home">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        Re:<span>Focus</span>
+                    </a>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">Official companion website for the Re:Focus Android digital wellness application by FOCRAMEX.</p>
+                    <p style="font-size: var(--text-sm); color: var(--text-muted);">&copy; 2026 Re:Focus by FOCRAMEX. All rights reserved.</p>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <a href="/#problem">About Re:Focus</a>
+                    <a href="/#features">Features</a>
+                    <a href="/#faq">FAQ</a>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Support</h4>
+                    <a href="support.html">Help &amp; Troubleshooting</a>
+                    <a href="delete-account.html">Account &amp; Data Deletion</a>
+                    <a href="mailto:support.refocus@gmail.com">Contact Support</a>
+                </div>
+
+                <div class="footer-col">
+                    <h4>Legal</h4>
+                    <a href="privacy.html">Privacy Policy</a>
+                    <a href="terms.html">Terms &amp; Conditions</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>

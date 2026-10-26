@@ -28,8 +28,7 @@ fun SessionDetailSheet(session: TimeBlock) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(24.dp)
-            .padding(bottom = 32.dp)
+            .padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 20.dp)
     ) {
         Text("Session Details", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
         Spacer(modifier = Modifier.height(24.dp))

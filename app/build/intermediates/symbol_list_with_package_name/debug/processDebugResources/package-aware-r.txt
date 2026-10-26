@@ -7,15 +7,33 @@ animator fragment_fade_exit
 animator fragment_open_enter
 animator fragment_open_exit
 attr action
+attr adSize
+attr adSizes
+attr adUnitId
 attr alpha
+attr ambientEnabled
+attr appTheme
 attr argType
 attr buttonSize
+attr buyButtonAppearance
+attr buyButtonHeight
+attr buyButtonText
+attr buyButtonWidth
+attr cameraBearing
+attr cameraMaxZoomPreference
+attr cameraMinZoomPreference
+attr cameraTargetLat
+attr cameraTargetLng
+attr cameraTilt
+attr cameraZoom
 attr circleCrop
 attr colorScheme
+attr customThemeStyle
 attr data
 attr dataPattern
 attr destination
 attr enterAnim
+attr environment
 attr exitAnim
 attr font
 attr fontProviderAuthority
@@ -28,11 +46,26 @@ attr fontProviderSystemFontFamily
 attr fontStyle
 attr fontVariationSettings
 attr fontWeight
+attr fragmentMode
+attr fragmentStyle
 attr graph
 attr imageAspectRatio
 attr imageAspectRatioAdjust
 attr lStar
+attr latLngBoundsNorthEastLatitude
+attr latLngBoundsNorthEastLongitude
+attr latLngBoundsSouthWestLatitude
+attr latLngBoundsSouthWestLongitude
 attr launchSingleTop
+attr liteMode
+attr mapType
+attr maskedWalletDetailsBackground
+attr maskedWalletDetailsButtonBackground
+attr maskedWalletDetailsButtonTextAppearance
+attr maskedWalletDetailsHeaderTextAppearance
+attr maskedWalletDetailsLogoImageType
+attr maskedWalletDetailsLogoTextColor
+attr maskedWalletDetailsTextAppearance
 attr mimeType
 attr navGraph
 attr nestedScrollViewStyle
@@ -49,8 +82,25 @@ attr scopeUris
 attr shortcutMatchRequired
 attr startDestination
 attr targetPackage
+attr toolbarTextColorStyle
 attr ttcIndex
+attr uiCompass
+attr uiMapToolbar
+attr uiRotateGestures
+attr uiScrollGestures
+attr uiScrollGesturesDuringRotateOrZoom
+attr uiTiltGestures
+attr uiZoomControls
+attr uiZoomGestures
 attr uri
+attr useViewLifecycle
+attr windowTransitionStyle
+attr zOrderOnTop
+bool enable_system_alarm_service_default
+bool enable_system_foreground_service_default
+bool enable_system_job_service_default
+bool isTablet
+bool workmanager_test_configuration
 color androidx_core_ripple_material_light
 color androidx_core_secondary_text_default_material_light
 color browser_actions_bg_grey
@@ -74,6 +124,19 @@ color notification_action_color_filter
 color notification_icon_bg_color
 color vector_tint_color
 color vector_tint_theme_color
+color wallet_bright_foreground_disabled_holo_light
+color wallet_bright_foreground_holo_dark
+color wallet_bright_foreground_holo_light
+color wallet_dim_foreground_disabled_holo_dark
+color wallet_dim_foreground_holo_dark
+color wallet_highlighted_text_holo_dark
+color wallet_highlighted_text_holo_light
+color wallet_hint_foreground_holo_dark
+color wallet_hint_foreground_holo_light
+color wallet_holo_blue_light
+color wallet_link_text_light
+color wallet_primary_text_holo_light
+color wallet_secondary_text_holo_dark
 dimen browser_actions_context_menu_max_width
 dimen browser_actions_context_menu_min_padding
 dimen compat_button_inset_horizontal_material
@@ -99,6 +162,9 @@ dimen notification_subtext_size
 dimen notification_top_pad
 dimen notification_top_pad_large_text
 drawable abc_vector_test
+drawable admob_close_button_black_circle_white_cross
+drawable admob_close_button_white_circle_black_cross
+drawable admob_close_button_white_cross
 drawable common_full_open_on_phone
 drawable common_google_signin_btn_icon_dark
 drawable common_google_signin_btn_icon_dark_focused
@@ -120,17 +186,26 @@ drawable common_google_signin_btn_text_light_normal
 drawable common_google_signin_btn_text_light_normal_background
 drawable googleg_disabled_color_18
 drawable googleg_standard_color_18
+drawable ic_alert
 drawable ic_call_answer
 drawable ic_call_answer_low
 drawable ic_call_answer_video
 drawable ic_call_answer_video_low
 drawable ic_call_decline
 drawable ic_call_decline_low
+drawable ic_google_logo
 drawable ic_launcher_background
 drawable ic_launcher_foreground
+drawable ic_launcher_monochrome
 drawable ic_other_sign_in
 drawable ic_passkey
 drawable ic_password
+drawable ic_refocus_clock
+drawable ic_refocus_figure
+drawable ic_refocus_icon
+drawable ic_refocus_logo
+drawable ic_refocus_wordmark
+drawable ic_tick_mark
 drawable notification_action_background
 drawable notification_bg
 drawable notification_bg_low
@@ -144,6 +219,22 @@ drawable notification_template_icon_bg
 drawable notification_template_icon_low_bg
 drawable notification_tile_bg
 drawable notify_panel_notification_icon_bg
+drawable offline_dialog_background
+drawable offline_dialog_default_icon_42dp
+drawable rzp_border
+drawable rzp_border_bottom
+drawable rzp_green_button
+drawable rzp_loader_circle
+drawable rzp_logo
+drawable rzp_name_logo
+drawable rzp_poweredby
+drawable rzp_secured_by_bg
+drawable rzp_white_border_black_bg
+drawable transparent_splash_icon
+font sora_bold
+font sora_medium
+font sora_regular
+font sora_semibold
 id accessibility_action_clickable_span
 id accessibility_custom_action_0
 id accessibility_custom_action_1
@@ -184,26 +275,47 @@ id action_text
 id actions
 id adjust_height
 id adjust_width
+id android_pay
+id android_pay_dark
+id android_pay_light
+id android_pay_light_with_border
 id androidx_compose_ui_view_composition_context
 id async
 id auto
 id blocking
+id book_now
 id browser_actions_header_text
 id browser_actions_menu_item_icon
 id browser_actions_menu_item_text
 id browser_actions_menu_items
 id browser_actions_menu_view
+id buyButton
+id buy_now
+id buy_with
+id buy_with_google
+id check_list
 id chronometer
+id classic
 id coil_request_manager
 id compose_view_saveable_id_tag
 id consume_window_insets_tag
 id dark
 id dialog_button
+id donate_with
+id donate_with_google
 id edit_text_id
 id forever
 id fragment_container_view_tag
+id googleMaterial2
+id google_wallet_classic
+id google_wallet_grayscale
+id google_wallet_monochrome
+id grayscale
 id hide_ime_id
 id hide_in_inspector_tag
+id holo_dark
+id holo_light
+id hybrid
 id icon
 id icon_group
 id icon_only
@@ -211,21 +323,42 @@ id info
 id inspection_slot_table_set
 id is_pooling_container_tag
 id italic
+id iv_check_mark
+id layout
 id light
 id line1
 id line3
+id ll_loader
+id logo_only
+id match_parent
+id material
+id monochrome
 id nav_controller_view_tag
 id none
 id normal
 id notification_background
 id notification_main_column
 id notification_main_column_container
+id offline_dialog_advertiser_name
+id offline_dialog_image
+id offline_dialog_text
 id pooling_container_listener_holder_tag
+id production
+id progressBar
 id report_drawn
 id right_icon
 id right_side
+id rzp_innerbox
+id rzp_outerbox
+id rzp_securedpayments
+id rzp_theMainMagicView
+id sandbox
+id satellite
+id selectionDetails
+id slide
 id special_effects_controller_view_tag
 id standard
+id strict_sandbox
 id tag_accessibility_actions
 id tag_accessibility_clickable_spans
 id tag_accessibility_heading
@@ -239,19 +372,25 @@ id tag_transition_group
 id tag_unhandled_key_event_manager
 id tag_unhandled_key_listeners
 id tag_window_insets_animation_callback
+id terrain
+id test
 id text
 id text2
 id time
 id title
+id tv_sub_item
+id tv_title
 id view_tree_lifecycle_owner
 id view_tree_on_back_pressed_dispatcher_owner
 id view_tree_saved_state_registry_owner
 id view_tree_view_model_store_owner
 id visible_removing_fragment_view_tag
 id wide
+id wrap_content
 id wrapped_composition_tag
 integer google_play_services_version
 integer status_bar_notification_info_maxnum
+layout admob_empty_layout
 layout browser_actions_context_menu_page
 layout browser_actions_context_menu_row
 layout custom_dialog
@@ -263,9 +402,19 @@ layout notification_template_custom_big
 layout notification_template_icon_group
 layout notification_template_part_chronometer
 layout notification_template_part_time
+layout offline_ads_dialog
+layout rzp_loader
+layout rzp_magic_base
+layout sdk_integration_status
+layout single_item
+layout wallet_test_layout
 mipmap ic_launcher
 mipmap ic_launcher_round
 raw firebase_common_keep
+raw keep
+raw rzp_config
+raw source_logo
+string accessibility_service_description
 string android_credentials_TYPE_PASSWORD_CREDENTIAL
 string androidx_credentials_TYPE_PUBLIC_KEY_CREDENTIAL
 string androidx_startup
@@ -305,6 +454,7 @@ string dropdown_menu
 string fallback_menu_item_copy_link
 string fallback_menu_item_open_in_browser
 string fallback_menu_item_share_link
+string firebase_database_url
 string gcm_defaultSenderId
 string google_api_key
 string google_app_id
@@ -368,13 +518,34 @@ string m3c_time_picker_period_toggle_description
 string m3c_time_picker_pm
 string m3c_tooltip_long_press_label
 string m3c_tooltip_pane_description
+string native_body
+string native_headline
+string native_media_view
 string navigation_menu
 string not_selected
+string notifications_permission_confirm
+string notifications_permission_decline
+string notifications_permission_title
 string off
+string offline_dialog_image_description
+string offline_dialog_text
+string offline_notification_title
+string offline_notification_title_with_advertiser
+string offline_opt_in_confirm
+string offline_opt_in_decline
+string offline_opt_in_message
+string offline_opt_in_title
 string on
 string project_id
 string range_end
 string range_start
+string s1
+string s2
+string s3
+string s4
+string s5
+string s6
+string s7
 string selected
 string status_bar_notification_info_overflow
 string switch_role
@@ -382,6 +553,9 @@ string tab
 string template_percent
 string tooltip_description
 string tooltip_label
+string wallet_buy_button_place_holder
+string watermark_label_prefix
+style CheckoutTheme
 style DialogWindowTheme
 style FloatingDialogTheme
 style FloatingDialogWindowTheme
@@ -391,15 +565,23 @@ style TextAppearance_Compat_Notification_Line2
 style TextAppearance_Compat_Notification_Time
 style TextAppearance_Compat_Notification_Title
 style Theme_Hidden
+style Theme_IAPTheme
+style Theme_PlayCore_Transparent
 style Theme_ReelTrak
+style WalletFragmentDefaultButtonTextAppearance
+style WalletFragmentDefaultDetailsHeaderTextAppearance
+style WalletFragmentDefaultDetailsTextAppearance
+style WalletFragmentDefaultStyle
 style Widget_Compat_NotificationActionContainer
 style Widget_Compat_NotificationActionText
 styleable ActivityNavigator android_name action data dataPattern targetPackage
+styleable AdsAttrs adSize adSizes adUnitId
 styleable AnimatedStateListDrawableCompat android_dither android_visible android_variablePadding android_constantSize android_enterFadeDuration android_exitFadeDuration
 styleable AnimatedStateListDrawableItem android_id android_drawable
 styleable AnimatedStateListDrawableTransition android_drawable android_toId android_fromId android_reversible
 styleable Capability queryPatterns shortcutMatchRequired
 styleable ColorStateListItem android_color android_alpha android_lStar alpha lStar
+styleable CustomWalletTheme customThemeStyle toolbarTextColorStyle windowTransitionStyle
 styleable FontFamily fontProviderAuthority fontProviderCerts fontProviderFetchStrategy fontProviderFetchTimeout fontProviderPackage fontProviderQuery fontProviderSystemFontFamily
 styleable FontFamilyFont android_font android_fontWeight android_fontStyle android_ttcIndex android_fontVariationSettings font fontStyle fontVariationSettings fontWeight ttcIndex
 styleable Fragment android_name android_id android_tag
@@ -407,6 +589,7 @@ styleable FragmentContainerView android_name android_tag
 styleable GradientColor android_startColor android_endColor android_type android_centerX android_centerY android_gradientRadius android_tileMode android_centerColor android_startX android_startY android_endX android_endY
 styleable GradientColorItem android_color android_offset
 styleable LoadingImageView circleCrop imageAspectRatio imageAspectRatioAdjust
+styleable MapAttrs ambientEnabled cameraBearing cameraMaxZoomPreference cameraMinZoomPreference cameraTargetLat cameraTargetLng cameraTilt cameraZoom latLngBoundsNorthEastLatitude latLngBoundsNorthEastLongitude latLngBoundsSouthWestLatitude latLngBoundsSouthWestLongitude liteMode mapType uiCompass uiMapToolbar uiRotateGestures uiScrollGestures uiScrollGesturesDuringRotateOrZoom uiTiltGestures uiZoomControls uiZoomGestures useViewLifecycle zOrderOnTop
 styleable NavAction android_id destination enterAnim exitAnim launchSingleTop popEnterAnim popExitAnim popUpTo popUpToInclusive popUpToSaveState restoreState
 styleable NavArgument android_name android_defaultValue argType nullable
 styleable NavDeepLink android_autoVerify action mimeType uri
@@ -417,5 +600,10 @@ styleable Navigator android_label android_id route
 styleable SignInButton buttonSize colorScheme scopeUris
 styleable StateListDrawable android_dither android_visible android_variablePadding android_constantSize android_enterFadeDuration android_exitFadeDuration
 styleable StateListDrawableItem android_drawable
+styleable WalletFragmentOptions appTheme environment fragmentMode fragmentStyle
+styleable WalletFragmentStyle buyButtonAppearance buyButtonHeight buyButtonText buyButtonWidth maskedWalletDetailsBackground maskedWalletDetailsButtonBackground maskedWalletDetailsButtonTextAppearance maskedWalletDetailsHeaderTextAppearance maskedWalletDetailsLogoImageType maskedWalletDetailsLogoTextColor maskedWalletDetailsTextAppearance
 xml accessibility_service_config
+xml file_provider_path
+xml gma_ad_services_config
 xml image_share_filepaths
+xml network_security_config

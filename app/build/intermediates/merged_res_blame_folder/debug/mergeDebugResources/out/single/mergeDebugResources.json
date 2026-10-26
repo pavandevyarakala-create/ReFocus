@@ -1,30 +1,154 @@
 [
     {
-        "merged": "com.reeltrak.app-debug-70:/mipmap-anydpi-v26_ic_launcher_round.xml.flat",
-        "source": "com.reeltrak.app-main-72:/mipmap-anydpi-v26/ic_launcher_round.xml"
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_refocus_icon.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_refocus_icon.png"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/xml_accessibility_service_config.xml.flat",
-        "source": "com.reeltrak.app-main-72:/xml/accessibility_service_config.xml"
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_launcher_background.xml.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_launcher_background.xml"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/drawable_ic_launcher_background.xml.flat",
-        "source": "com.reeltrak.app-main-72:/drawable/ic_launcher_background.xml"
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_refocus_figure.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_refocus_figure.png"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/mipmap-anydpi-v26_ic_launcher.xml.flat",
-        "source": "com.reeltrak.app-main-72:/mipmap-anydpi-v26/ic_launcher.xml"
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xxxhdpi_ic_launcher.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xxxhdpi/ic_launcher.png"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/drawable_ic_launcher_foreground.xml.flat",
-        "source": "com.reeltrak.app-main-72:/drawable/ic_launcher_foreground.xml"
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xhdpi_ic_launcher.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xhdpi/ic_launcher.png"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/mipmap-xxxhdpi_ic_launcher.png.flat",
-        "source": "com.reeltrak.app-main-72:/mipmap-xxxhdpi/ic_launcher.png"
+        "merged": "com.reeltrak.app-debug-83:/mipmap-hdpi_ic_launcher.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-hdpi/ic_launcher.png"
     },
     {
-        "merged": "com.reeltrak.app-debug-70:/mipmap-xxxhdpi_ic_launcher_round.png.flat",
-        "source": "com.reeltrak.app-main-72:/mipmap-xxxhdpi/ic_launcher_round.png"
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_google_logo.xml.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_google_logo.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xxhdpi_ic_launcher_monochrome.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xxhdpi/ic_launcher_monochrome.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-mdpi_ic_launcher_round.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-mdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_refocus_wordmark.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_refocus_wordmark.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-mdpi_ic_launcher.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-mdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/font_sora_semibold.ttf.flat",
+        "source": "com.reeltrak.app-main-85:/font/sora_semibold.ttf"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xxhdpi_ic_launcher.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xxhdpi/ic_launcher.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/font_sora_medium.ttf.flat",
+        "source": "com.reeltrak.app-main-85:/font/sora_medium.ttf"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-hdpi_ic_launcher_foreground.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-hdpi/ic_launcher_foreground.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xxxhdpi_ic_launcher_round.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xxxhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/raw_source_logo.png.flat",
+        "source": "com.reeltrak.app-main-85:/raw/source_logo.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/xml_network_security_config.xml.flat",
+        "source": "com.reeltrak.app-main-85:/xml/network_security_config.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-mdpi_ic_launcher_foreground.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-mdpi/ic_launcher_foreground.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-hdpi_ic_launcher_monochrome.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-hdpi/ic_launcher_monochrome.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xxhdpi_ic_launcher_round.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xxhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xxxhdpi_ic_launcher_monochrome.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xxxhdpi/ic_launcher_monochrome.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/xml_accessibility_service_config.xml.flat",
+        "source": "com.reeltrak.app-main-85:/xml/accessibility_service_config.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-mdpi_ic_launcher_monochrome.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-mdpi/ic_launcher_monochrome.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_refocus_logo.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_refocus_logo.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-anydpi-v26_ic_launcher.xml.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-anydpi-v26/ic_launcher.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable_ic_refocus_clock.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/ic_refocus_clock.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xxhdpi_ic_launcher_foreground.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xxhdpi/ic_launcher_foreground.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xxxhdpi_ic_launcher_foreground.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xxxhdpi/ic_launcher_foreground.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xhdpi_ic_launcher_monochrome.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xhdpi/ic_launcher_monochrome.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable-xhdpi_ic_launcher_foreground.png.flat",
+        "source": "com.reeltrak.app-main-85:/drawable-xhdpi/ic_launcher_foreground.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/font_sora_regular.ttf.flat",
+        "source": "com.reeltrak.app-main-85:/font/sora_regular.ttf"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/raw_keep.xml.flat",
+        "source": "com.reeltrak.app-main-85:/raw/keep.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-anydpi-v26_ic_launcher_round.xml.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-anydpi-v26/ic_launcher_round.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/drawable_transparent_splash_icon.xml.flat",
+        "source": "com.reeltrak.app-main-85:/drawable/transparent_splash_icon.xml"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/font_sora_bold.ttf.flat",
+        "source": "com.reeltrak.app-main-85:/font/sora_bold.ttf"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-xhdpi_ic_launcher_round.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-xhdpi/ic_launcher_round.png"
+    },
+    {
+        "merged": "com.reeltrak.app-debug-83:/mipmap-hdpi_ic_launcher_round.png.flat",
+        "source": "com.reeltrak.app-main-85:/mipmap-hdpi/ic_launcher_round.png"
     }
 ]

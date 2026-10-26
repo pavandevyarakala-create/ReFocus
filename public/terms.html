@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terms &amp; Conditions - Re:Focus by FOCRAMEX</title>
+    <meta name="description" content="Terms and Conditions for Re:Focus by FOCRAMEX. Understand user responsibilities, in-app subscription terms, cancellation policies, and service mechanics.">
+    <link rel="stylesheet" href="styles.css">
+    <script>
+        const CONFIG = {
+            PLAY_STORE_URL: "#",
+            DOWNLOAD_APK_URL: "https://github.com/pavandevyarakala-create/Inventory/releases/download/v0.5.0/ReFocus.apk",
+            SUPPORT_EMAIL: "support.refocus@gmail.com"
+        };
+    </script>
+</head>
+<body>
+    <!-- Accessible Navigation -->
+    <nav class="nav-wrapper" aria-label="Main Navigation">
+        <div class="container nav-container glass-nav" style="border-radius: var(--radius-pill); margin-top: var(--space-sm); padding: 0 var(--space-md);">
+            <a href="/" class="logo" aria-label="Re:Focus Home">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                Re:<span>Focus</span>
+            </a>
+            
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="/#problem">About</a>
+                <a href="/#features">Features</a>
+                <a href="/#faq">FAQ</a>
+                <a href="delete-account.html">Account &amp; Data Deletion</a>
+                <a href="support.html">Support</a>
+            </div>
+
+            <a href="/" class="btn btn-primary" style="padding: 0.5rem 1.25rem; font-size: var(--text-sm);">Return to Site</a>
+            
+            <button type="button" class="mobile-menu-btn" aria-label="Open Mobile Menu" aria-expanded="false" aria-controls="mobile-menu" onclick="window.location.href='/'">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+        </div>
+    </nav>
+
+    <main class="legal-section container">
+        <div class="legal-content">
+            <h1>Terms &amp; Conditions</h1>
+            <p class="meta">Effective Date: October 2026 | Application: Re:Focus | Brand: FOCRAMEX</p>
+
+            <h2>1. Acceptance of Terms</h2>
+            <p>By downloading, installing, accessing, or using the <strong>Re:Focus</strong> Android application ("Application") or visiting its companion website, you agree to be legally bound by these Terms &amp; Conditions ("Terms"). These Terms constitute a legally binding agreement between you ("User") and <strong>FOCRAMEX</strong> ("we", "us", or "our"). If you do not agree to these Terms, you must immediately cease using and uninstall the Application.</p>
+
+            <h2>2. Description of Service &amp; Core Mechanics</h2>
+            <p>Re:Focus is an Android digital wellbeing and habit-building utility designed to help users track, understand, and regulate their consumption of short-form video formats (Instagram Reels and YouTube Shorts).</p>
+            <ul>
+                <li><strong>Reel Counting &amp; Detection:</strong> Re:Focus utilizes an Android Accessibility Service to detect when supported video reels are actively playing and counts scroll transitions. Real-time counts are displayed in an on-screen floating HUD.</li>
+                <li><strong>Daily Limits &amp; Skull Days:</strong> Users configure a target daily reel viewing limit. Exceeding your configured limit triggers a <strong>"Skull Day"</strong>, which immediately resets your Current Streak to zero.</li>
+                <li><strong>Discipline Levels:</strong> Your discipline status (Seedling, Focused, Consistent, Ironclad, Master, Legend) is determined by your lifetime <strong>Longest Streak</strong>. Your discipline tier represents lifetime best consistency and never decreases upon encountering a Skull Day.</li>
+                <li><strong>Strict Mode:</strong> An optional habit-enforcement feature. When enabled and your daily reel limit is exceeded, the app triggers an automatic back navigation (<code>GLOBAL_ACTION_BACK</code>) to safely interrupt your feed consumption.</li>
+                <li><strong>Rewarded Ad Adjustments:</strong> To foster mindfulness and prevent impulsive changes, altering a locked daily limit or disabling Strict Mode requires watching an AdMob rewarded video ad.</li>
+            </ul>
+
+            <h2>3. Account Registration &amp; Security</h2>
+            <p>Basic local reel counting can be utilized without an account. To unlock cloud features, streak sync, multi-day analytics, and Pro features, you must sign in with a valid Google account via Firebase Authentication.</p>
+            <ul>
+                <li>You are solely responsible for maintaining the security of your device and Google credentials.</li>
+                <li>You agree not to bypass, reverse-engineer, decompile, tamper with security controls, or attack the Cloudflare Worker API or Firestore backend.</li>
+                <li>FOCRAMEX reserves the right to restrict or terminate accounts that attempt fraud, automated API abuse, or security tampering.</li>
+            </ul>
+
+            <h2>4. In-App Subscriptions &amp; Billing</h2>
+            <p>Re:Focus provides premium capabilities under a transparent subscription model:</p>
+            <ul>
+                <li><strong>Free Trial:</strong> Newly created Google accounts receive an initial <strong>7-day free trial</strong> upon first connecting to our servers. No payment details are required to experience the trial.</li>
+                <li><strong>Recurring Monthly Price:</strong> Re:Focus Pro is priced at <strong>₹79/month</strong>.</li>
+                <li><strong>Payment Processing:</strong> All recurring subscription mandates and payments are securely handled by <strong>Razorpay Software Private Limited</strong> via UPI Autopay and debit/credit cards. FOCRAMEX never collects, stores, or accesses your bank accounts, card details, or UPI credentials.</li>
+                <li><strong>Renewal &amp; Billing Cycle:</strong> Subscriptions automatically renew every month on your billing date until explicitly cancelled.</li>
+                <li><strong>Cancellation Policy:</strong> You can cancel your recurring autopay subscription at any time directly in the app: <strong>Settings &rarr; Manage Subscription &rarr; Cancel Autopay</strong>. Cancellation immediately terminates recurring mandates with Razorpay. Your Pro access remains fully active until the end of the paid billing period.</li>
+                <li><strong>Refund Policy:</strong> All subscription purchases are final and non-refundable, except where mandated by applicable Indian consumer protection laws.</li>
+            </ul>
+
+            <h2>5. Required Android Permissions &amp; Acceptable Use</h2>
+            <p>Re:Focus requires specific Android permissions to perform its core functions:</p>
+            <ul>
+                <li><strong>Accessibility Service (<code>BIND_ACCESSIBILITY_SERVICE</code>):</strong> Strictly required for active reel detection, swipe counting, and Strict Mode exit actions. The app never intercepts chats, passwords, keystrokes, or data from unrelated apps.</li>
+                <li><strong>Overlay Permission (<code>SYSTEM_ALERT_WINDOW</code>):</strong> Strictly required to render the live counter bubble.</li>
+                <li>You agree not to use Re:Focus for any unlawful purpose or in violation of Google Play Store Developer Policies.</li>
+            </ul>
+
+            <h2>6. Intellectual Property</h2>
+            <p>All software code, visual designs, typography, brand names, logos, animations, and graphics associated with Re:Focus and FOCRAMEX are the exclusive intellectual property of FOCRAMEX. Users are granted a limited, personal, non-exclusive, revocable license to use the app for individual productivity purposes.</p>
+
+            <h2>7. Disclaimer of Warranties</h2>
+            <p>Re:Focus is provided on an <strong>"AS IS"</strong> and <strong>"AS AVAILABLE"</strong> basis without warranties of any kind. While we strive for absolute reliability, third-party platforms (Instagram and YouTube) frequently update their UI layouts, which may temporarily affect reel detection accuracy until an app compatibility update is released.</p>
+
+            <h2>8. Limitation of Liability</h2>
+            <p>To the fullest extent permitted by applicable law, FOCRAMEX and its developers shall not be liable for any indirect, punitive, special, incidental, or consequential damages resulting from your use of or inability to use the Application.</p>
+
+            <h2>9. Account Deletion &amp; Data Purge</h2>
+            <p>You can request account deletion at any time via <strong>Settings &rarr; Delete Account</strong>. Deletion requests undergo a <strong>7-day recovery grace period</strong>, after which all account records in Firebase Auth and Cloud Firestore are permanently purged. For more details, see our <a href="delete-account.html">Account &amp; Data Deletion Policy</a>.</p>
+
+            <h2>10. Governing Law &amp; Jurisdiction</h2>
+            <p>These Terms and Conditions shall be governed by, interpreted, and construed in accordance with the laws of the <strong>Republic of India</strong>. Any dispute, claim, or controversy arising out of or relating to these Terms or the Application shall be submitted to the exclusive jurisdiction of the competent courts of India.</p>
+
+            <h2>11. Modifications to Terms</h2>
+            <p>FOCRAMEX reserves the right to modify these Terms at any time. When modifications occur, the Effective Date at the top of this document will be updated. Continued use of the Application after changes are published constitutes your acceptance of the revised Terms.</p>
+
+            <h2>12. Contact Information</h2>
+            <div class="contact-card">
+                <p><strong>FOCRAMEX Legal Desk</strong></p>
+                <p>For questions regarding these Terms &amp; Conditions, please contact:</p>
+                <p><strong>Email:</strong> <a href="mailto:support.refocus@gmail.com">support.refocus@gmail.com</a></p>
+                <p><strong>Brand:</strong> FOCRAMEX</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="/" class="logo" style="margin-bottom: var(--space-sm);" aria-label="Re:Focus Home">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        Re:<span>Focus</span>
+                    </a>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">Official companion website for the Re:Focus Android digital wellness application by FOCRAMEX.</p>
+                    <p style="font-size: var(--text-sm); color: var(--text-muted);">&copy; 2026 Re:Focus by FOCRAMEX. All rights reserved.</p>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <a href="/#problem">About Re:Focus</a>
+                    <a href="/#features">Features</a>
+                    <a href="/#faq">FAQ</a>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Support</h4>
+                    <a href="/#faq">FAQ</a>
+                    <a href="support.html">Help &amp; Troubleshooting</a>
+                    <a href="delete-account.html">Account &amp; Data Deletion</a>
+                    <a href="mailto:support.refocus@gmail.com">Contact Support</a>
+                </div>
+
+                <div class="footer-col">
+                    <h4>Legal</h4>
+                    <a href="privacy.html">Privacy Policy</a>
+                    <a href="terms.html">Terms &amp; Conditions</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>

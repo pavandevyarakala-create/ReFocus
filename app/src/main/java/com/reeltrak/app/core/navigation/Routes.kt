@@ -7,6 +7,6 @@ object Routes {
     const val ANALYTICS = "analytics_route"
     const val CALENDAR = "calendar_route"
     const val SETTINGS = "settings_route"
-    const val DEBUG_OVERLAY = "debug_overlay_route"
-    const val DEBUG_COUNTER = "debug_counter_route"
+    const val PRIVACY_POLICY = "privacy_policy_route"
+    const val TERMS_AND_CONDITIONS = "terms_and_conditions_route"
 }

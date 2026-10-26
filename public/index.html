@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Re:Focus by FOCRAMEX - Take Back Your Attention</title>
+    <meta name="description" content="Re:Focus by FOCRAMEX is the Android digital wellbeing app designed to break the infinite scroll on Instagram Reels and YouTube Shorts with on-device counting, daily limits, and habit streaks.">
+    <link rel="stylesheet" href="styles.css">
+    <script>
+        const CONFIG = {
+            PLAY_STORE_URL: "#",
+            DOWNLOAD_APK_URL: "https://github.com/pavandevyarakala-create/Inventory/releases/download/v0.5.0/ReFocus.apk",
+            SUPPORT_EMAIL: "support.refocus@gmail.com"
+        };
+    </script>
+</head>
+<body>
+
+    <!-- Accessible Navigation -->
+    <nav class="nav-wrapper" aria-label="Main Navigation">
+        <div class="container nav-container glass-nav" style="border-radius: var(--radius-pill); margin-top: var(--space-sm); padding: 0 var(--space-md);">
+            <a href="/" class="logo" aria-label="Re:Focus Home">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                Re:<span>Focus</span>
+            </a>
+            
+            <div class="nav-links">
+                <a href="#problem">About</a>
+                <a href="#features">Features</a>
+                <a href="#faq">FAQ</a>
+                <a href="delete-account.html">Account &amp; Data Deletion</a>
+                <a href="support.html">Support</a>
+            </div>
+
+            <a href="#" class="btn btn-primary" style="padding: 0.5rem 1.25rem; font-size: var(--text-sm);" onclick="window.location.href=CONFIG.DOWNLOAD_APK_URL">Download APK</a>
+            
+            <button type="button" class="mobile-menu-btn" aria-label="Open Mobile Menu" aria-expanded="false" aria-controls="mobile-menu">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+            </button>
+        </div>
+    </nav>
+
+    <!-- Mobile Menu Overlay -->
+    <div id="mobile-menu" class="glass-nav" style="display: none; position: fixed; top: 80px; left: 1rem; right: 1rem; z-index: 999; flex-direction: column; padding: var(--space-md); border-radius: var(--radius-md); text-align: center; gap: var(--space-sm);">
+        <a href="#problem" style="font-weight: 500;">About</a>
+        <a href="#features" style="font-weight: 500;">Features</a>
+        <a href="#faq" style="font-weight: 500;">FAQ</a>
+        <a href="delete-account.html" style="font-weight: 500;">Account &amp; Data Deletion</a>
+        <a href="support.html" style="font-weight: 500;">Support</a>
+        <a href="privacy.html" style="font-weight: 500;">Privacy Policy</a>
+    </div>
+
+    <main>
+    <!-- 1. Hero Section -->
+    <header class="hero container reveal">
+        <div class="hero-content">
+            <div class="hero-badge">Re:Focus by FOCRAMEX</div>
+            <h1 class="text-gradient">Take back your attention.</h1>
+            <p>Re:Focus helps you conquer short-form video addiction on Instagram Reels and YouTube Shorts through real-time on-device counting, mindful daily limits, and streak discipline.</p>
+            <div class="hero-actions">
+                <a href="#" class="btn btn-primary" onclick="window.location.href=CONFIG.DOWNLOAD_APK_URL">Download APK (v0.5.0)</a>
+                <a href="#features" class="btn btn-secondary">Explore Features</a>
+            </div>
+            <p style="font-size: var(--text-sm); color: var(--text-muted); margin-top: var(--space-xs);">
+                Direct APK download available now. Google Play Store rollout coming soon.
+            </p>
+        </div>
+
+        <div class="hero-visual">
+            <div class="hero-glow"></div>
+            <div class="device-frame" aria-hidden="true">
+                <div class="screenshot-placeholder">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom: var(--space-xs);"><rect x="4" y="2" width="16" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
+                    <div style="font-size: var(--text-base); font-weight: 600; color: var(--text-primary);">Dashboard HUD</div>
+                    <div style="font-size: var(--text-sm);">Real-Time Reel Counter &amp; Daily Intent</div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- 2. What Re:Focus does -->
+    <section id="problem" class="section intro-section container reveal">
+        <h2 class="text-gradient">Scrolling takes seconds.<br>Taking control takes intention.</h2>
+        <p style="font-size: var(--text-xl); line-height: 1.6;">
+            Short-form algorithms are engineered for endless consumption. Re:Focus disrupts the auto-pilot scroll by putting a live floating counter on your screen and enforcing real daily boundaries—entirely evaluated in real time on your Android device for zero privacy compromise.
+        </p>
+    </section>
+
+    <!-- 3. Core Features: CONTROL -->
+    <section id="features" class="section container reveal">
+        <article class="feature-pillar">
+            <div class="feature-content">
+                <div class="step-num">01 / Real-Time Tracking</div>
+                <h3 class="text-gradient">Live Floating Counter.</h3>
+                <p>A compact, non-intrusive floating bubble stays right on your screen as you browse Instagram Reels or YouTube Shorts, showing you exactly how many reels you have consumed during your current session and today.</p>
+                <p>Every swipe transition is counted instantly via your device's Accessibility Service—without inspecting content, captions, or private chats.</p>
+            </div>
+            <div class="feature-visual">
+                <div class="device-frame" style="height: 580px;" aria-hidden="true">
+                    <div class="screenshot-placeholder">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom: var(--space-xs);"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                        <div style="font-size: var(--text-base); font-weight: 600; color: var(--text-primary);">Floating Counter HUD</div>
+                        <div style="font-size: var(--text-sm);">On-Device Active Playback Detection</div>
+                    </div>
+                </div>
+            </div>
+        </article>
+    </section>
+
+    <!-- 4. Feature Pillar: DISCIPLINE -->
+    <section class="section container reveal">
+        <article class="feature-pillar reversed">
+            <div class="feature-visual">
+                <div class="device-frame" style="height: 580px;" aria-hidden="true">
+                    <div class="screenshot-placeholder">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" stroke-width="1.5" style="margin-bottom: var(--space-xs);"><path d="M12 2c0 0-5 6.5-5 11a5 5 0 0 0 10 0c0-4.5-5-11-5-11Z"></path></svg>
+                        <div style="font-size: var(--text-base); font-weight: 600; color: var(--text-primary);">Streaks &amp; Skull Days</div>
+                        <div style="font-size: var(--text-sm);">Accountability &amp; Milestone Tiers</div>
+                    </div>
+                </div>
+            </div>
+            <div class="feature-content">
+                <div class="step-num">02 / Accountability</div>
+                <h3 class="text-gradient">Streaks, Skull Days &amp; Discipline Levels.</h3>
+                <p>Stay beneath your chosen daily reel limit to build consecutive streak records. If you choose to scroll past your boundary, the day becomes a <strong>Skull Day</strong>, resetting your Current Streak to zero.</p>
+                <p>Your overarching <strong>Discipline Level</strong> (Seedling, Focused, Consistent, Ironclad, Master, Legend) is tied to your lifetime <em>Longest Streak</em>—meaning it represents your highest sustained achievement and will never decrease.</p>
+            </div>
+        </article>
+    </section>
+
+    <!-- 5. Feature Pillar: STRICT MODE &amp; ANTI-BYPASS -->
+    <section class="section container reveal">
+        <article class="feature-pillar">
+            <div class="feature-content">
+                <div class="step-num">03 / Enforcement</div>
+                <h3 class="text-gradient">Strict Mode Anti-Bypass.</h3>
+                <p>When you need unbreakable boundaries, turn on <strong>Strict Mode</strong>. Once you reach your daily reel limit, Re:Focus automatically invokes system back navigation to safely exit Instagram Reels and YouTube Shorts.</p>
+                <p>To eliminate impulsive overrides, modifying a locked daily limit or disabling Strict Mode requires watching an AdMob rewarded ad—introducing intentional friction when temptation strikes.</p>
+            </div>
+            <div class="feature-visual">
+                <div class="device-frame" style="height: 580px;" aria-hidden="true">
+                    <div class="screenshot-placeholder">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom: var(--space-xs);"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                        <div style="font-size: var(--text-base); font-weight: 600; color: var(--text-primary);">Strict Mode Lock</div>
+                        <div style="font-size: var(--text-sm);">Automatic Feed Interruption</div>
+                    </div>
+                </div>
+            </div>
+        </article>
+    </section>
+
+    <!-- 6. How It Works -->
+    <section class="section container reveal">
+        <h2 style="font-size: var(--text-4xl); margin-bottom: var(--space-lg); text-align: center;">How Re:Focus Works</h2>
+        <div class="flow-grid">
+            <div class="step-card">
+                <div class="step-num">Step 01</div>
+                <h4>Set your limit</h4>
+                <p style="font-size: var(--text-sm);">Choose your daily maximum reel count (e.g., 30 or 50 reels) in the Dashboard.</p>
+            </div>
+            <div class="step-card">
+                <div class="step-num">Step 02</div>
+                <h4>Watch &amp; Stay Aware</h4>
+                <p style="font-size: var(--text-sm);">Browse normally. The floating counter tracks your reels and active viewing time.</p>
+            </div>
+            <div class="step-card">
+                <div class="step-num">Step 03</div>
+                <h4>Maintain Discipline</h4>
+                <p style="font-size: var(--text-sm);">Receive warnings at 80% and 100% of your limit, or let Strict Mode guide you out.</p>
+            </div>
+            <div class="step-card">
+                <div class="step-num">Step 04</div>
+                <h4>Track Long-Term Growth</h4>
+                <p style="font-size: var(--text-sm);">View your Goal Calendar, weekly metrics, and advance your discipline tier.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- 8. FAQ Section -->
+    <section id="faq" class="section container reveal">
+        <h2 style="font-size: var(--text-4xl); margin-bottom: var(--space-lg); text-align: center;">Frequently Asked Questions</h2>
+        
+        <div class="faq-list">
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq1">
+                    <span>What is Re:Focus?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq1" class="faq-content">
+                    <p>Re:Focus is an Android digital wellbeing tool built by FOCRAMEX. It tracks your viewing of Instagram Reels and YouTube Shorts, counts every video transition, and empowers you to establish and keep healthy digital habits.</p>
+                </div>
+            </div>
+            
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq2">
+                    <span>How does reel counting and the daily limit work?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq2" class="faq-content">
+                    <p>You set a daily reel allowance (for example, 50 reels). The on-device Accessibility Service detects when a supported video feed is active and increments the counter with each vertical swipe. If you exceed your limit, the day becomes a "Skull Day," resetting your current streak.</p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq3">
+                    <span>What is the difference between Free and Pro mode?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq3" class="faq-content">
+                    <p>Free mode provides basic on-device reel counting and today's session metrics with local storage. Signing in unlocks a 7-day free trial. Pro membership unlocks the Goal Calendar, multi-day Analytics, Strict Mode feed interruption, cloud synchronization across devices, and daily cloud backups.</p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq4">
+                    <span>Is my scrolling data sent to external servers?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq4" class="faq-content">
+                    <p>No video inspection data or second-by-second session logs leave your device. Only daily aggregate counts (such as total reels and watch time for the date) are synced to your private Google Cloud Firestore document if you are signed in with an active trial or Pro membership.</p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq5">
+                    <span>How does Strict Mode work?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq5" class="faq-content">
+                    <p>Strict Mode automatically triggers standard Android back navigation (GLOBAL_ACTION_BACK) when you try to watch reels after your daily limit has been reached. It locks in until midnight server time to stop impulsive overrides.</p>
+                </div>
+            </div>
+
+            <div class="faq-item">
+                <button type="button" class="faq-btn" aria-expanded="false" aria-controls="faq6">
+                    <span>How do I delete my account or manage subscriptions?</span>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="transition: transform 0.2s;" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <div id="faq6" class="faq-content">
+                    <p>You can manage or cancel subscriptions inside the Android app under Settings &rarr; Manage Subscription. You can request account deletion in app Settings &rarr; Delete Account or online at our <a href="delete-account.html">Account &amp; Data Deletion</a> portal, which wipes local device data immediately and permanently purges cloud data after a 7-day recovery period.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- 9. Download CTA -->
+    <section class="section container reveal" style="padding-bottom: calc(var(--space-xxl) + var(--space-xl));">
+        <div class="cta-card">
+            <h2 class="text-gradient">Your attention is worth protecting.</h2>
+            <p>Download the official Re:Focus Android build and start taking control today.</p>
+            <a href="#" class="btn btn-primary" onclick="window.location.href=CONFIG.DOWNLOAD_APK_URL">Download Re:Focus APK</a>
+        </div>
+    </section>
+    </main>
+
+    <!-- 10. Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="/" class="logo" style="margin-bottom: var(--space-sm);" aria-label="Re:Focus Home">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        Re:<span>Focus</span>
+                    </a>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">Official companion website for the Re:Focus Android digital wellness application by FOCRAMEX.</p>
+                    <p style="font-size: var(--text-sm); color: var(--text-muted);">&copy; 2026 Re:Focus by FOCRAMEX. All rights reserved.</p>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <a href="/#problem">About Re:Focus</a>
+                    <a href="/#features">Features</a>
+                    <a href="/#faq">FAQ</a>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Support</h4>
+                    <a href="support.html">Help &amp; Troubleshooting</a>
+                    <a href="delete-account.html">Account &amp; Data Deletion</a>
+                    <a href="mailto:support.refocus@gmail.com">Contact Support</a>
+                </div>
+
+                <div class="footer-col">
+                    <h4>Legal</h4>
+                    <a href="privacy.html">Privacy Policy</a>
+                    <a href="terms.html">Terms &amp; Conditions</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <script src="js/main.js"></script>
+</body>
+</html>

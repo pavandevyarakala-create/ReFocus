@@ -1,11 +1,27 @@
 R_DEF: Internal format may change without notice
 local
+drawable ic_google_logo
 drawable ic_launcher_background
 drawable ic_launcher_foreground
+drawable ic_launcher_monochrome
+drawable ic_refocus_clock
+drawable ic_refocus_figure
+drawable ic_refocus_icon
+drawable ic_refocus_logo
+drawable ic_refocus_wordmark
+drawable transparent_splash_icon
+font sora_bold
+font sora_medium
+font sora_regular
+font sora_semibold
 mipmap ic_launcher
 mipmap ic_launcher_round
+raw keep
+raw source_logo
+string accessibility_service_description
 string app_name
 string default_web_client_id
+string firebase_database_url
 string gcm_defaultSenderId
 string google_api_key
 string google_app_id
@@ -14,3 +30,4 @@ string google_storage_bucket
 string project_id
 style Theme.ReelTrak
 xml accessibility_service_config
+xml network_security_config

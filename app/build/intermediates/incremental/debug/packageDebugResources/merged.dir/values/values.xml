@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="accessibility_service_description">Re:Focus uses this service strictly to detect when supported Instagram Reels and YouTube Shorts are actively playing in order to track your viewing sessions, count scroll transitions, and help you maintain your daily reel limit. Re:Focus does not read or collect personal messages, passwords, contacts, keystrokes, or payment credentials, and all view detection is processed in real time on your device.</string>
     <string name="app_name">Re:Focus</string>
     <string name="default_web_client_id" translatable="false">524118238647-fhocd7sf7t3nkmdbbanf3a33bgqcgj90.apps.googleusercontent.com</string>
+    <string name="firebase_database_url" translatable="false">https://refocus-504119-default-rtdb.asia-southeast1.firebasedatabase.app</string>
     <string name="gcm_defaultSenderId" translatable="false">524118238647</string>
     <string name="google_api_key" translatable="false">AIzaSyBilmiuqvT56rMlShcdW1R7X39d1vYj8MA</string>
     <string name="google_app_id" translatable="false">1:524118238647:android:1af37f98b1c1b75dce3432</string>
     <string name="google_crash_reporting_api_key" translatable="false">AIzaSyBilmiuqvT56rMlShcdW1R7X39d1vYj8MA</string>
     <string name="google_storage_bucket" translatable="false">refocus-504119.firebasestorage.app</string>
     <string name="project_id" translatable="false">refocus-504119</string>
-    <style name="Theme.ReelTrak" parent="android:Theme.Material.Light.NoActionBar"/>
+    <style name="Theme.ReelTrak" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#FCF4E9</item>
+    </style>
 </resources>

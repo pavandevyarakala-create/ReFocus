@@ -1,9 +1,15 @@
 package com.reeltrak.app;
 
+import androidx.hilt.work.HiltWrapper_WorkerFactoryModule;
+import com.reeltrak.app.core.di.BackupRestoreModule;
+import com.reeltrak.app.core.di.CoroutinesModule;
 import com.reeltrak.app.core.di.DatabaseModule;
 import com.reeltrak.app.core.di.FirebaseModule;
+import com.reeltrak.app.core.di.NetworkModule;
 import com.reeltrak.app.core.di.PreferencesModule;
 import com.reeltrak.app.core.di.StateModule;
+import com.reeltrak.app.core.sync.RestoreAckWorker_HiltModule;
+import com.reeltrak.app.core.sync.SyncWorker_HiltModule;
 import com.reeltrak.app.features.auth.LoginViewModel_HiltModules;
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel_HiltModules;
 import com.reeltrak.app.features.onboarding.viewmodel.OnboardingViewModel_HiltModules;
@@ -134,13 +140,19 @@ public final class ReelTrakApplication_HiltComponents {
   @Component(
       modules = {
           ApplicationContextModule.class,
+          BackupRestoreModule.class,
+          CoroutinesModule.class,
           DatabaseModule.class,
           FirebaseModule.class,
           HiltWrapper_FragmentGetContextFix_FragmentGetContextFixModule.class,
+          HiltWrapper_WorkerFactoryModule.class,
+          NetworkModule.class,
           PreferencesModule.class,
           ActivityRetainedCBuilderModule.class,
           ServiceCBuilderModule.class,
-          StateModule.class
+          RestoreAckWorker_HiltModule.class,
+          StateModule.class,
+          SyncWorker_HiltModule.class
       }
   )
   @Singleton

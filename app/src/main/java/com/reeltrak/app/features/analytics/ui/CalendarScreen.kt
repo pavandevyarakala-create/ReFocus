@@ -36,50 +36,73 @@ import com.reeltrak.app.features.dashboard.ui.components.AchievementBadge
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import com.reeltrak.app.core.ui.components.ReFocusTopBar
+import com.reeltrak.app.core.ui.theme.ReFocusColors
+import com.reeltrak.app.core.ui.theme.ReFocusTheme
+
+import com.reeltrak.app.core.ui.components.LockedFeature
+import com.reeltrak.app.core.ui.components.LockedFeatureScreen
+import com.reeltrak.app.domain.models.AccessState
+import com.reeltrak.app.features.settings.viewmodel.SettingsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CalendarScreen(
-    viewModel: DashboardViewModel = hiltViewModel()
+    viewModel: DashboardViewModel = hiltViewModel(),
+    settingsViewModel: SettingsViewModel = hiltViewModel()
 ) {
-    val habitTrackerData by viewModel.habitTrackerData.collectAsStateWithLifecycle()
-    val streakStats by viewModel.streakStats.collectAsStateWithLifecycle()
-    
-    val hasHistory = remember(habitTrackerData) {
-        habitTrackerData.any { it.totalReelsScrolled > 0 || it.dailyGoal > 0 }
+    val accessState by settingsViewModel.accessState.collectAsStateWithLifecycle()
+    val isAppUnlocked = accessState == AccessState.TRIAL || accessState == AccessState.ACTIVE
+
+    if (!isAppUnlocked) {
+        LockedFeatureScreen(
+            feature = LockedFeature.CALENDAR,
+            onUpgradeClick = {
+                settingsViewModel.openSubscriptionPaywall()
+            }
+        )
+        return
     }
+
+    val habitTrackerData by viewModel.habitTrackerData.collectAsStateWithLifecycle()
+    val calendarMonthData by viewModel.calendarMonthData.collectAsStateWithLifecycle()
+    val streakStats by viewModel.streakStats.collectAsStateWithLifecycle()
+    val hasHistory by viewModel.hasAnyHistory.collectAsStateWithLifecycle()
 
     var showDisciplineHub by remember { mutableStateOf(false) }
 
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(24.dp)
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ReFocusColors.background)
     ) {
-        item {
-            Text("Calendar & Streaks", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
-        }
-
-        if (!hasHistory) {
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = ReFocusTheme.Dimens.TopBarContentTopOffset, bottom = ReFocusTheme.Dimens.ScreenBottomContentPadding),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            if (!hasHistory) {
             item {
                 EmptyStateIllustration()
             }
         } else {
-            // 1. TOP STREAK CARD
+            // 1. EDITORIAL STREAK & DISCIPLINE HERO (Directly on canvas)
             item {
-                StreakSummaryCard(streakStats)
+                StreakEditorialHeader(
+                    stats = streakStats,
+                    onOpenDisciplineHub = { showDisciplineHub = true }
+                )
             }
 
-            // 2. DISCIPLINE LEVEL
+            // 2. THE CALENDAR (Primary physical surface)
             item {
-                DisciplineLevelCard(streakStats, onClick = { showDisciplineHub = true })
-            }
-
-            // 3. THE CALENDAR
-            item {
-                GoalCalendar(dailyStats = habitTrackerData)
+                GoalCalendar(
+                    dailyStats = calendarMonthData,
+                    onMonthChanged = { viewModel.setCalendarMonth(it) }
+                )
             }
 
             // 4. STATS GRID
@@ -92,8 +115,18 @@ fun CalendarScreen(
                 SuccessTimeline(habitTrackerData.takeLast(14))
             }
         }
-        
-        item { Spacer(modifier = Modifier.height(16.dp)) }
+        }
+
+        ReFocusTopBar(
+            title = "Calendar",
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(
+                    start = ReFocusTheme.Dimens.TopBarHorizontalMargin,
+                    end = ReFocusTheme.Dimens.TopBarHorizontalMargin,
+                    top = ReFocusTheme.Dimens.TopBarTopMargin
+                )
+        )
     }
 
     if (showDisciplineHub) {
@@ -115,7 +148,7 @@ private fun EmptyStateIllustration() {
                 Icons.Default.History, 
                 contentDescription = null, 
                 modifier = Modifier.size(80.dp),
-                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+                tint = ReFocusColors.accent.copy(alpha = 0.4f)
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text("Start your first streak today", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
@@ -131,9 +164,12 @@ private fun EmptyStateIllustration() {
 }
 
 @Composable
-private fun StreakSummaryCard(stats: DashboardViewModel.StreakStats) {
+private fun StreakEditorialHeader(
+    stats: DashboardViewModel.StreakStats,
+    onOpenDisciplineHub: () -> Unit
+) {
     val infiniteTransition = rememberInfiniteTransition(label = "fire")
-    val scale by infiniteTransition.animateFloat(
+    val scale = infiniteTransition.animateFloat(
         initialValue = 1f,
         targetValue = 1.15f,
         animationSpec = infiniteRepeatable(
@@ -143,75 +179,132 @@ private fun StreakSummaryCard(stats: DashboardViewModel.StreakStats) {
         label = "scale"
     )
 
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
-        )
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // 1. Dominant Streak Metric (Directly on canvas)
         Row(
-            modifier = Modifier.padding(24.dp),
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("CURRENT STREAK", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+            Column {
+                Text(
+                    text = "CURRENT FOCUS STREAK",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.2.sp,
+                    color = ReFocusColors.accent
+                )
+                Spacer(modifier = Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
-                    Text("${stats.currentStreak}", style = MaterialTheme.typography.displayLarge, fontWeight = FontWeight.Black)
-                    Text(" days", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 12.dp, start = 4.dp))
+                    Text(
+                        text = "${stats.currentStreak}",
+                        fontSize = 54.sp,
+                        lineHeight = 56.sp,
+                        fontWeight = FontWeight.Black,
+                        color = ReFocusColors.textPrimary
+                    )
+                    Text(
+                        text = if (stats.currentStreak == 1) " day" else " days",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = ReFocusColors.textSecondary,
+                        modifier = Modifier.padding(bottom = 8.dp, start = 4.dp)
+                    )
                 }
             }
-            
-            Box(contentAlignment = Alignment.Center) {
-                Surface(
-                    modifier = Modifier.size(80.dp).graphicsLayer(scaleX = scale, scaleY = scale),
-                    shape = CircleShape,
-                    color = Color(0xFFFF5722).copy(alpha = 0.1f)
-                ) {}
+
+            // Flame Disc with Authentic Warm Fire Animation
+            val isStreakActive = stats.currentStreak > 0
+            val flameColor = ReFocusColors.streakFlame
+            val flameGlowBg = if (isStreakActive) ReFocusColors.streakFlameGlow else ReFocusColors.surfaceStrong
+            val flameIconTint = if (isStreakActive) flameColor else flameColor.copy(alpha = 0.45f)
+
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .size(64.dp)
+                    .graphicsLayer {
+                        if (isStreakActive) {
+                            scaleX = scale.value
+                            scaleY = scale.value
+                        }
+                    }
+                    .background(color = flameGlowBg, shape = CircleShape)
+            ) {
                 Icon(
                     imageVector = Icons.Default.LocalFireDepartment,
-                    contentDescription = "Streak",
-                    modifier = Modifier.size(56.dp).graphicsLayer(scaleX = scale, scaleY = scale),
-                    tint = Color(0xFFFF5722)
+                    contentDescription = "Streak Fire",
+                    modifier = Modifier.size(38.dp),
+                    tint = flameIconTint
                 )
             }
         }
-    }
-}
 
-@Composable
-private fun DisciplineLevelCard(stats: DashboardViewModel.StreakStats, onClick: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.EmojiEvents, contentDescription = null, tint = MaterialTheme.colorScheme.tertiary)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Discipline Level", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.weight(1f))
-                Text(stats.disciplineLevel, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+        // 2. Secondary Discipline Information (Clean horizontal bar, border removed)
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .clickable(onClick = onOpenDisciplineHub),
+            shape = RoundedCornerShape(14.dp),
+            color = ReFocusColors.surfaceElevated
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.EmojiEvents,
+                            contentDescription = null,
+                            tint = ReFocusColors.accent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Level: ${stats.disciplineLevel}",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = ReFocusColors.textPrimary
+                        )
+                    }
+
+                    Text(
+                        text = "Discipline Hub ›",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = ReFocusColors.accent
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                LinearProgressIndicator(
+                    progress = { stats.progressToNextLevel },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(CircleShape),
+                    color = ReFocusColors.accent,
+                    trackColor = ReFocusColors.progressTrack
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Text(
+                    text = "Next milestone at ${getNextMilestone(stats.longestStreak)} days (Best: ${stats.longestStreak}d)",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontSize = 11.sp,
+                    color = ReFocusColors.textMuted
+                )
             }
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
-            LinearProgressIndicator(
-                progress = { stats.progressToNextLevel },
-                modifier = Modifier.fillMaxWidth().height(10.dp).clip(CircleShape),
-                color = MaterialTheme.colorScheme.primary,
-                trackColor = MaterialTheme.colorScheme.surfaceVariant
-            )
-            
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                "Level up at ${getNextMilestone(stats.longestStreak)} days (Best: ${stats.longestStreak})",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }
@@ -226,18 +319,60 @@ private fun getNextMilestone(longest: Int): Int = when {
 
 @Composable
 private fun StreakStatsGrid(stats: DashboardViewModel.StreakStats) {
-    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-        SmallStatCard("Success Days", "${stats.totalSuccessfulDays}", Modifier.weight(1f))
-        SmallStatCard("Skull Days", "💀 ${stats.totalSkullDays}", Modifier.weight(1f))
-    }
-}
+    // Sits directly on background canvas - not another bordered card
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "SUCCESS DAYS",
+                style = MaterialTheme.typography.labelSmall,
+                letterSpacing = 1.2.sp,
+                fontWeight = FontWeight.Bold,
+                color = ReFocusColors.textMuted
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "${stats.totalSuccessfulDays}",
+                fontSize = 28.sp,
+                lineHeight = 30.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = ReFocusColors.textPrimary
+            )
+        }
 
-@Composable
-private fun SmallStatCard(title: String, value: String, modifier: Modifier = Modifier) {
-    Card(modifier = modifier) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(title, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Box(
+            modifier = Modifier
+                .width(1.dp)
+                .height(32.dp)
+                .background(ReFocusColors.border.copy(alpha = 0.5f))
+        )
+
+        Column(
+            modifier = Modifier.weight(1f),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "DRIFTED DAYS",
+                style = MaterialTheme.typography.labelSmall,
+                letterSpacing = 1.2.sp,
+                fontWeight = FontWeight.Bold,
+                color = ReFocusColors.textMuted
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "${stats.totalDriftedDays}",
+                fontSize = 28.sp,
+                lineHeight = 30.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = if (stats.totalDriftedDays > 0) ReFocusColors.error else ReFocusColors.textPrimary
+            )
         }
     }
 }
@@ -258,14 +393,12 @@ private fun SuccessTimeline(recentData: List<DashboardViewModel.DailyBlocks>) {
                         .height(30.dp)
                         .clip(RoundedCornerShape(4.dp))
                         .background(
-                            if (day.isSkullDay) MaterialTheme.colorScheme.surfaceVariant
-                            else if (day.totalReelsScrolled > 0 || day.dailyGoal > 0) MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (day.isSkullDay) Text("💀", fontSize = 10.sp)
-                }
+                            if (day.isDriftedDay) ReFocusColors.error
+                            else if (day.isUnrestrictedDay) ReFocusColors.warning
+                            else if (day.totalReelsScrolled > 0 || day.dailyGoal > 0) ReFocusColors.accent
+                            else ReFocusColors.chartTrack
+                        )
+                )
             }
         }
     }
@@ -289,69 +422,108 @@ private fun BadgeCollectionSection(stats: DashboardViewModel.StreakStats) {
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface
         )
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(14.dp))
         
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            milestones.forEachIndexed { index, milestone ->
-                val unlockTime = unlockTimes[index]
-                val isUnlocked = unlockTime > 0L
-                val badgeName = when (milestone) {
-                    7 -> "Focused"
-                    30 -> "Consistent"
-                    50 -> "Disciplined"
-                    100 -> "Master"
-                    365 -> "Legend"
-                    else -> ""
-                }
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val columns = if (maxWidth > 520.dp) 3 else 2
+            val chunkedMilestones = remember(columns) { milestones.chunked(columns) }
 
-                Card(
-                    modifier = Modifier.weight(1f),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isUnlocked) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
-                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    border = if (isUnlocked) BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)) else null
-                ) {
-                    Column(
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                chunkedMilestones.forEach { rowItems ->
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                            .height(IntrinsicSize.Max),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        AchievementBadge(
-                            milestone = milestone,
-                            isUnlocked = isUnlocked,
-                            size = 52.dp
-                        )
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = badgeName,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isUnlocked) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                        )
-                        Text(
-                            text = if (isUnlocked) "Earned" else "$milestone days",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (isUnlocked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                        )
-                        if (isUnlocked) {
-                            val formattedDate = remember(unlockTime) {
-                                val instant = Instant.ofEpochMilli(unlockTime)
-                                val formatter = DateTimeFormatter.ofPattern("d MMM yy").withZone(ZoneId.systemDefault())
-                                formatter.format(instant)
+                        rowItems.forEach { milestone ->
+                            val index = milestones.indexOf(milestone)
+                            val unlockTime = unlockTimes[index]
+                            val isUnlocked = unlockTime > 0L
+                            val badgeName = when (milestone) {
+                                7 -> "Focused"
+                                30 -> "Consistent"
+                                50 -> "Disciplined"
+                                100 -> "Master"
+                                365 -> "Legend"
+                                else -> ""
                             }
-                            Text(
-                                text = formattedDate,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontSize = 8.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                                modifier = Modifier.padding(top = 2.dp)
-                            )
+
+                            Card(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight(),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isUnlocked) {
+                                        ReFocusColors.surfaceElevated
+                                    } else {
+                                        ReFocusColors.surface
+                                    }
+                                ),
+                                shape = RoundedCornerShape(16.dp),
+                                border = if (isUnlocked) {
+                                    BorderStroke(1.dp, ReFocusColors.accent.copy(alpha = 0.4f))
+                                } else null
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(14.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    AchievementBadge(
+                                        milestone = milestone,
+                                        isUnlocked = isUnlocked,
+                                        size = 64.dp
+                                    )
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Text(
+                                        text = badgeName,
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        textAlign = TextAlign.Center,
+                                        color = if (isUnlocked) {
+                                            MaterialTheme.colorScheme.onSurface
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                        }
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = if (isUnlocked) "Earned" else "$milestone days",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = if (isUnlocked) FontWeight.SemiBold else FontWeight.Normal,
+                                        textAlign = TextAlign.Center,
+                                        color = if (isUnlocked) {
+                                            ReFocusColors.accent
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                                        }
+                                    )
+                                    if (isUnlocked) {
+                                        val formattedDate = remember(unlockTime) {
+                                            val instant = Instant.ofEpochMilli(unlockTime)
+                                            val formatter = DateTimeFormatter.ofPattern("d MMM yyyy").withZone(ZoneId.systemDefault())
+                                            formatter.format(instant)
+                                        }
+                                        Text(
+                                            text = formattedDate,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            textAlign = TextAlign.Center,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        repeat(columns - rowItems.size) {
+                            Spacer(modifier = Modifier.weight(1f))
                         }
                     }
                 }
@@ -368,6 +540,7 @@ private fun DisciplineHubBottomSheet(
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
+        containerColor = ReFocusColors.background,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ) {
         Column(
@@ -388,14 +561,15 @@ private fun DisciplineHubBottomSheet(
             // Section 1: Current Discipline Profile Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f))
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ReFocusColors.surfaceElevated)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
                         text = "YOUR STANDINGS",
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                        color = ReFocusColors.accent
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -421,8 +595,8 @@ private fun DisciplineHubBottomSheet(
                     LinearProgressIndicator(
                         progress = { stats.progressToNextLevel },
                         modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape),
-                        color = MaterialTheme.colorScheme.primary,
-                        trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        color = ReFocusColors.accent,
+                        trackColor = ReFocusColors.progressTrack
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     
@@ -445,21 +619,22 @@ private fun DisciplineHubBottomSheet(
             // Section 2: How Streaks Work
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ReFocusColors.surface)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
                         text = "HOW STREAKS WORK",
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                        color = ReFocusColors.accent
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
                         text = "• Stay within your daily limit to build your streak.\n" +
                                 "• A small grace zone is allowed for minor limit breaches.\n" +
-                                "• Going too far beyond your limit creates a Skull Day.\n" +
-                                "• Skull Days reset your current streak to 0.\n" +
+                                "• Exceeding the grace zone makes the day a Drifted day.\n" +
+                                "• Drifted days reset your current streak to 0.\n" +
                                 "• Your highest streak is always remembered and determines your Level.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -491,7 +666,7 @@ private fun DisciplineHubBottomSheet(
                             .fillMaxWidth()
                             .padding(vertical = 6.dp)
                             .background(
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary.copy(alpha = 0.08f) else Color.Transparent,
+                                color = if (isCurrent) ReFocusColors.accentSoft else Color.Transparent,
                                 shape = RoundedCornerShape(8.dp)
                             )
                             .padding(horizontal = 8.dp, vertical = 6.dp),
@@ -506,7 +681,7 @@ private fun DisciplineHubBottomSheet(
                         Text(
                             text = range,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (isCurrent) ReFocusColors.accent else MaterialTheme.colorScheme.onSurfaceVariant,
                             fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal
                         )
                     }
@@ -519,14 +694,15 @@ private fun DisciplineHubBottomSheet(
             // Section 5: Why It Matters
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.15f))
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ReFocusColors.surfaceElevated)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text(
                         text = "WHY IT MATTERS",
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.secondary
+                        color = ReFocusColors.accent
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
@@ -537,7 +713,7 @@ private fun DisciplineHubBottomSheet(
                 }
             }
             
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(8.dp))
         }
     }
 }

@@ -1,0 +1,152 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAccountActive(userId) {
+      let accDoc = /databases/$(database)/documents/users/$(userId)/account/status;
+      return !exists(accDoc) || (
+        ('accountStatus' in get(accDoc).data && get(accDoc).data.accountStatus == 'ACTIVE') ||
+        (!('accountStatus' in get(accDoc).data) && 'status' in get(accDoc).data && get(accDoc).data.status == 'ACTIVE')
+      );
+    }
+
+    // Validates that the user has an active, trial, or pending/cancelled subscription within valid period before permitting cloud sync.
+    // Rejects missing subscription documents, expired trials, expired paid periods, and non-paying accounts.
+    function hasActiveSubscription(userId) {
+      let subDoc = /databases/$(database)/documents/users/$(userId)/subscription/status;
+      return isAccountActive(userId) && exists(subDoc) && (
+        (
+          get(subDoc).data.subscriptionStatus in ['ACTIVE', 'PENDING', 'CANCELLED'] &&
+          request.time < get(subDoc).data.currentPeriodEnd
+        ) ||
+        (
+          get(subDoc).data.subscriptionStatus == 'TRIAL' &&
+          request.time < get(subDoc).data.trialEnd
+        )
+      );
+    }
+
+    // Sensitive administrative collections (Backend Cloudflare Worker / Admin SDK only)
+    match /subscription_map/{subscriptionId} {
+      allow read, write: if false;
+    }
+
+    match /trial_registry/{userId} {
+      allow read, write: if false;
+    }
+
+    // User Profile Document
+    match /users/{userId} {
+      // Users can read their own profile document
+      allow read: if isOwner(userId);
+      
+      // Strict Positive Whitelist: Authenticated owner can only write legitimate profile fields
+      // Prevents quota-exhaustion attacks, junk-field stuffing, and subscription manipulation
+      allow create, update: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(['email', 'displayName', 'photoUrl', 'updatedAt'])
+        && (!('email' in request.resource.data) || (request.resource.data.email is string && request.resource.data.email.size() <= 254))
+        && (!('displayName' in request.resource.data) || (request.resource.data.displayName is string && request.resource.data.displayName.size() <= 100))
+        && (!('photoUrl' in request.resource.data) || (request.resource.data.photoUrl is string && request.resource.data.photoUrl.size() <= 1000));
+        
+      allow delete: if false;
+
+      // 1. Daily Tracking Data Subcollection
+      // Used by SyncManager & SyncWorker for habits, reels count, strict mode, goals.
+      // - Read & Write access strictly requires ownership AND active/trial subscription entitlement.
+      // - Format: YYYY-MM-DD (e.g. 2026-09-28)
+      // - Whitelist: dateString, totalReelsCount, dailyGoal, isStrictModeOn, isStrictModeLocked, isLimitLocked
+      // - Bounds: totalReelsCount >= 0 && <= 100000, dailyGoal >= 0 && <= 100000
+      // - Date string validation: matches YYYY-MM-DD pattern and matches document key
+      match /daily_data/{dateString} {
+        allow read: if isOwner(userId) && hasActiveSubscription(userId);
+        allow write: if isOwner(userId)
+          && hasActiveSubscription(userId)
+          && dateString.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && request.resource.data.dateString == dateString
+          && request.resource.data.keys().hasOnly([
+            'dateString', 'totalReelsCount', 'dailyGoal', 
+            'isStrictModeOn', 'isStrictModeLocked', 'isLimitLocked'
+          ])
+          && request.resource.data.totalReelsCount is int
+          && request.resource.data.totalReelsCount >= 0
+          && request.resource.data.totalReelsCount <= 100000
+          && request.resource.data.dailyGoal is int
+          && request.resource.data.dailyGoal >= 0
+          && request.resource.data.dailyGoal <= 100000
+          && request.resource.data.isStrictModeOn is bool
+          && (!('isStrictModeLocked' in request.resource.data) || request.resource.data.isStrictModeLocked is bool)
+          && (!('isLimitLocked' in request.resource.data) || request.resource.data.isLimitLocked is bool);
+      }
+
+      // 2. Onboarding Status Subcollection
+      // Path: /users/{userId}/onboarding/tour
+      // Used by OnboardingRepositoryImpl to sync tour completion
+      match /onboarding/{documentId} {
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId)
+          && documentId == 'tour'
+          && request.resource.data.keys().hasOnly(['appTourCompleted', 'updatedAt'])
+          && request.resource.data.appTourCompleted is bool;
+      }
+
+      // 3. Subscription Status Document
+      // Path: /users/{userId}/subscription/status
+      match /subscription/{documentId} {
+        // Users can READ their own subscription status to render UI and check features
+        allow read: if isOwner(userId);
+
+        // Client app is STRICTLY PROHIBITED from writing or modifying subscription documents.
+        // Subscription authority is reserved exclusively for the trusted backend / server environment
+        // (Firebase Admin SDK / Cloud Functions triggered by Razorpay webhooks bypass rules automatically).
+        allow write: if false;
+      }
+
+      // 4. Master Account Access Control Document
+      // Path: /users/{userId}/account/status
+      match /account/{documentId} {
+        // Users can READ their own account status to verify if they are allowed to access the app
+        allow read: if isOwner(userId);
+
+        // Client app is STRICTLY PROHIBITED from writing or modifying account status documents.
+        // Master access authority belongs exclusively to the administrator via Firebase Admin / Console.
+        allow write: if false;
+      }
+
+      // 5. User Settings & Preferences Subcollection
+      // Path: /users/{userId}/settings/{documentId}
+      // Used to persist account-level daily limit across installs (Entitled accounts only)
+      match /settings/{documentId} {
+        allow read: if isOwner(userId) && hasActiveSubscription(userId);
+        allow write: if isOwner(userId)
+          && hasActiveSubscription(userId)
+          && documentId in ['preferences', 'limits']
+          && request.resource.data.keys().hasOnly(['dailyLimit', 'defaultDailyLimit', 'updatedAt', 'lastUpdatedEpoch'])
+          && (!('dailyLimit' in request.resource.data) || (request.resource.data.dailyLimit is int && request.resource.data.dailyLimit >= 0 && request.resource.data.dailyLimit <= 100000))
+          && (!('defaultDailyLimit' in request.resource.data) || (request.resource.data.defaultDailyLimit is int && request.resource.data.defaultDailyLimit >= 0 && request.resource.data.defaultDailyLimit <= 100000));
+      }
+
+      // 6. Server-Authoritative Backup Status Document
+      // Path: /users/{userId}/backup/{documentId}
+      // Allows authenticated owner to READ their own backup status.
+      // Writing is STRICTLY PROHIBITED for clients — only Cloudflare Worker / Admin SDK may write.
+      match /backup/{documentId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,6 +1,9 @@
 package com.reeltrak.app.features.dashboard.viewmodel;
 
+import com.reeltrak.app.core.ads.RewardedAdManager;
 import com.reeltrak.app.data.local.dao.DailyReelDataDao;
+import com.reeltrak.app.data.security.authorization.AppAuthorizationManager;
+import com.reeltrak.app.domain.managers.SubscriptionManager;
 import com.reeltrak.app.domain.repository.PreferencesRepository;
 import com.reeltrak.app.services.notifications.ReelNotificationManager;
 import com.reeltrak.app.services.overlay.OverlayStateManager;
@@ -37,21 +40,33 @@ public final class DashboardViewModel_Factory implements Factory<DashboardViewMo
 
   private final Provider<ReelNotificationManager> notificationManagerProvider;
 
+  private final Provider<SubscriptionManager> subscriptionManagerProvider;
+
+  private final Provider<RewardedAdManager> rewardedAdManagerProvider;
+
+  private final Provider<AppAuthorizationManager> appAuthorizationManagerProvider;
+
   public DashboardViewModel_Factory(Provider<PreferencesRepository> preferencesRepositoryProvider,
       Provider<DailyReelDataDao> dailyReelDataDaoProvider,
       Provider<OverlayStateManager> overlayStateManagerProvider,
       Provider<DayManager> dayManagerProvider,
-      Provider<ReelNotificationManager> notificationManagerProvider) {
+      Provider<ReelNotificationManager> notificationManagerProvider,
+      Provider<SubscriptionManager> subscriptionManagerProvider,
+      Provider<RewardedAdManager> rewardedAdManagerProvider,
+      Provider<AppAuthorizationManager> appAuthorizationManagerProvider) {
     this.preferencesRepositoryProvider = preferencesRepositoryProvider;
     this.dailyReelDataDaoProvider = dailyReelDataDaoProvider;
     this.overlayStateManagerProvider = overlayStateManagerProvider;
     this.dayManagerProvider = dayManagerProvider;
     this.notificationManagerProvider = notificationManagerProvider;
+    this.subscriptionManagerProvider = subscriptionManagerProvider;
+    this.rewardedAdManagerProvider = rewardedAdManagerProvider;
+    this.appAuthorizationManagerProvider = appAuthorizationManagerProvider;
   }
 
   @Override
   public DashboardViewModel get() {
-    return newInstance(preferencesRepositoryProvider.get(), dailyReelDataDaoProvider.get(), overlayStateManagerProvider.get(), dayManagerProvider.get(), notificationManagerProvider.get());
+    return newInstance(preferencesRepositoryProvider.get(), dailyReelDataDaoProvider.get(), overlayStateManagerProvider.get(), dayManagerProvider.get(), notificationManagerProvider.get(), subscriptionManagerProvider.get(), rewardedAdManagerProvider.get(), appAuthorizationManagerProvider.get());
   }
 
   public static DashboardViewModel_Factory create(
@@ -59,13 +74,18 @@ public final class DashboardViewModel_Factory implements Factory<DashboardViewMo
       Provider<DailyReelDataDao> dailyReelDataDaoProvider,
       Provider<OverlayStateManager> overlayStateManagerProvider,
       Provider<DayManager> dayManagerProvider,
-      Provider<ReelNotificationManager> notificationManagerProvider) {
-    return new DashboardViewModel_Factory(preferencesRepositoryProvider, dailyReelDataDaoProvider, overlayStateManagerProvider, dayManagerProvider, notificationManagerProvider);
+      Provider<ReelNotificationManager> notificationManagerProvider,
+      Provider<SubscriptionManager> subscriptionManagerProvider,
+      Provider<RewardedAdManager> rewardedAdManagerProvider,
+      Provider<AppAuthorizationManager> appAuthorizationManagerProvider) {
+    return new DashboardViewModel_Factory(preferencesRepositoryProvider, dailyReelDataDaoProvider, overlayStateManagerProvider, dayManagerProvider, notificationManagerProvider, subscriptionManagerProvider, rewardedAdManagerProvider, appAuthorizationManagerProvider);
   }
 
   public static DashboardViewModel newInstance(PreferencesRepository preferencesRepository,
       DailyReelDataDao dailyReelDataDao, OverlayStateManager overlayStateManager,
-      DayManager dayManager, ReelNotificationManager notificationManager) {
-    return new DashboardViewModel(preferencesRepository, dailyReelDataDao, overlayStateManager, dayManager, notificationManager);
+      DayManager dayManager, ReelNotificationManager notificationManager,
+      SubscriptionManager subscriptionManager, RewardedAdManager rewardedAdManager,
+      AppAuthorizationManager appAuthorizationManager) {
+    return new DashboardViewModel(preferencesRepository, dailyReelDataDao, overlayStateManager, dayManager, notificationManager, subscriptionManager, rewardedAdManager, appAuthorizationManager);
   }
 }

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     
     <!-- ReelTrak Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -13,8 +14,26 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:manageSpaceActivity=".ManageSpaceActivity"
-        android:theme="@style/Theme.ReelTrak">
+        android:theme="@style/Theme.ReelTrak"
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:ignore="RemoveWorkManagerInitializer">
+
+        <!-- Google Mobile Ads (AdMob) App ID -->
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-5284347714670334~9887795933" />
+
+        <!-- Disable default WorkManager initializer for custom Configuration.Provider (Hilt) -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
         
         <activity
             android:name=".MainActivity"
@@ -25,11 +44,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <activity
-            android:name=".ManageSpaceActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!-- ReelTrak Engine (Accessibility Service) -->
         <service
