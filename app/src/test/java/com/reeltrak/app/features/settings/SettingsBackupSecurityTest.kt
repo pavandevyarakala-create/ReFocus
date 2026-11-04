@@ -172,6 +172,15 @@ class SettingsBackupSecurityTest {
         override suspend fun setNotificationsEnabled(enabled: Boolean) {}
         override val counterThemeMode: Flow<ThemeMode> = MutableStateFlow(ThemeMode.LIGHT)
         override suspend fun setCounterThemeMode(mode: ThemeMode) {}
+        private val _appThemeMode = MutableStateFlow(ThemeMode.LIGHT)
+        override val appThemeMode: Flow<ThemeMode> = _appThemeMode
+        override suspend fun setAppThemeMode(mode: ThemeMode) { _appThemeMode.value = mode }
+        private val _isInstagramTrackingEnabled = MutableStateFlow(true)
+        override val isInstagramTrackingEnabled: Flow<Boolean> = _isInstagramTrackingEnabled
+        override suspend fun setInstagramTrackingEnabled(enabled: Boolean) { _isInstagramTrackingEnabled.value = enabled }
+        private val _isYouTubeTrackingEnabled = MutableStateFlow(true)
+        override val isYouTubeTrackingEnabled: Flow<Boolean> = _isYouTubeTrackingEnabled
+        override suspend fun setYouTubeTrackingEnabled(enabled: Boolean) { _isYouTubeTrackingEnabled.value = enabled }
         override val hasCompletedTour: Flow<Boolean> = MutableStateFlow(false)
         override suspend fun setHasCompletedTour(completed: Boolean) {}
         override suspend fun getAllPreferencesSync(): Map<String, Any> = emptyMap()

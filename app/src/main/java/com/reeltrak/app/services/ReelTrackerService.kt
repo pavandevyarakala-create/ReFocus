@@ -97,6 +97,24 @@ class ReelTrackerService : AccessibilityService() {
         InstagramDetectorV2(),
         YouTubeDetectorV2()
     )
+
+    @Volatile
+    private var isInstagramTrackingEnabled: Boolean = true
+
+    @Volatile
+    private var isYouTubeTrackingEnabled: Boolean = true
+
+    private fun findActiveDetector(packageName: String?): IReelDetector? {
+        if (packageName.isNullOrBlank()) return null
+        return detectors.find { detector ->
+            val isEnabled = when (detector) {
+                is InstagramDetectorV2 -> isInstagramTrackingEnabled
+                is YouTubeDetectorV2 -> isYouTubeTrackingEnabled
+                else -> true
+            }
+            isEnabled && detector.supports(packageName)
+        }
+    }
     // -----------------
 
     private var floatingCounterManager: FloatingCounterManager? = null
@@ -260,6 +278,18 @@ class ReelTrackerService : AccessibilityService() {
                         currentState.copy(counterThemeMode = mode)
                     }
                 }
+            }
+        }
+
+        // Observe Platform Tracking preferences
+        serviceScope.launch {
+            preferencesRepository.isInstagramTrackingEnabled.collect { enabled ->
+                isInstagramTrackingEnabled = enabled
+            }
+        }
+        serviceScope.launch {
+            preferencesRepository.isYouTubeTrackingEnabled.collect { enabled ->
+                isYouTubeTrackingEnabled = enabled
             }
         }
 
@@ -585,7 +615,7 @@ class ReelTrackerService : AccessibilityService() {
             try {
                 val activePackage = rootNode.packageName?.toString() ?: ""
                 // Lifecycle 2: V3 Engine Pipeline
-                val detector = detectors.find { it.supports(activePackage) }
+                val detector = findActiveDetector(activePackage)
                 Log.d("STARTUP_DEBUG", "ReelTrackerService: activePackage='$activePackage', matchedDetector=${detector?.javaClass?.simpleName}")
                 if (detector != null) {
                     // Performing BFS analysis
@@ -765,7 +795,7 @@ class ReelTrackerService : AccessibilityService() {
             val root = try { rootInActiveWindow } catch (_: Exception) { null } ?: return@launch
             try {
                 val packageName = root.packageName?.toString()?.takeIf { it.isNotBlank() } ?: return@launch
-                val detector = detectors.find { it.supports(packageName) }
+                val detector = findActiveDetector(packageName)
                 if (detector == null) {
                     strictEnforcementGate.observe(null)
                     return@launch
@@ -797,7 +827,7 @@ class ReelTrackerService : AccessibilityService() {
                     try {
                         freshPackage = currentRoot.packageName?.toString() ?: return@launch
                         if (freshPackage != candidatePackage) return@launch
-                        val detector = detectors.find { it.supports(freshPackage) } ?: return@launch
+                        val detector = findActiveDetector(freshPackage) ?: return@launch
                         val freshSnapshot = detectorAnalysis.run { detector.analyze(currentRoot) }
                         freshSurface = StrictModeEnforcementPolicy.surfaceKey(freshSnapshot)
                         if (freshSurface == null || !strictModeShouldEnforce(freshSnapshot)) return@launch

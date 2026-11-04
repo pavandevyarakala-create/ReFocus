@@ -185,8 +185,11 @@ class MainActivity : ComponentActivity(), PaymentResultWithDataListener {
                     isSplashActive = false
                 }
             }
+
+            val appThemeMode by preferencesRepository.appThemeMode.collectAsStateWithLifecycle(initialValue = com.reeltrak.app.domain.models.ThemeMode.LIGHT)
+            val isAppDark = appThemeMode == com.reeltrak.app.domain.models.ThemeMode.DARK
             
-            com.reeltrak.app.core.ui.theme.GenesisTheme(darkTheme = false) {
+            com.reeltrak.app.core.ui.theme.GenesisTheme(darkTheme = isAppDark) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background

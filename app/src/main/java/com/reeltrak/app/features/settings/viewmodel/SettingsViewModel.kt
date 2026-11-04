@@ -99,6 +99,15 @@ class SettingsViewModel @Inject constructor(
     val counterThemeMode: StateFlow<ThemeMode> = preferencesRepository.counterThemeMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.LIGHT)
 
+    val appThemeMode: StateFlow<ThemeMode> = preferencesRepository.appThemeMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.LIGHT)
+
+    val isInstagramTrackingEnabled: StateFlow<Boolean> = preferencesRepository.isInstagramTrackingEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val isYouTubeTrackingEnabled: StateFlow<Boolean> = preferencesRepository.isYouTubeTrackingEnabled
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
     private val _isTourCompleted = MutableStateFlow(true)
     val isTourCompleted: StateFlow<Boolean> = _isTourCompleted.asStateFlow()
 
@@ -264,6 +273,24 @@ class SettingsViewModel @Inject constructor(
     fun setCounterThemeMode(mode: ThemeMode) {
         viewModelScope.launch {
             preferencesRepository.setCounterThemeMode(mode)
+        }
+    }
+
+    fun setAppThemeMode(mode: ThemeMode) {
+        viewModelScope.launch {
+            preferencesRepository.setAppThemeMode(mode)
+        }
+    }
+
+    fun setInstagramTrackingEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.setInstagramTrackingEnabled(enabled)
+        }
+    }
+
+    fun setYouTubeTrackingEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.setYouTubeTrackingEnabled(enabled)
         }
     }
 

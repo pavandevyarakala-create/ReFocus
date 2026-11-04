@@ -52,6 +52,15 @@ interface PreferencesRepository {
     val counterThemeMode: Flow<com.reeltrak.app.domain.models.ThemeMode>
     suspend fun setCounterThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode)
 
+    val appThemeMode: Flow<com.reeltrak.app.domain.models.ThemeMode> get() = kotlinx.coroutines.flow.flowOf(com.reeltrak.app.domain.models.ThemeMode.LIGHT)
+    suspend fun setAppThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode) {}
+
+    val isInstagramTrackingEnabled: Flow<Boolean> get() = kotlinx.coroutines.flow.flowOf(true)
+    suspend fun setInstagramTrackingEnabled(enabled: Boolean) {}
+
+    val isYouTubeTrackingEnabled: Flow<Boolean> get() = kotlinx.coroutines.flow.flowOf(true)
+    suspend fun setYouTubeTrackingEnabled(enabled: Boolean) {}
+
     val authSession: Flow<com.reeltrak.app.core.auth.UserAuthData?>
     suspend fun saveAuthSession(userData: com.reeltrak.app.core.auth.UserAuthData)
     suspend fun clearAuthSession()

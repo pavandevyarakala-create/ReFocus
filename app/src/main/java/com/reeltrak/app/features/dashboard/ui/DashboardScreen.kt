@@ -51,7 +51,9 @@ fun DashboardScreen(
     val isStrictMode: Boolean? by viewModel.isStrictModeEnabled.collectAsStateWithLifecycle()
     val isStrictModeLocked by viewModel.isStrictModeLocked.collectAsStateWithLifecycle()
     val strictModeDailyState by viewModel.strictModeDailyState.collectAsStateWithLifecycle()
-    val isLimitChangeRestricted by viewModel.isLimitChangeRestricted.collectAsStateWithLifecycle(initialValue = false)
+    val isDailyLimitToggledOn by viewModel.isDailyLimitToggledOn.collectAsStateWithLifecycle()
+    val configuredDailyLimit by viewModel.configuredDailyLimit.collectAsStateWithLifecycle()
+    val isStrictModeActive = (isStrictMode == true) && (strictModeDailyState == StrictModeDailyState.REACTIVATED_LOCKED || strictModeDailyState == StrictModeDailyState.ACTIVE_INTERACTIVE)
 
     var showStrictModeInfoDialog by remember { mutableStateOf(false) }
     val streakStats by viewModel.streakStats.collectAsStateWithLifecycle()
@@ -75,42 +77,56 @@ fun DashboardScreen(
                     dailyIntentProvider = { dailyIntentState.value }, 
                     currentReelsProvider = { reelsScrolledTodayState.value },
                     streakStatsProvider = { streakStats },
-                    isLimitLocked = isLimitChangeRestricted,
-                    isSaving = false,
+                    onStreakClick = onStreakClick,
+                    modifier = Modifier.tourTarget(TourTargets.HERO_PROGRESS_CARD, tourCoordinator)
+                )
+            }
+            item {
+                DailyLimitCard(
+                    isLimitEnabled = isDailyLimitToggledOn,
+                    currentLimit = configuredDailyLimit,
+                    isStrictModeActive = isStrictModeActive,
                     isEntitled = isDailyLimitEntitled,
-                    onDailyLimitLockedClick = {
-                        if (!isDailyLimitEntitled) {
-                            showDailyLimitEntitlementDialog = true
-                        } else {
-                            Toast.makeText(context, "Daily Limit can only be changed once per day. It unlocks tomorrow.", Toast.LENGTH_SHORT).show()
+                    isLoading = isAppUnlocked && (isStrictMode == null),
+                    onToggleLimit = { enabled ->
+                        viewModel.toggleDailyLimit(enabled) { success ->
+                            if (!success && isStrictModeActive) {
+                                Toast.makeText(context, "Daily Limit cannot be turned off while Strict Mode is active.", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     },
-                    onSaveGoal = { newGoal ->
+                    onSaveLimit = { newGoal ->
                         if (!isDailyLimitEntitled) {
                             showDailyLimitEntitlementDialog = true
-                            return@HeroProgressCard
+                            return@DailyLimitCard
                         }
-                        if (isLimitChangeRestricted) {
-                            Toast.makeText(context, "Daily Limit has already been updated for today. Resets tomorrow.", Toast.LENGTH_SHORT).show()
-                            return@HeroProgressCard
+                        if (isStrictModeActive) {
+                            Toast.makeText(context, "Daily Limit is locked by Strict Mode until tomorrow.", Toast.LENGTH_SHORT).show()
+                            return@DailyLimitCard
                         }
 
                         viewModel.confirmAndSetDailyGoal(newGoal) { success ->
                             if (success) {
-                                Toast.makeText(context, "Daily Limit updated! Further changes locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Daily Limit updated to $newGoal reels!", Toast.LENGTH_SHORT).show()
                             } else {
-                                Toast.makeText(context, "Daily Limit can only be changed once per day. Resets tomorrow.", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Could not update Daily Limit. Please try again.", Toast.LENGTH_SHORT).show()
                             }
                         }
                     },
-                    onStreakClick = onStreakClick,
-                    modifier = Modifier.tourTarget(TourTargets.HERO_PROGRESS_CARD, tourCoordinator)
+                    onLockedClick = {
+                        if (!isDailyLimitEntitled) {
+                            showDailyLimitEntitlementDialog = true
+                        } else if (isStrictModeActive) {
+                            Toast.makeText(context, "Daily Limit is locked by Strict Mode until tomorrow.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
                 )
             }
             item {
                 StrictModeCard(
                     dailyState = strictModeDailyState,
                     isEntitled = isAppUnlocked,
+                    isDailyLimitEnabled = isDailyLimitToggledOn,
                     isLoading = isAppUnlocked && (isStrictMode == null),
                     onTurnOffClick = {
                         if (!isAppUnlocked) {
@@ -134,6 +150,10 @@ fun DashboardScreen(
                             showStrictModeInfoDialog = true
                             return@StrictModeCard
                         }
+                        if (!isDailyLimitToggledOn) {
+                            Toast.makeText(context, "Turn on Daily Limit first before enabling Strict Mode.", Toast.LENGTH_SHORT).show()
+                            return@StrictModeCard
+                        }
                         viewModel.setStrictMode(true) { success ->
                             if (success) {
                                 Toast.makeText(context, "Strict Mode enabled and locked until tomorrow.", Toast.LENGTH_SHORT).show()
@@ -146,6 +166,9 @@ fun DashboardScreen(
                         } else if (strictModeDailyState.isLocked) {
                             Toast.makeText(context, "Strict Mode can only be turned off once per day. Locked until tomorrow.", Toast.LENGTH_SHORT).show()
                         }
+                    },
+                    onDisabledClick = {
+                        Toast.makeText(context, "Turn on Daily Limit first before enabling Strict Mode.", Toast.LENGTH_SHORT).show()
                     },
                     modifier = Modifier.tourTarget(TourTargets.STRICT_MODE_CARD, tourCoordinator)
                 )

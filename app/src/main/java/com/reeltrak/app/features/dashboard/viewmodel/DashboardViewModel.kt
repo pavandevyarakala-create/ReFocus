@@ -63,6 +63,36 @@ class DashboardViewModel @Inject constructor(
     val isDailyLimitLocked: StateFlow<Boolean> = preferencesRepository.isDailyLimitLocked
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
+    // Holds the last configured daily limit (e.g. 200) even when toggled off to 0
+    val configuredDailyLimit: StateFlow<Int> = combine(
+        dayManager.currentDayStats,
+        preferencesRepository.defaultDailyLimit
+    ) { stats, defaultLimit ->
+        val goal = stats?.dailyGoal ?: -1
+        if (goal > 0) goal else if (defaultLimit > 0) defaultLimit else 200
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 200)
+
+    private val _isDailyLimitExplicitToggle = MutableStateFlow<Boolean?>(null)
+    val isDailyLimitToggledOn: StateFlow<Boolean> = combine(
+        dayManager.currentDayStats,
+        _isDailyLimitExplicitToggle
+    ) { stats, explicitToggle ->
+        if (stats?.isStrictModeOn == true) {
+            true
+        } else if (explicitToggle != null) {
+            explicitToggle
+        } else {
+            (stats?.dailyGoal ?: -1) > 0
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val isStrictModeEligible: StateFlow<Boolean> = combine(
+        isDailyLimitToggledOn,
+        configuredDailyLimit
+    ) { isToggledOn, limit ->
+        isToggledOn && limit > 0
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
     fun disableStrictModeForToday() {
         if (!subscriptionManager.hasActiveEntitlementNow()) return
         dayManager.disableStrictModeForToday()
@@ -79,6 +109,11 @@ class DashboardViewModel @Inject constructor(
 
     fun setStrictMode(enabled: Boolean, onResult: (Boolean) -> Unit = {}) {
         if (!subscriptionManager.hasActiveEntitlementNow()) {
+            onResult(false)
+            return
+        }
+        if (enabled && !isDailyLimitToggledOn.value) {
+            android.util.Log.w("DashboardViewModel", "setStrictMode rejected: Daily Limit toggle must be ON before enabling Strict Mode.")
             onResult(false)
             return
         }
@@ -112,15 +147,35 @@ class DashboardViewModel @Inject constructor(
     val defaultLimit: StateFlow<Int> = preferencesRepository.defaultDailyLimit
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), -1)
 
-    val isLimitChangeRestricted: StateFlow<Boolean> = combine(
-        dayManager.currentDayStats,
-        preferencesRepository.lastLimitChangeDate
-    ) { stats, lastChangeDate ->
-        val todayEpoch = stats?.dateString?.let {
-            runCatching { LocalDate.parse(it).toEpochDay() }.getOrNull()
-        } ?: LocalDate.now().toEpochDay()
-        (stats?.isLimitLocked == true) || (lastChangeDate == todayEpoch)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    // Daily limit changes are ONLY restricted while Strict Mode is active
+    val isLimitChangeRestricted: StateFlow<Boolean> = dayManager.currentDayStats
+        .map { it?.isStrictModeOn == true }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    fun toggleDailyLimit(enabled: Boolean, onResult: (Boolean) -> Unit = {}) {
+        val mode = appAuthorizationManager.getOperationalMode()
+        if (!mode.isEntitled) {
+            onResult(false)
+            return
+        }
+        val stats = dayManager.currentDayStats.value
+        if (!enabled && stats?.isStrictModeOn == true) {
+            android.util.Log.w("DashboardViewModel", "toggleDailyLimit OFF rejected: Strict Mode is currently ON.")
+            onResult(false)
+            return
+        }
+        _isDailyLimitExplicitToggle.value = enabled
+        viewModelScope.launch {
+            val targetGoal = if (enabled) {
+                val configured = configuredDailyLimit.value
+                if (configured > 0) configured else 200
+            } else {
+                0
+            }
+            val success = dayManager.setDailyGoalSuspend(targetGoal, forceUpdate = true)
+            onResult(success)
+        }
+    }
 
     fun setDailyGoal(goal: Int) {
         val mode = appAuthorizationManager.getOperationalMode()
@@ -128,7 +183,15 @@ class DashboardViewModel @Inject constructor(
             android.util.Log.w("DashboardViewModel", "setDailyGoal rejected: Daily Limit is Trial/Premium-only. Mode: $mode")
             return
         }
-        dayManager.setDailyGoal(goal)
+        val stats = dayManager.currentDayStats.value
+        if (stats?.isStrictModeOn == true) {
+            android.util.Log.w("DashboardViewModel", "setDailyGoal rejected: Strict Mode is currently ON.")
+            return
+        }
+        viewModelScope.launch {
+            preferencesRepository.setDefaultDailyLimit(goal)
+            dayManager.setDailyGoalSuspend(goal, forceUpdate = true)
+        }
     }
 
     fun confirmAndSetDailyGoal(goal: Int, onResult: (Boolean) -> Unit = {}) {
@@ -138,13 +201,18 @@ class DashboardViewModel @Inject constructor(
             onResult(false)
             return
         }
+        val stats = dayManager.currentDayStats.value
+        if (stats?.isStrictModeOn == true) {
+            android.util.Log.w("DashboardViewModel", "confirmAndSetDailyGoal rejected: Strict Mode is currently ON.")
+            onResult(false)
+            return
+        }
         viewModelScope.launch {
-            if (!dayManager.canSetDailyGoalToday()) {
-                android.util.Log.d("DashboardViewModel", "confirmAndSetDailyGoal rejected: limit already locked for today")
-                onResult(false)
-                return@launch
+            preferencesRepository.setDefaultDailyLimit(goal)
+            val success = dayManager.setDailyGoalSuspend(goal, forceUpdate = true)
+            if (success) {
+                _isDailyLimitExplicitToggle.value = true
             }
-            val success = dayManager.setDailyGoalSuspend(goal)
             onResult(success)
         }
     }

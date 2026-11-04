@@ -100,6 +100,15 @@ class Bug014FreeModePersistenceRegressionTest {
         override val counterThemeMode: Flow<com.reeltrak.app.domain.models.ThemeMode> =
             MutableStateFlow(com.reeltrak.app.domain.models.ThemeMode.LIGHT)
         override suspend fun setCounterThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode) {}
+        private val _appThemeMode = MutableStateFlow(com.reeltrak.app.domain.models.ThemeMode.LIGHT)
+        override val appThemeMode: Flow<com.reeltrak.app.domain.models.ThemeMode> = _appThemeMode
+        override suspend fun setAppThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode) { _appThemeMode.value = mode }
+        private val _isInstagramTrackingEnabled = MutableStateFlow(true)
+        override val isInstagramTrackingEnabled: Flow<Boolean> = _isInstagramTrackingEnabled
+        override suspend fun setInstagramTrackingEnabled(enabled: Boolean) { _isInstagramTrackingEnabled.value = enabled }
+        private val _isYouTubeTrackingEnabled = MutableStateFlow(true)
+        override val isYouTubeTrackingEnabled: Flow<Boolean> = _isYouTubeTrackingEnabled
+        override suspend fun setYouTubeTrackingEnabled(enabled: Boolean) { _isYouTubeTrackingEnabled.value = enabled }
         override val hasCompletedTour: Flow<Boolean> = MutableStateFlow(false)
         override suspend fun setHasCompletedTour(completed: Boolean) {}
         override val lastBackupTime: Flow<Long> = MutableStateFlow(0L)

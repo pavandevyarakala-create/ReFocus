@@ -11,6 +11,8 @@ import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.SmartDisplay
+import androidx.compose.material.icons.outlined.Subscriptions
 import androidx.compose.material.icons.outlined.Widgets
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -101,8 +103,12 @@ fun SettingsScreen(
     }
 
     val counterThemeMode by viewModel.counterThemeMode.collectAsStateWithLifecycle()
+    val appThemeMode by viewModel.appThemeMode.collectAsStateWithLifecycle()
+    val isInstagramTrackingEnabled by viewModel.isInstagramTrackingEnabled.collectAsStateWithLifecycle()
+    val isYouTubeTrackingEnabled by viewModel.isYouTubeTrackingEnabled.collectAsStateWithLifecycle()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
-    ReFocusBrandTheme(darkTheme = false) {
+    ReFocusBrandTheme(darkTheme = appThemeMode == ThemeMode.DARK) {
         val colors = ReFocusTheme.colors
 
         Scaffold(
@@ -143,7 +149,120 @@ fun SettingsScreen(
 
                 Spacer(modifier = Modifier.height(28.dp))
 
-                // 3. Cloud Data Backup & Restore
+                // 1. User Preferences (Unified Grouped Container)
+                SettingsSectionHeader(title = "PREFERENCES")
+                Spacer(modifier = Modifier.height(6.dp))
+                SettingsGroupContainer {
+                    // App Dark Mode / Light Mode Control
+                    AppearanceSettingControl(
+                        title = "App Appearance",
+                        subtitle = when (appThemeMode) {
+                            ThemeMode.LIGHT -> "Application • Light styling"
+                            ThemeMode.DARK -> "Application • Dark styling"
+                        },
+                        icon = Icons.Outlined.Palette,
+                        currentMode = appThemeMode,
+                        onSelectMode = { viewModel.setAppThemeMode(it) },
+                        showDivider = true
+                    )
+
+                    // Dedicated In-Line Counter Appearance Control: [ Light ] [ Dark ]
+                    AppearanceSettingControl(
+                        title = "Counter Appearance",
+                        subtitle = when (counterThemeMode) {
+                            ThemeMode.LIGHT -> "Overlay counter • Light styling"
+                            ThemeMode.DARK -> "Overlay counter • Dark styling"
+                        },
+                        icon = Icons.Outlined.Widgets,
+                        currentMode = counterThemeMode,
+                        onSelectMode = { viewModel.setCounterThemeMode(it) },
+                        showDivider = true
+                    )
+
+                    // Platform Tracking: Instagram Reels
+                    SettingsItemRow(
+                        title = "Instagram Reels",
+                        subtitle = "Track scroll sessions and count reels in Instagram",
+                        icon = Icons.Outlined.SmartDisplay,
+                        showDivider = true,
+                        trailing = {
+                            Switch(
+                                checked = isInstagramTrackingEnabled,
+                                onCheckedChange = { isChecked ->
+                                    if (!isChecked && !isYouTubeTrackingEnabled) {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "At least one platform must remain active for tracking.",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        viewModel.setInstagramTrackingEnabled(isChecked)
+                                    }
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = colors.textInverse,
+                                    checkedTrackColor = colors.accentLime,
+                                    uncheckedThumbColor = colors.textMuted,
+                                    uncheckedTrackColor = colors.surfaceSoft
+                                )
+                            )
+                        }
+                    )
+
+                    // Platform Tracking: YouTube Shorts
+                    SettingsItemRow(
+                        title = "YouTube Shorts",
+                        subtitle = "Track scroll sessions and count shorts in YouTube",
+                        icon = Icons.Outlined.Subscriptions,
+                        showDivider = true,
+                        trailing = {
+                            Switch(
+                                checked = isYouTubeTrackingEnabled,
+                                onCheckedChange = { isChecked ->
+                                    if (!isChecked && !isInstagramTrackingEnabled) {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "At least one platform must remain active for tracking.",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        viewModel.setYouTubeTrackingEnabled(isChecked)
+                                    }
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = colors.textInverse,
+                                    checkedTrackColor = colors.accentLime,
+                                    uncheckedThumbColor = colors.textMuted,
+                                    uncheckedTrackColor = colors.surfaceSoft
+                                )
+                            )
+                        }
+                    )
+
+                    // Notifications Switch
+                    SettingsItemRow(
+                        title = "Notifications",
+                        subtitle = "Daily usage alerts and limit threshold warnings",
+                        icon = Icons.Outlined.Notifications,
+                        showDivider = false,
+                        trailing = {
+                            Switch(
+                                checked = notificationsEnabled,
+                                onCheckedChange = { viewModel.setNotificationsEnabled(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = colors.textInverse,
+                                    checkedTrackColor = colors.accentLime,
+                                    uncheckedThumbColor = colors.textMuted,
+                                    uncheckedTrackColor = colors.surfaceSoft
+                                )
+                            )
+                        }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(28.dp))
+
+                // 2. Cloud Data Backup & Restore
                 SettingsSectionHeader(title = "BACKUP & RESTORE")
                 Spacer(modifier = Modifier.height(6.dp))
                 SettingsGroupContainer {
@@ -178,44 +297,6 @@ fun SettingsScreen(
                             }
                         },
                         showDivider = false
-                    )
-                }
-                Spacer(modifier = Modifier.height(28.dp))
-
-                // 4. User Preferences (Unified Grouped Container)
-                SettingsSectionHeader(title = "PREFERENCES")
-                Spacer(modifier = Modifier.height(6.dp))
-                SettingsGroupContainer {
-                    // Dedicated In-Line Counter Appearance Control: [ Light ] [ Dark ]
-                    AppearanceSettingControl(
-                        title = "Counter Appearance",
-                        subtitle = when (counterThemeMode) {
-                            ThemeMode.LIGHT -> "Overlay counter • Light styling"
-                            ThemeMode.DARK -> "Overlay counter • Dark styling"
-                        },
-                        icon = Icons.Outlined.Widgets,
-                        currentMode = counterThemeMode,
-                        onSelectMode = { viewModel.setCounterThemeMode(it) },
-                        showDivider = true
-                    )
-
-                    SettingsItemRow(
-                        title = "Notifications",
-                        subtitle = "Daily usage alerts and limit threshold warnings",
-                        icon = Icons.Outlined.Notifications,
-                        showDivider = false,
-                        trailing = {
-                            Switch(
-                                checked = notificationsEnabled,
-                                onCheckedChange = { viewModel.setNotificationsEnabled(it) },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = colors.textInverse,
-                                    checkedTrackColor = colors.accentLime,
-                                    uncheckedThumbColor = colors.textMuted,
-                                    uncheckedTrackColor = colors.surfaceSoft
-                                )
-                            )
-                        }
                     )
                 }
 

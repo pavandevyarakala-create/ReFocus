@@ -24,10 +24,12 @@ import com.reeltrak.app.domain.models.StrictModeDailyState
 fun StrictModeCard(
     dailyState: StrictModeDailyState,
     isEntitled: Boolean = true,
+    isDailyLimitEnabled: Boolean = true,
     isLoading: Boolean = false,
     onTurnOffClick: () -> Unit = {},
     onReactivateClick: () -> Unit = {},
     onLockedCardClick: () -> Unit = {},
+    onDisabledClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val strictCardShape = RoundedCornerShape(16.dp)
@@ -41,10 +43,14 @@ fun StrictModeCard(
                 spotColor = ReFocusColors.shadowSpot
             )
             .then(
-                if (!isEntitled || dailyState == StrictModeDailyState.REACTIVATED_LOCKED) {
-                    Modifier.clickable(enabled = !isLoading) { onLockedCardClick() }
-                } else {
-                    Modifier
+                when {
+                    !isEntitled || dailyState == StrictModeDailyState.REACTIVATED_LOCKED -> {
+                        Modifier.clickable(enabled = !isLoading) { onLockedCardClick() }
+                    }
+                    !isDailyLimitEnabled -> {
+                        Modifier.clickable(enabled = !isLoading) { onDisabledClick() }
+                    }
+                    else -> Modifier
                 }
             ),
         shape = strictCardShape,
@@ -140,6 +146,7 @@ fun StrictModeCard(
                     !isEntitled -> "Auto-closes apps at limit • Premium feature"
                     isLoading -> "Loading..."
                     dailyState == StrictModeDailyState.REACTIVATED_LOCKED -> "Enforcement active • Locked until tomorrow"
+                    !isDailyLimitEnabled -> "Requires Daily Limit • Turn on limit first"
                     dailyState == StrictModeDailyState.DISABLED_TODAY -> "Off for today • Toggle to enable (will lock)"
                     else -> "Enforcement active • You can turn this off once today"
                 }
@@ -147,6 +154,7 @@ fun StrictModeCard(
                 val subtitleColor = when {
                     !isEntitled -> ReFocusColors.textMuted
                     dailyState == StrictModeDailyState.REACTIVATED_LOCKED -> ReFocusColors.textMuted
+                    !isDailyLimitEnabled -> ReFocusColors.textMuted
                     dailyState == StrictModeDailyState.DISABLED_TODAY -> ReFocusColors.warningText
                     else -> if (ReFocusColors.isDark) ReFocusColors.accentHighlight else ReFocusColors.accentDark
                 }
@@ -178,6 +186,18 @@ fun StrictModeCard(
                         tint = ReFocusColors.textMuted
                     )
                 }
+            } else if (!isDailyLimitEnabled && dailyState != StrictModeDailyState.REACTIVATED_LOCKED) {
+                // Strict Mode cannot be enabled if Daily Limit is OFF
+                Switch(
+                    checked = false,
+                    onCheckedChange = { onDisabledClick() },
+                    enabled = false,
+                    colors = SwitchDefaults.colors(
+                        disabledUncheckedThumbColor = ReFocusColors.textMuted.copy(alpha = 0.5f),
+                        disabledUncheckedTrackColor = ReFocusColors.surfaceSoft,
+                        disabledUncheckedBorderColor = ReFocusColors.border
+                    )
+                )
             } else {
                 when (dailyState) {
                     StrictModeDailyState.ACTIVE_INTERACTIVE -> {
@@ -232,9 +252,11 @@ fun StrictModeCard(
     isStrictModeEnabled: Boolean,
     isLocked: Boolean,
     isEntitled: Boolean = true,
+    isDailyLimitEnabled: Boolean = true,
     isLoading: Boolean = false,
     onToggleStrictMode: (Boolean) -> Unit = {},
     onLockedCardClick: () -> Unit = {},
+    onDisabledClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val dailyState = when {
@@ -246,10 +268,12 @@ fun StrictModeCard(
     StrictModeCard(
         dailyState = dailyState,
         isEntitled = isEntitled,
+        isDailyLimitEnabled = isDailyLimitEnabled,
         isLoading = isLoading,
         onTurnOffClick = { onToggleStrictMode(false) },
         onReactivateClick = { onToggleStrictMode(true) },
         onLockedCardClick = onLockedCardClick,
+        onDisabledClick = onDisabledClick,
         modifier = modifier
     )
 }

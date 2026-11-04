@@ -51,6 +51,8 @@ class PreferencesRepositoryImpl @Inject constructor(
     private val NOTIFICATIONS_ENABLED_KEY = booleanPreferencesKey("notifications_enabled")
     private val THEME_MODE_KEY = stringPreferencesKey("theme_mode")
     private val COUNTER_THEME_MODE_KEY = stringPreferencesKey("counter_theme_mode")
+    private val INSTAGRAM_TRACKING_ENABLED_KEY = booleanPreferencesKey("instagram_tracking_enabled")
+    private val YOUTUBE_TRACKING_ENABLED_KEY = booleanPreferencesKey("youtube_tracking_enabled")
     
     private val BADGE_7_UNLOCK_TIME_KEY = longPreferencesKey("badge_7_unlock_time")
     private val BADGE_30_UNLOCK_TIME_KEY = longPreferencesKey("badge_30_unlock_time")
@@ -296,6 +298,39 @@ class PreferencesRepositoryImpl @Inject constructor(
     override suspend fun setCounterThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode) {
         context.dataStore.edit { preferences ->
             preferences[COUNTER_THEME_MODE_KEY] = mode.name
+        }
+    }
+
+    override val appThemeMode: Flow<com.reeltrak.app.domain.models.ThemeMode> = context.dataStore.data
+        .map { preferences ->
+            when (preferences[THEME_MODE_KEY]) {
+                com.reeltrak.app.domain.models.ThemeMode.DARK.name -> com.reeltrak.app.domain.models.ThemeMode.DARK
+                com.reeltrak.app.domain.models.ThemeMode.LIGHT.name -> com.reeltrak.app.domain.models.ThemeMode.LIGHT
+                else -> com.reeltrak.app.domain.models.ThemeMode.LIGHT
+            }
+        }
+
+    override suspend fun setAppThemeMode(mode: com.reeltrak.app.domain.models.ThemeMode) {
+        context.dataStore.edit { preferences ->
+            preferences[THEME_MODE_KEY] = mode.name
+        }
+    }
+
+    override val isInstagramTrackingEnabled: Flow<Boolean> = context.dataStore.data
+        .map { preferences -> preferences[INSTAGRAM_TRACKING_ENABLED_KEY] ?: true }
+
+    override suspend fun setInstagramTrackingEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[INSTAGRAM_TRACKING_ENABLED_KEY] = enabled
+        }
+    }
+
+    override val isYouTubeTrackingEnabled: Flow<Boolean> = context.dataStore.data
+        .map { preferences -> preferences[YOUTUBE_TRACKING_ENABLED_KEY] ?: true }
+
+    override suspend fun setYouTubeTrackingEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[YOUTUBE_TRACKING_ENABLED_KEY] = enabled
         }
     }
 
