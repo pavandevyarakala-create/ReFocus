@@ -1,5 +1,7 @@
 package com.reeltrak.app.services.overlay
 
+import android.util.Log
+import com.reeltrak.app.BuildConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,7 +38,9 @@ data class OverlayState(
     val currentSessionReels: Int = 0,
     val sessionStartTime: Long = 0L,
     val sessionState: SessionState = SessionState.IDLE,
-    val dailyGoal: Int = 0
+    val dailyGoal: Int = 0,
+    val isUpdateRequired: Boolean = false,
+    val counterThemeMode: com.reeltrak.app.domain.models.ThemeMode = com.reeltrak.app.domain.models.ThemeMode.LIGHT
 )
 
 /**
@@ -65,6 +69,12 @@ class OverlayStateManager {
                 batchDepth = 0
                 batchedState?.let { finalState ->
                     if (_state.value != finalState) {
+                        if (BuildConfig.DEBUG && _state.value.count != finalState.count) {
+                            Log.d(
+                                "COUNTER_DIAG",
+                                "[POINT_3_STATE_EMITTED] Batched OverlayState count changed: ${_state.value.count} -> ${finalState.count}, isVisible=${finalState.isVisible}, thread=${Thread.currentThread().name}"
+                            )
+                        }
                         _state.value = finalState
                     }
                 }
@@ -81,6 +91,12 @@ class OverlayStateManager {
                 val currentState = _state.value
                 val newState = updater(currentState)
                 if (currentState != newState) {
+                    if (BuildConfig.DEBUG && currentState.count != newState.count) {
+                        Log.d(
+                            "COUNTER_DIAG",
+                            "[POINT_3_STATE_EMITTED] OverlayState count changed: ${currentState.count} -> ${newState.count}, isVisible=${newState.isVisible}, thread=${Thread.currentThread().name}"
+                        )
+                    }
                     _state.value = newState
                 }
             }

@@ -10,148 +10,186 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.reeltrak.app.features.dashboard.ui.components.*
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel
-import com.reeltrak.app.services.tracking.SessionState
-import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.TimeBlock
+import com.reeltrak.app.domain.models.StrictModeDailyState
 
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.reeltrak.app.core.tour.LocalTourCoordinator
+import com.reeltrak.app.core.tour.TourTargets
+import com.reeltrak.app.core.tour.tourTarget
+
+import android.widget.Toast
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
+import com.reeltrak.app.core.ui.components.DailyLimitEntitlementDialog
+import com.reeltrak.app.core.ui.components.ReFocusTopBar
+import com.reeltrak.app.core.ui.theme.ReFocusColors
+import com.reeltrak.app.core.ui.theme.ReFocusTheme
+import com.reeltrak.app.data.security.authorization.OperationalMode
 
 @OptIn(ExperimentalMaterial3Api::class)
-
 @Composable
 fun DashboardScreen(
     viewModel: DashboardViewModel = hiltViewModel(),
-    onStreakClick: () -> Unit = {}
+    onStreakClick: () -> Unit = {},
+    onOpenSubscription: () -> Unit = {},
+    onNavigateToLoginForUpgrade: () -> Unit = {},
+    onProfileClick: () -> Unit = {},
+    userProfilePictureUri: String? = null,
+    userDisplayName: String? = null
 ) {
+    val context = LocalContext.current
+
+    val isAppUnlocked by viewModel.isAppUnlocked.collectAsStateWithLifecycle()
+    val operationalMode by viewModel.operationalMode.collectAsStateWithLifecycle()
+    val isDailyLimitEntitled by viewModel.isDailyLimitEntitled.collectAsStateWithLifecycle()
+
+    var showDailyLimitEntitlementDialog by remember { mutableStateOf(false) }
+
     val dailyIntentState = viewModel.dailyIntent.collectAsStateWithLifecycle()
     val reelsScrolledTodayState = viewModel.reelsScrolledToday.collectAsStateWithLifecycle()
     
-    val liveState by viewModel.liveSessionState.collectAsStateWithLifecycle()
-
     val isStrictMode: Boolean? by viewModel.isStrictModeEnabled.collectAsStateWithLifecycle()
     val isStrictModeLocked by viewModel.isStrictModeLocked.collectAsStateWithLifecycle()
+    val strictModeDailyState by viewModel.strictModeDailyState.collectAsStateWithLifecycle()
     val isLimitChangeRestricted by viewModel.isLimitChangeRestricted.collectAsStateWithLifecycle(initialValue = false)
 
-    var showDailyLimitDialog by remember { mutableStateOf<Int?>(null) }
-    var showStrictModeConfirmation by remember { mutableStateOf(false) }
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedSession by remember { mutableStateOf<TimeBlock?>(null) }
-
+    var showStrictModeInfoDialog by remember { mutableStateOf(false) }
     val streakStats by viewModel.streakStats.collectAsStateWithLifecycle()
 
-    LazyColumn(
+    val tourCoordinator = LocalTourCoordinator.current
+
+    Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
-            .padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(24.dp),
-        contentPadding = PaddingValues(top = 16.dp, bottom = 32.dp)
+            .background(ReFocusColors.background)
     ) {
-        item {
-            HeroProgressCard(
-                dailyIntentProvider = { dailyIntentState.value }, 
-                currentReelsProvider = { reelsScrolledTodayState.value },
-                streakStatsProvider = { streakStats },
-                isLimitLocked = isLimitChangeRestricted,
-                onSaveGoal = { newGoal ->
-                    showDailyLimitDialog = newGoal
-                },
-                onStreakClick = onStreakClick
-            )
-        }
-        item {
-            StrictModeCard(
-                isStrictModeEnabled = isStrictMode ?: false,
-                isLocked = isStrictModeLocked || isStrictMode == true || isStrictMode == null,
-                isLoading = isStrictMode == null,
-                onToggleStrictMode = { enabled ->
-                    if (enabled) {
-                        showStrictModeConfirmation = true
-                    } else {
-                        viewModel.setStrictMode(false)
-                    }
-                }
-            )
-        }
-        item {
-            TodaysStatusCard(
-                dailyIntentProvider = { dailyIntentState.value },
-                currentReelsProvider = { reelsScrolledTodayState.value },
-                streakStatsProvider = { streakStats }
-            )
-        }
-        item {
-            if (liveState.sessionState == SessionState.ACTIVE || liveState.sessionState == SessionState.ENTERING_REELS || liveState.sessionState == SessionState.EXITING) {
-                LiveSessionCard(
-                    currentApp = liveState.currentApp,
-                    sessionStartTime = liveState.sessionStartTime,
-                    reelsScrolled = liveState.currentSessionReels
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            contentPadding = PaddingValues(top = ReFocusTheme.Dimens.TopBarContentTopOffset, bottom = ReFocusTheme.Dimens.ScreenBottomContentPadding)
+        ) {
+            item {
+                HeroProgressCard(
+                    dailyIntentProvider = { dailyIntentState.value }, 
+                    currentReelsProvider = { reelsScrolledTodayState.value },
+                    streakStatsProvider = { streakStats },
+                    isLimitLocked = isLimitChangeRestricted,
+                    isSaving = false,
+                    isEntitled = isDailyLimitEntitled,
+                    onDailyLimitLockedClick = {
+                        if (!isDailyLimitEntitled) {
+                            showDailyLimitEntitlementDialog = true
+                        } else {
+                            Toast.makeText(context, "Daily Limit can only be changed once per day. It unlocks tomorrow.", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    onSaveGoal = { newGoal ->
+                        if (!isDailyLimitEntitled) {
+                            showDailyLimitEntitlementDialog = true
+                            return@HeroProgressCard
+                        }
+                        if (isLimitChangeRestricted) {
+                            Toast.makeText(context, "Daily Limit has already been updated for today. Resets tomorrow.", Toast.LENGTH_SHORT).show()
+                            return@HeroProgressCard
+                        }
+
+                        viewModel.confirmAndSetDailyGoal(newGoal) { success ->
+                            if (success) {
+                                Toast.makeText(context, "Daily Limit updated! Further changes locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Daily Limit can only be changed once per day. Resets tomorrow.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onStreakClick = onStreakClick,
+                    modifier = Modifier.tourTarget(TourTargets.HERO_PROGRESS_CARD, tourCoordinator)
+                )
+            }
+            item {
+                StrictModeCard(
+                    dailyState = strictModeDailyState,
+                    isEntitled = isAppUnlocked,
+                    isLoading = isAppUnlocked && (isStrictMode == null),
+                    onTurnOffClick = {
+                        if (!isAppUnlocked) {
+                            showStrictModeInfoDialog = true
+                            return@StrictModeCard
+                        }
+                        if (strictModeDailyState.isLocked) {
+                            Toast.makeText(context, "Strict Mode can only be turned off once per day. Locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                            return@StrictModeCard
+                        }
+                        viewModel.setStrictMode(false) { success ->
+                            if (success) {
+                                Toast.makeText(context, "Strict Mode turned off for today. You can turn it back on once.", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(context, "Strict Mode can only be turned off once per day. Locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onReactivateClick = {
+                        if (!isAppUnlocked) {
+                            showStrictModeInfoDialog = true
+                            return@StrictModeCard
+                        }
+                        viewModel.setStrictMode(true) { success ->
+                            if (success) {
+                                Toast.makeText(context, "Strict Mode enabled and locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    onLockedCardClick = {
+                        if (!isAppUnlocked) {
+                            showStrictModeInfoDialog = true
+                        } else if (strictModeDailyState.isLocked) {
+                            Toast.makeText(context, "Strict Mode can only be turned off once per day. Locked until tomorrow.", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.tourTarget(TourTargets.STRICT_MODE_CARD, tourCoordinator)
+                )
+            }
+            item {
+                TodaysStatusCard(
+                    dailyIntentProvider = { dailyIntentState.value },
+                    currentReelsProvider = { reelsScrolledTodayState.value },
+                    streakStatsProvider = { streakStats },
+                    modifier = Modifier.tourTarget(TourTargets.LIVE_TODAYS_STATUS, tourCoordinator)
                 )
             }
         }
+
+        ReFocusTopBar(
+            title = "Dashboard",
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(
+                    start = ReFocusTheme.Dimens.TopBarHorizontalMargin,
+                    end = ReFocusTheme.Dimens.TopBarHorizontalMargin,
+                    top = ReFocusTheme.Dimens.TopBarTopMargin
+                )
+        )
     }
     
     // --- Confirmation Dialogs ---
 
-    showDailyLimitDialog?.let { goal ->
-        AlertDialog(
-            onDismissRequest = { showDailyLimitDialog = null },
-            title = { Text("Set Daily Reel Limit?") },
-            text = { Text("This will become your default daily limit and will automatically apply every day. You won't need to set it again unless you decide to change it.\n\nLimit changes are allowed only once per calendar day.") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.confirmAndSetDailyGoal(goal)
-                        showDailyLimitDialog = null
-                    }
-                ) {
-                    Text("Save")
-                }
+    if (showDailyLimitEntitlementDialog) {
+        val isUnauthenticated = operationalMode == OperationalMode.UNAUTHENTICATED_FREE
+        DailyLimitEntitlementDialog(
+            isUnauthenticated = isUnauthenticated,
+            onDismiss = {
+                showDailyLimitEntitlementDialog = false
             },
-            dismissButton = {
-                TextButton(onClick = { showDailyLimitDialog = null }) {
-                    Text("Cancel")
+            onPrimaryAction = {
+                showDailyLimitEntitlementDialog = false
+                if (isUnauthenticated) {
+                    onNavigateToLoginForUpgrade()
+                } else {
+                    onOpenSubscription()
                 }
             }
         )
-    }
-
-    if (showStrictModeConfirmation) {
-        AlertDialog(
-            onDismissRequest = { showStrictModeConfirmation = false },
-            title = { Text("Enable Strict Mode?") },
-            text = {
-                Text(
-                    "Once enabled, Strict Mode cannot be turned off until the current day ends (daily reset).\n\n" +
-                    "• You will not be able to disable it manually.\n" +
-                    "• When the daily reel limit is reached, access to Reels/Shorts will be prevented by simulating a Back action.\n\n" +
-                    "Only enable this if you are fully committed to your goals."
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.setStrictMode(true)
-                        showStrictModeConfirmation = false
-                    }
-                ) {
-                    Text("Enable Strict Mode")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showStrictModeConfirmation = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    selectedSession?.let { session ->
-        ModalBottomSheet(
-            onDismissRequest = { selectedSession = null },
-            sheetState = sheetState
-        ) {
-            SessionDetailSheet(session = session)
-        }
     }
 
     val pendingBadge by viewModel.pendingCelebrationBadge.collectAsStateWithLifecycle()
@@ -167,4 +205,20 @@ fun DashboardScreen(
             }
         )
     }
+
+    if (showStrictModeInfoDialog) {
+        val isUnauthenticated = operationalMode == OperationalMode.UNAUTHENTICATED_FREE
+        StrictModeInfoDialog(
+            onDismissRequest = { showStrictModeInfoDialog = false },
+            onGetPremiumClick = {
+                showStrictModeInfoDialog = false
+                if (isUnauthenticated) {
+                    onNavigateToLoginForUpgrade()
+                } else {
+                    onOpenSubscription()
+                }
+            }
+        )
+    }
 }
+

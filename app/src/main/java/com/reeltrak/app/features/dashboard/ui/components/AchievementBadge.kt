@@ -35,6 +35,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.cos
 import kotlin.math.sin
+import com.reeltrak.app.core.ui.theme.ReFocusColors
 
 @Composable
 fun AchievementBadge(
@@ -54,7 +55,7 @@ fun AchievementBadge(
         label = "rotation"
     )
 
-    val scaleFactor by infiniteTransition.animateFloat(
+    val scaleFactor = infiniteTransition.animateFloat(
         initialValue = 1f,
         targetValue = 1.05f,
         animationSpec = infiniteRepeatable(
@@ -65,9 +66,14 @@ fun AchievementBadge(
     )
 
     val appliedModifier = if (isUnlocked) {
-        modifier.size(size).graphicsLayer(scaleX = scaleFactor, scaleY = scaleFactor)
+        Modifier.size(size).graphicsLayer {
+            scaleX = scaleFactor.value
+            scaleY = scaleFactor.value
+        }
     } else {
-        modifier.size(size).blur(2.dp).graphicsLayer(alpha = 0.4f)
+        Modifier.size(size).blur(2.dp).graphicsLayer {
+            alpha = 0.4f
+        }
     }
 
     Box(contentAlignment = Alignment.Center, modifier = modifier.size(size)) {
@@ -88,14 +94,14 @@ fun AchievementBadge(
         if (!isUnlocked) {
             Surface(
                 shape = CircleShape,
-                color = Color.Black.copy(alpha = 0.6f),
+                color = ReFocusColors.scrim.copy(alpha = 0.7f),
                 modifier = Modifier.size(size * 0.45f)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
                         imageVector = Icons.Default.Lock,
                         contentDescription = "Locked Milestone",
-                        tint = Color.White,
+                        tint = ReFocusColors.textPrimary,
                         modifier = Modifier.size(size * 0.22f)
                     )
                 }
@@ -510,12 +516,19 @@ fun ConfettiAnimation(modifier: Modifier = Modifier) {
         label = "progress"
     )
 
+    val confettiColors = listOf(
+        ReFocusColors.accent,
+        ReFocusColors.accentPressed,
+        ReFocusColors.streakFlame,
+        ReFocusColors.success,
+        ReFocusColors.warning
+    )
+
     Canvas(modifier = modifier) {
         val width = size.width
         val height = size.height
         
-        // Render 24 multi-colored confetti particles falling/spreading
-        val randomColors = listOf(Color.Yellow, Color.Cyan, Color.Green, Color.Magenta, Color.Red, Color(0xFFFF9100))
+        // Render 24 confetti particles falling/spreading using ReFocus brand palette
         for (i in 0 until 24) {
             val seed = i * 23.4f
             val xPos = (width * 0.5f) + (width * 0.45f * sin(seed) * animProgress)
@@ -523,7 +536,7 @@ fun ConfettiAnimation(modifier: Modifier = Modifier) {
             val sizeRadius = 6.dp.toPx() + (3.dp.toPx() * sin(seed + animProgress))
             
             drawCircle(
-                color = randomColors[i % randomColors.size].copy(alpha = 1f - animProgress),
+                color = confettiColors[i % confettiColors.size].copy(alpha = 1f - animProgress),
                 radius = sizeRadius,
                 center = Offset(xPos, yPos)
             )

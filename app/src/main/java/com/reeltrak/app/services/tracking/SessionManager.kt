@@ -1,6 +1,7 @@
 package com.reeltrak.app.services.tracking
 
 import android.util.Log
+import com.reeltrak.app.data.security.authorization.AuthorizationToken
 
 enum class SessionState {
     IDLE,
@@ -15,86 +16,141 @@ enum class SessionState {
  * Finite State Machine managing the Reel session lifecycle.
  */
 class SessionManager(
-    private val onStateChanged: (SessionState, SessionState) -> Unit
+    private val onStateChanged: (SessionState, SessionState) -> Unit,
+    private val timeProvider: () -> Long = { System.currentTimeMillis() }
 ) {
+
+    private val lock = Any()
+
+    @Volatile
     var currentState: SessionState = SessionState.IDLE
         private set
 
+    @Volatile
     var currentApp: String? = null
         private set
         
+    @Volatile
     var sessionStartTime: Long = 0L
         private set
         
-    var lastSuccessfulDetection: Long = 0L
-        private set
-        
+    @Volatile
     var reelsCount: Int = 0
         private set
-        
-    val sessionDurationMs: Long
-        get() = if (currentState != SessionState.IDLE && sessionStartTime > 0) {
-            System.currentTimeMillis() - sessionStartTime
-        } else 0L
 
+    @Volatile
+    var activeAuthorizationToken: AuthorizationToken? = null
+        private set
+        
     fun transitionTo(newState: SessionState) {
-        if (currentState == newState) return
-        
-        Log.d("SessionDebug", "[Session] Transition: $currentState -> $newState")
-        val oldState = currentState
-        currentState = newState
-        
-        when (newState) {
-            SessionState.ENTERING_REELS -> {
-                sessionStartTime = System.currentTimeMillis()
-                lastSuccessfulDetection = System.currentTimeMillis()
-                reelsCount = 0
+        synchronized(lock) {
+            if (currentState == newState) return
+            
+            Log.d("SessionDebug", "[Session] Transition: $currentState -> $newState")
+            val oldState = currentState
+            val now = timeProvider()
+
+            currentState = newState
+            
+            when (newState) {
+                SessionState.ENTERING_REELS -> {
+                    sessionStartTime = now
+                    reelsCount = 0
+                }
+                SessionState.IDLE, SessionState.DESTROYED -> {
+                    currentApp = null
+                    reelsCount = 0
+                    sessionStartTime = 0L
+                }
+                else -> {}
             }
-            SessionState.IDLE, SessionState.DESTROYED -> {
-                currentApp = null
-                reelsCount = 0
-                sessionStartTime = 0L
-                lastSuccessfulDetection = 0L
-            }
-            else -> {}
+            
+            onStateChanged(oldState, newState)
         }
-        
-        onStateChanged(oldState, newState)
     }
 
+    private var consecutiveNullAppCount = 0
+
     fun updateCurrentApp(packageName: String?) {
-        if (currentApp != packageName) {
-            Log.d("SessionDebug", "[Session] App Changed: $currentApp -> $packageName")
-            currentApp = packageName
-            if (packageName == null || !isTrackedApp(packageName)) {
-                transitionTo(SessionState.IDLE)
+        synchronized(lock) {
+            if (packageName == null) {
+                consecutiveNullAppCount++
+                // BUG-G01: Transient null active window protection
+                // A temporary null root during window transitions must not immediately destroy an active session.
+                // Distinguish transient unavailability from persistent exit.
+                if (consecutiveNullAppCount >= 2 && currentState != SessionState.IDLE) {
+                    Log.d("SessionDebug", "[Session] Confirmed app exit on persistent null window -> IDLE")
+                    transitionTo(SessionState.IDLE)
+                    currentApp = null
+                }
+                return
+            }
+
+            consecutiveNullAppCount = 0
+
+            if (currentApp != packageName) {
+                Log.d("SessionDebug", "[Session] App Changed: $currentApp -> $packageName")
+                
+                // If switching away from an active session, end and persist it BEFORE updating currentApp
+                if (currentState == SessionState.ACTIVE || 
+                    currentState == SessionState.ENTERING_REELS || 
+                    currentState == SessionState.PAUSED ||
+                    currentState == SessionState.EXITING) {
+                    transitionTo(SessionState.IDLE)
+                }
+
+                currentApp = packageName
+                if (!isTrackedApp(packageName)) {
+                    if (currentState != SessionState.IDLE) {
+                        transitionTo(SessionState.IDLE)
+                    }
+                }
             }
         }
     }
 
     fun recordSuccessfulDetection() {
-        lastSuccessfulDetection = System.currentTimeMillis()
-        if (currentState == SessionState.ENTERING_REELS) {
-            transitionTo(SessionState.ACTIVE)
-        } else if (currentState == SessionState.IDLE) {
-            // Cold start detection jump: initialize session timers
-            sessionStartTime = System.currentTimeMillis()
-            reelsCount = 0
-            transitionTo(SessionState.ACTIVE)
-        } else if (currentState == SessionState.PAUSED || currentState == SessionState.EXITING) {
-            transitionTo(SessionState.ACTIVE)
+        synchronized(lock) {
+            val now = timeProvider()
+            if (currentState == SessionState.ENTERING_REELS) {
+                transitionTo(SessionState.ACTIVE)
+            } else if (currentState == SessionState.IDLE) {
+                // Cold start detection jump: initialize session timers
+                sessionStartTime = now
+                reelsCount = 0
+                transitionTo(SessionState.ACTIVE)
+            } else if (currentState == SessionState.PAUSED || currentState == SessionState.EXITING) {
+                transitionTo(SessionState.ACTIVE)
+            }
         }
     }
     
-    fun incrementReel() {
-        reelsCount++
-        recordSuccessfulDetection()
+    fun updateAuthorization(token: AuthorizationToken?) {
+        synchronized(lock) {
+            activeAuthorizationToken = token
+            if (token == null && currentState != SessionState.IDLE) {
+                Log.d("SessionDebug", "[Session] Authorization revoked. Forcing IDLE.")
+                transitionTo(SessionState.IDLE)
+            }
+        }
+    }
+
+    fun incrementReel(token: AuthorizationToken? = null) {
+        synchronized(lock) {
+            if (token != null) {
+                activeAuthorizationToken = token
+            }
+            reelsCount++
+            recordSuccessfulDetection()
+        }
     }
 
     fun resetSessionCount() {
-        Log.d("SessionDebug", "[Session] Daily Reset: reelsCount reset to 0")
-        reelsCount = 0
-        sessionStartTime = System.currentTimeMillis()
+        synchronized(lock) {
+            Log.d("SessionDebug", "[Session] Daily Reset: reelsCount reset to 0")
+            reelsCount = 0
+            sessionStartTime = timeProvider()
+        }
     }
 
     fun isTrackedApp(packageName: String?): Boolean {

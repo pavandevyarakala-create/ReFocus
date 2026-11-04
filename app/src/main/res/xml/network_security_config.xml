@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Base configuration: block all cleartext HTTP by default (all domains and external hosts) -->
+    <base-config cleartextTrafficPermitted="false" />
+
+    <!-- No cleartext domain exceptions required: Cloud Functions communicate over HTTPS -->
+</network-security-config>

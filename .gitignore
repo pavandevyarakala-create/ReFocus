@@ -20,3 +20,20 @@ local.properties
 Thumbs.db
 # Firebase
 google-services.json
+
+# Keystore & Signing
+*.jks
+*.keystore
+*.p12
+*.key
+signing.properties
+keystore.properties
+secrets.properties
+
+# Node & Env
+node_modules/
+.env
+.env.*
+.wrangler/
+.firebase/
+.gradle-local-reel/

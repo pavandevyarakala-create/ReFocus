@@ -2,69 +2,141 @@ package com.reeltrak.app.core.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.em
+import androidx.compose.ui.unit.sp
+import com.reeltrak.app.R
 
-val GenesisTypography = Typography(
+/**
+ * Re:Focus Global Sora Typeface System.
+ *
+ * Weight Strategy:
+ * - Display / Hero metrics: Sora SemiBold (FontWeight.SemiBold - 600)
+ * - Large titles & screen titles: Sora SemiBold (FontWeight.SemiBold - 600)
+ * - Section titles & headers: Sora Medium (FontWeight.Medium - 500) / SemiBold
+ * - Body text: Sora Regular (FontWeight.Normal - 400)
+ * - Secondary / supporting text: Sora Regular (FontWeight.Normal - 400) / Medium
+ * - Buttons & actions: Sora Medium / SemiBold
+ * - Small labels, tags & micro captions: Sora Medium
+ */
+val SoraFontFamily = FontFamily(
+    Font(R.font.sora_regular, FontWeight.Normal),
+    Font(R.font.sora_medium, FontWeight.Medium),
+    Font(R.font.sora_semibold, FontWeight.SemiBold),
+    Font(R.font.sora_bold, FontWeight.Bold)
+)
+
+val ReFocusTypography = Typography(
     displayLarge = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for General Sans
-        fontWeight = FontWeight.Bold,
-        fontSize = 72.sp,
-        letterSpacing = (-0.04).em,
-        color = GenesisTextPrimary
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 40.sp,
+        lineHeight = 46.sp,
+        letterSpacing = (-0.02).em
+    ),
+    displayMedium = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 32.sp,
+        lineHeight = 38.sp,
+        letterSpacing = (-0.02).em
+    ),
+    displaySmall = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 28.sp,
+        lineHeight = 34.sp,
+        letterSpacing = (-0.01).em
     ),
     headlineLarge = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for General Sans
-        fontWeight = FontWeight.Bold,
-        fontSize = 60.sp,
-        letterSpacing = (-0.03).em,
-        color = GenesisTextPrimary
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 24.sp,
+        lineHeight = 30.sp,
+        letterSpacing = (-0.01).em
+    ),
+    headlineMedium = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 20.sp,
+        lineHeight = 26.sp,
+        letterSpacing = 0.sp
+    ),
+    headlineSmall = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 18.sp,
+        lineHeight = 24.sp,
+        letterSpacing = 0.sp
     ),
     titleLarge = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for General Sans
-        fontWeight = FontWeight.Bold,
-        fontSize = 32.sp,
-        letterSpacing = (-0.03).em,
-        color = GenesisTextPrimary
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 17.sp,
+        lineHeight = 22.sp,
+        letterSpacing = 0.sp
     ),
     titleMedium = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for General Sans
-        fontWeight = FontWeight.Bold,
-        fontSize = 24.sp,
-        letterSpacing = (-0.03).em,
-        color = GenesisTextPrimary
-    ),
-    bodyLarge = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for DM Sans
-        fontWeight = FontWeight.Normal,
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.Medium,
         fontSize = 15.sp,
-        color = GenesisTextPrimary
+        lineHeight = 20.sp,
+        letterSpacing = 0.sp
     ),
-    bodyMedium = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for DM Sans
+    titleSmall = TextStyle(
+        fontFamily = SoraFontFamily,
         fontWeight = FontWeight.Medium,
         fontSize = 14.sp,
-        color = GenesisTextPrimary
+        lineHeight = 18.sp,
+        letterSpacing = 0.sp
+    ),
+    bodyLarge = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 15.sp,
+        lineHeight = 22.sp,
+        letterSpacing = 0.sp
+    ),
+    bodyMedium = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 13.5.sp,
+        lineHeight = 19.sp,
+        letterSpacing = 0.sp
+    ),
+    bodySmall = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.Normal,
+        fontSize = 12.sp,
+        lineHeight = 16.sp,
+        letterSpacing = 0.sp
+    ),
+    labelLarge = TextStyle(
+        fontFamily = SoraFontFamily,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 13.5.sp,
+        lineHeight = 18.sp,
+        letterSpacing = 0.01.em
     ),
     labelMedium = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for DM Sans
-        fontWeight = FontWeight.Medium,
-        fontSize = 13.sp,
-        color = GenesisTextSecondary
-    ),
-    labelSmall = TextStyle(
-        fontFamily = FontFamily.SansSerif, // Fallback for DM Sans
+        fontFamily = SoraFontFamily,
         fontWeight = FontWeight.Medium,
         fontSize = 12.sp,
-        color = GenesisTextSecondary
+        lineHeight = 16.sp,
+        letterSpacing = 0.01.em
     ),
-    bodySmall = TextStyle( // Used as Overline
-        fontFamily = FontFamily.SansSerif, // Fallback for DM Sans
+    labelSmall = TextStyle(
+        fontFamily = SoraFontFamily,
         fontWeight = FontWeight.Medium,
-        fontSize = 11.sp,
-        letterSpacing = 1.sp,
-        color = GenesisTextSecondary
+        fontSize = 10.5.sp,
+        lineHeight = 14.sp,
+        letterSpacing = 0.02.em
     )
 )
+
+/**
+ * Backward compatibility alias for GenesisTypography.
+ */
+val GenesisTypography = ReFocusTypography

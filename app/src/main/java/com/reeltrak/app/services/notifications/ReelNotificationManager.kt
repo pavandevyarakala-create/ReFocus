@@ -15,15 +15,22 @@ import androidx.core.app.NotificationManagerCompat
 import com.reeltrak.app.MainActivity
 import com.reeltrak.app.R
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
+import com.reeltrak.app.domain.repository.PreferencesRepository
 
 @Singleton
 class ReelNotificationManager @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val preferencesRepository: PreferencesRepository
 ) {
 
     private val notificationManager = NotificationManagerCompat.from(context)
+    private var notificationsEnabled = true
+    
 
     companion object {
         const val CHANNEL_ID_LIMITS = "channel_limits"
@@ -38,42 +45,45 @@ class ReelNotificationManager @Inject constructor(
 
     init {
         createChannels()
+        CoroutineScope(Dispatchers.IO).launch {
+            preferencesRepository.notificationsEnabled.collect { isEnabled ->
+                notificationsEnabled = isEnabled
+            }
+        }
     }
 
     private fun createChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val limitsChannel = NotificationChannel(
-                CHANNEL_ID_LIMITS,
-                "Limit Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Alerts when you reach or approach your daily reel limit"
-                enableVibration(true)
-                enableLights(true)
-            }
-
-            val streaksChannel = NotificationChannel(
-                CHANNEL_ID_STREAKS,
-                "Streaks & Milestones",
-                NotificationManager.IMPORTANCE_DEFAULT
-            ).apply {
-                description = "Notifications for streak milestones and badges"
-            }
-
-            val summaryChannel = NotificationChannel(
-                CHANNEL_ID_SUMMARY,
-                "Daily Summaries",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Morning recaps of your progress"
-            }
-
-            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(limitsChannel)
-            manager.createNotificationChannel(streaksChannel)
-            manager.createNotificationChannel(summaryChannel)
-            Log.d("ReelNotificationManager", "Notification channels created")
+        val limitsChannel = NotificationChannel(
+            CHANNEL_ID_LIMITS,
+            "Limit Alerts",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Alerts when you reach or approach your daily reel limit"
+            enableVibration(true)
+            enableLights(true)
         }
+
+        val streaksChannel = NotificationChannel(
+            CHANNEL_ID_STREAKS,
+            "Streaks & Milestones",
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Notifications for streak milestones and badges"
+        }
+
+        val summaryChannel = NotificationChannel(
+            CHANNEL_ID_SUMMARY,
+            "Daily Summaries",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "Morning recaps of your progress"
+        }
+
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(limitsChannel)
+        manager.createNotificationChannel(streaksChannel)
+        manager.createNotificationChannel(summaryChannel)
+        Log.d("ReelNotificationManager", "Notification channels created")
     }
 
     private fun getPendingIntent(): PendingIntent {
@@ -127,7 +137,7 @@ class ReelNotificationManager @Inject constructor(
             .build()
 
         try {
-            if (notificationManager.areNotificationsEnabled()) {
+            if (notificationsEnabled && notificationManager.areNotificationsEnabled()) {
                 notificationManager.notify(NOTIFICATION_ID_LIMIT_WARNING, notification)
                 Log.d("ReelNotificationManager", "showProgressMilestoneNotification dispatched successfully ($percentage%)")
             } else {
@@ -153,7 +163,7 @@ class ReelNotificationManager @Inject constructor(
             .build()
 
         try {
-            if (notificationManager.areNotificationsEnabled()) {
+            if (notificationsEnabled && notificationManager.areNotificationsEnabled()) {
                 notificationManager.notify(NOTIFICATION_ID_LIMIT_REACHED, notification)
                 Log.d("ReelNotificationManager", "showLimitReachedNotification dispatched successfully")
             } else {
@@ -179,7 +189,7 @@ class ReelNotificationManager @Inject constructor(
             .build()
 
         try {
-            if (notificationManager.areNotificationsEnabled()) {
+            if (notificationsEnabled && notificationManager.areNotificationsEnabled()) {
                 notificationManager.notify(NOTIFICATION_ID_STREAK, notification)
                 Log.d("ReelNotificationManager", "showStreakMilestoneNotification dispatched successfully")
             } else {
@@ -209,7 +219,7 @@ class ReelNotificationManager @Inject constructor(
             .build()
 
         try {
-            if (notificationManager.areNotificationsEnabled()) {
+            if (notificationsEnabled && notificationManager.areNotificationsEnabled()) {
                 notificationManager.notify(NOTIFICATION_ID_SUMMARY, notification)
                 Log.d("ReelNotificationManager", "showDailySummaryNotification dispatched successfully")
             } else {

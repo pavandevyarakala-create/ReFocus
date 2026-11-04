@@ -1,0 +1,16 @@
+{
+  "name": "refocus-razorpay-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker for Re:Focus Razorpay Checkout and Firestore updates",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node test_runner.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "^4.131.1"
+  }
+}

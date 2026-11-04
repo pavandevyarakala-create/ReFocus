@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Re:Focus</string>
+    <string name="accessibility_service_description">Re:Focus uses this service strictly to detect when supported Instagram Reels and YouTube Shorts are actively playing in order to track your viewing sessions, count scroll transitions, and help you maintain your daily reel limit. Re:Focus does not read or collect personal messages, passwords, contacts, keystrokes, or payment credentials, and all view detection is processed in real time on your device.</string>
 </resources>

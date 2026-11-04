@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account &amp; Data Deletion - Re:Focus by FOCRAMEX</title>
+    <meta name="description" content="Step-by-step instructions on how to delete your Re:Focus account, cancel in-app subscriptions, and permanently purge your cloud data.">
+    <link rel="stylesheet" href="styles.css">
+    <script>
+        const CONFIG = {
+            SUPPORT_EMAIL: "support.refocus@gmail.com"
+        };
+    </script>
+</head>
+<body>
+    <!-- Accessible Navigation -->
+    <nav class="nav-wrapper" aria-label="Main Navigation">
+        <div class="container nav-container glass-nav" style="border-radius: var(--radius-pill); margin-top: var(--space-sm); padding: 0 var(--space-md);">
+            <a href="/" class="logo" aria-label="Re:Focus Home">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                Re:<span>Focus</span>
+            </a>
+            
+            <div class="nav-links">
+                <a href="/">Home</a>
+                <a href="/#problem">About</a>
+                <a href="/#features">Features</a>
+                <a href="/#faq">FAQ</a>
+                <a href="support.html">Support</a>
+                <a href="privacy.html">Privacy</a>
+            </div>
+
+            <a href="/" class="btn btn-primary" style="padding: 0.5rem 1.25rem; font-size: var(--text-sm);">Return to Site</a>
+            
+            <button type="button" class="mobile-menu-btn" aria-label="Open Mobile Menu" aria-expanded="false" aria-controls="mobile-menu" onclick="window.location.href='/'">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+        </div>
+    </nav>
+
+    <main class="legal-section container">
+        <div class="legal-content">
+            <h1>Account &amp; Data Deletion Policy</h1>
+            <p class="meta">Effective Date: October 2026 | Application: Re:Focus | Brand: FOCRAMEX</p>
+
+            <div class="legal-alert">
+                <p><strong>Your Right to be Forgotten:</strong> You have the absolute right to delete your Re:Focus account and have all associated data stored on our servers permanently and irrevocably erased.</p>
+            </div>
+
+            <h2>1. Overview of Data Deletion</h2>
+            <p>In full compliance with Google Play Developer Data Safety policies and international privacy frameworks, <strong>Re:Focus by FOCRAMEX</strong> provides straightforward mechanisms for users to request the permanent deletion of their account and all associated cloud data.</p>
+            <p>You can initiate deletion directly within the mobile application, use our <strong><a href="delete-account.html">Online Account Deletion Portal</a></strong>, or submit a manual deletion request via our dedicated support email.</p>
+            <div style="margin: var(--space-md) 0;">
+                <a href="delete-account.html" class="btn btn-primary" style="font-size: var(--text-sm);">Open Online Deletion Portal &rarr;</a>
+            </div>
+
+            <h2>2. How to Request Account Deletion (In-App)</h2>
+            <p>The fastest way to delete your account is directly inside the Android application:</p>
+            <ol style="padding-left: var(--space-md); margin-bottom: var(--space-md); color: var(--text-secondary);">
+                <li style="margin-bottom: var(--space-xs);">Open the <strong>Re:Focus</strong> app on your Android device.</li>
+                <li style="margin-bottom: var(--space-xs);">Navigate to the <strong>Settings</strong> tab (gear icon in the bottom navigation dock).</li>
+                <li style="margin-bottom: var(--space-xs);">Scroll down to the <strong>Danger Zone / Account Lifecycle</strong> section.</li>
+                <li style="margin-bottom: var(--space-xs);">Tap <strong>Delete Account</strong>.</li>
+                <li style="margin-bottom: var(--space-xs);">Read the confirmation details carefully and tap <strong>Confirm Delete</strong>.</li>
+            </ol>
+            <p>Upon confirmation, your session is immediately ended, local device cache is wiped, and your cloud account enters our 7-day safety grace period.</p>
+
+            <h2>3. The 7-Day Recovery Grace Period</h2>
+            <p>To safeguard against accidental deletions or unauthorized device access:</p>
+            <ul>
+                <li>When deletion is requested, your account transitions to <code>PENDING_DELETION</code> status on our Cloudflare edge server.</li>
+                <li><strong>Cancellations / Restoration:</strong> If you change your mind within <strong>7 days</strong>, simply open the app and sign in with the same Google account. You will receive an option to cancel deletion and restore your streaks and history.</li>
+                <li><strong>Permanent Purge:</strong> Once the 7-day period expires, our automated backend scheduler executes a permanent, irreversible purge across Google Cloud Firestore and Firebase Authentication.</li>
+            </ul>
+
+            <h2>4. What Data Is Permanently Deleted?</h2>
+            <p>Upon expiration of the grace period, the following data is permanently purged from our infrastructure:</p>
+            <ul>
+                <li><strong>Firebase Authentication Record:</strong> Your user profile entry, email mapping, and UID in Google Identity Toolkit are permanently deleted.</li>
+                <li><strong>Cloud Firestore User Document (<code>/users/{uid}</code>):</strong> Display name, profile image URL, daily goal preferences, and account metadata are removed.</li>
+                <li><strong>Daily Summaries Subcollection (<code>/users/{uid}/days/*</code>):</strong> All historical daily reel counts, watch times, and active day statistics are irrevocably deleted.</li>
+                <li><strong>Cloud Backups:</strong> All server-stored backup snapshots associated with your UID are purged.</li>
+                <li><strong>Device-Local Data:</strong> All local Room SQLite databases, session logs, and DataStore preferences are wiped immediately upon requesting deletion on the device.</li>
+            </ul>
+
+            <h2>5. What Data May Be Retained and Why</h2>
+            <ul>
+                <li><strong>Razorpay Transaction Records:</strong> In accordance with Indian tax laws (such as GST regulations) and financial reporting compliance, historical transaction invoices and payment IDs are retained by Razorpay and our financial records for legal and audit obligations. These records contain zero browsing habits or reel-tracking metrics.</li>
+            </ul>
+
+            <h2>6. What Happens to Active Subscriptions?</h2>
+            <div class="legal-alert" style="background: rgba(239, 68, 68, 0.08); border-left-color: #EF4444;">
+                <p><strong>Important Note on Subscriptions:</strong> Deleting your Re:Focus account or uninstalling the app automatically cancels any pending cycles in our system; however, to ensure no subsequent charges occur on your bank account or UPI handle, we strongly recommend manually tapping <strong>Cancel Autopay</strong> in app Settings before initiating account deletion.</p>
+            </div>
+
+            <h2>7. Manual Deletion Requests via Email</h2>
+            <p>If you have already uninstalled the application or cannot access your Android device, you can request manual deletion by contacting our privacy team:</p>
+            <div class="contact-card">
+                <p><strong>Email:</strong> <a href="mailto:support.refocus@gmail.com?subject=Account%20Deletion%20Request">support.refocus@gmail.com</a></p>
+                <p><strong>Subject Line:</strong> <code>Account Deletion Request - Re:Focus</code></p>
+                <p><strong>Body Content:</strong> Please send the request from the exact Google email address associated with your Re:Focus account so we can verify ownership.</p>
+                <p><em>Manual email requests are verified and processed within 48 to 72 business hours.</em></p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="/" class="logo" style="margin-bottom: var(--space-sm);" aria-label="Re:Focus Home">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                        Re:<span>Focus</span>
+                    </a>
+                    <p style="font-size: var(--text-sm); margin-bottom: var(--space-md);">Official companion website for the Re:Focus Android digital wellness application by FOCRAMEX.</p>
+                    <p style="font-size: var(--text-sm); color: var(--text-muted);">&copy; 2026 Re:Focus by FOCRAMEX. All rights reserved.</p>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Product</h4>
+                    <a href="/#problem">About Re:Focus</a>
+                    <a href="/#features">Features</a>
+                    <a href="/#faq">FAQ</a>
+                </div>
+                
+                <div class="footer-col">
+                    <h4>Support</h4>
+                    <a href="/#faq">FAQ</a>
+                    <a href="support.html">Help &amp; Troubleshooting</a>
+                    <a href="delete-account.html">Account &amp; Data Deletion</a>
+                    <a href="mailto:support.refocus@gmail.com">Contact Support</a>
+                </div>
+
+                <div class="footer-col">
+                    <h4>Legal</h4>
+                    <a href="privacy.html">Privacy Policy</a>
+                    <a href="terms.html">Terms &amp; Conditions</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>

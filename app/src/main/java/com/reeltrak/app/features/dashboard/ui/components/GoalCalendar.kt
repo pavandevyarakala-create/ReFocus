@@ -11,8 +11,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
@@ -24,13 +26,23 @@ import java.time.LocalDate
 import java.time.YearMonth
 import java.time.format.TextStyle
 import java.util.Locale
+import com.reeltrak.app.core.ui.theme.ReFocusColors
 
 @Composable
-fun GoalCalendar(dailyStats: List<DailyBlocks>) {
-    // Local state for month navigation
-    var currentMonth by remember { mutableStateOf(YearMonth.now()) }
-    val today = remember { LocalDate.now() }
+fun GoalCalendar(
+    dailyStats: List<DailyBlocks>,
+    currentBusinessDate: LocalDate = LocalDate.now(),
+    onMonthChanged: (YearMonth) -> Unit = {}
+) {
+    // Local state for month navigation anchored to current local date
+    var currentMonth by remember(currentBusinessDate) { mutableStateOf(YearMonth.from(currentBusinessDate)) }
+    val today = currentBusinessDate
+    var selectedDate by remember { mutableStateOf<LocalDate?>(null) }
     
+    LaunchedEffect(currentMonth) {
+        onMonthChanged(currentMonth)
+    }
+
     // Create a map for quick lookup by epoch day
     val statsMap = remember(dailyStats) {
         dailyStats.associateBy { it.dateEpochDay }
@@ -48,12 +60,19 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
     }
     val (daysInMonth, firstDayOfWeek, daysInPrevMonth) = calendarGridData
 
+    val calendarShape = RoundedCornerShape(22.dp)
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+        modifier = Modifier
+            .fillMaxWidth()
+            .shadow(
+                elevation = 3.dp,
+                shape = calendarShape,
+                ambientColor = ReFocusColors.shadowAmbient,
+                spotColor = ReFocusColors.shadowSpot
+            ),
+        shape = calendarShape,
+        colors = CardDefaults.cardColors(containerColor = ReFocusColors.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             // 1. HEADER: < Month Year >
@@ -66,7 +85,7 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                     Icon(
                         imageVector = Icons.Default.ChevronLeft,
                         contentDescription = "Previous Month",
-                        tint = MaterialTheme.colorScheme.primary
+                        tint = ReFocusColors.textPrimary
                     )
                 }
                 
@@ -81,7 +100,7 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                     Icon(
                         imageVector = Icons.Default.ChevronRight,
                         contentDescription = "Next Month",
-                        tint = MaterialTheme.colorScheme.primary
+                        tint = ReFocusColors.textPrimary
                     )
                 }
             }
@@ -130,52 +149,61 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                                     cellIndex < firstDayOfWeek -> {
                                         val day = daysInPrevMonth - (firstDayOfWeek - cellIndex - 1)
                                         Text(
-                                            text = day.toString(),
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
+                                             text = day.toString(),
+                                             style = MaterialTheme.typography.bodyMedium,
+                                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.2f)
                                         )
                                     }
                                     // Current month days
                                     dayCounter <= daysInMonth -> {
                                         val day = dayCounter
-                                        val isToday = currentMonth.year == today.year && 
-                                                      currentMonth.month == today.month && 
-                                                      day == today.dayOfMonth
-                                        
                                         val date = currentMonth.atDay(day)
                                         val dayData = statsMap[date.toEpochDay()]
+                                        val isToday = (dayData?.isToday == true) || (currentMonth.year == today.year && 
+                                                      currentMonth.month == today.month && 
+                                                      day == today.dayOfMonth)
 
-                                        val cellColor = remember(day, statsMap, currentMonth) {
+                                        val warningColor = ReFocusColors.warning
+                                        val errorColor = ReFocusColors.error
+                                        val accentDarkColor = ReFocusColors.accentDark
+                                        val accentColor = ReFocusColors.accent
+
+                                        val cellColor = remember(day, statsMap, currentMonth, warningColor, errorColor, accentDarkColor, accentColor) {
                                             val data = statsMap[date.toEpochDay()]
-                                            if (data == null || data.percentage < 0f) {
+                                            if (data == null || (data.totalReelsScrolled == 0 && data.dailyGoal <= 0)) {
                                                 Color.Transparent
-                                            } else if (data.isSkullDay) {
-                                                Color.Transparent
+                                            } else if (data.isUnrestrictedDay) {
+                                                warningColor // Amber indicator for Unrestricted Day
+                                            } else if (data.isDriftedDay) {
+                                                errorColor // Error indicator for Drifted Day
                                             } else if (data.isGraceDay) {
-                                                Color(0xFFEF9A9A) // Light Red for Grace Zone
+                                                errorColor.copy(alpha = 0.5f) // Grace Zone
                                             } else {
                                                 val fraction = data.percentage.coerceIn(0f, 1f)
-                                                androidx.compose.ui.graphics.lerp(Color(0xFF1B5E20), Color(0xFF81C784), fraction)
+                                                androidx.compose.ui.graphics.lerp(accentDarkColor, accentColor, fraction)
                                             }
                                         }
 
                                         Surface(
-                                            modifier = Modifier.fillMaxSize(),
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable { selectedDate = date },
                                             shape = RoundedCornerShape(8.dp),
                                             color = cellColor,
-                                            border = if (isToday) BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)) else null
+                                            border = when {
+                                                selectedDate == date -> BorderStroke(2.dp, ReFocusColors.textPrimary)
+                                                isToday -> BorderStroke(1.5.dp, ReFocusColors.accent)
+                                                else -> null
+                                            }
                                         ) {
                                             Box(contentAlignment = Alignment.Center) {
-                                                if (dayData?.isSkullDay == true) {
-                                                    Text(text = "💀", fontSize = 18.sp)
-                                                } else {
-                                                    Text(
-                                                        text = day.toString(),
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                        fontWeight = if (isToday) FontWeight.Bold else FontWeight.Normal,
-                                                        color = if (cellColor != Color.Transparent) Color.White else if (isToday) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                                                    )
-                                                }
+                                                Text(
+                                                    text = day.toString(),
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    fontWeight = if (isToday || dayData?.isDriftedDay == true || dayData?.isUnrestrictedDay == true) FontWeight.Bold else FontWeight.Normal,
+                                                    color = if (cellColor != Color.Transparent) (if (cellColor == accentColor) ReFocusColors.textInverse else ReFocusColors.textPrimary) else if (isToday) ReFocusColors.accent else MaterialTheme.colorScheme.onSurface
+                                                )
                                             }
                                         }
                                         dayCounter++
@@ -198,21 +226,60 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // 4. COLOR LEGEND
-            Text(
-                "Color Legend", 
-                style = MaterialTheme.typography.labelMedium, 
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            // 4. COLOR LEGEND AND SELECTED DATE STATS
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Bottom
+            ) {
+                Text(
+                    "Color Legend", 
+                    style = MaterialTheme.typography.labelMedium, 
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                if (selectedDate != null) {
+                    val dayEntry = statsMap[selectedDate!!.toEpochDay()]
+                    val dateStr = selectedDate!!.format(java.time.format.DateTimeFormatter.ofPattern("MMM d"))
+                    if (dayEntry == null) {
+                        Text(
+                            text = "$dateStr: No data recorded",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Normal,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        val count = dayEntry.totalReelsScrolled
+                        val statusSuffix = when {
+                            dayEntry.isUnrestrictedDay -> " (Unrestricted)"
+                            dayEntry.isDriftedDay -> " (Drifted)"
+                            dayEntry.isGraceDay -> " (Grace Zone)"
+                            dayEntry.dailyGoal > 0 && count <= dayEntry.dailyGoal -> " (Within Limit)"
+                            else -> ""
+                        }
+                        Text(
+                            text = "$dateStr: $count reels$statusSuffix",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = when {
+                                dayEntry.isUnrestrictedDay -> ReFocusColors.warning
+                                dayEntry.isDriftedDay -> ReFocusColors.error
+                                dayEntry.isGraceDay -> ReFocusColors.error.copy(alpha = 0.7f)
+                                else -> ReFocusColors.accent
+                            }
+                        )
+                    }
+                }
+            }
             Spacer(modifier = Modifier.height(8.dp))
             
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 // Gradient Item
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.5f)) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1.2f)) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -220,38 +287,37 @@ fun GoalCalendar(dailyStats: List<DailyBlocks>) {
                             .clip(RoundedCornerShape(4.dp))
                             .background(
                                 brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
-                                    colors = listOf(Color(0xFF1B5E20), Color(0xFF81C784))
+                                    colors = listOf(ReFocusColors.accentDark, ReFocusColors.accent)
                                 )
                             )
                     )
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("0% → 100%", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("0% → 100%", style = MaterialTheme.typography.labelSmall, fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
 
                 // Grace Zone Item
-                LegendItem(Color(0xFFEF9A9A), "Grace Zone", Modifier.weight(1f))
+                LegendItem(ReFocusColors.error.copy(alpha = 0.5f), "Grace", Modifier.weight(0.9f))
 
-                // Skull Day Item
-                LegendItem(Color.Transparent, "> Limit + 30", Modifier.weight(1f), isSkull = true)
+                // Drifted Day Item
+                LegendItem(ReFocusColors.error, "Drifted", Modifier.weight(0.9f))
+
+                // Unrestricted Day Item
+                LegendItem(ReFocusColors.warning, "Unrestricted", Modifier.weight(1.1f))
             }
         }
     }
 }
 
 @Composable
-private fun LegendItem(color: Color, label: String, modifier: Modifier = Modifier, isSkull: Boolean = false) {
+private fun LegendItem(color: Color, label: String, modifier: Modifier = Modifier) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = modifier) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(8.dp)
                 .clip(RoundedCornerShape(4.dp))
-                .background(if (isSkull) MaterialTheme.colorScheme.surfaceVariant else color)
-                .then(if (isSkull) Modifier.border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(4.dp)) else Modifier),
-            contentAlignment = Alignment.Center
-        ) {
-            if (isSkull) Text("💀", fontSize = 6.sp)
-        }
+                .background(color)
+        )
         Spacer(modifier = Modifier.height(4.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, fontSize = 8.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
