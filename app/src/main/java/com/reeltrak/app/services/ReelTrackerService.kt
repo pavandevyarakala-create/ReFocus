@@ -10,7 +10,6 @@ import android.content.IntentFilter
 import android.os.PowerManager
 import android.app.KeyguardManager
 import androidx.core.content.ContextCompat
-import com.reeltrak.app.data.local.entity.SessionData
 import com.reeltrak.app.domain.repository.PreferencesRepository
 import com.reeltrak.app.services.overlay.OverlayStateManager
 
@@ -66,6 +65,7 @@ class ReelTrackerService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var processingQueue: LatestStateAnalysisQueue<TrackingAnalysisRequest>? = null
     private val detectorAnalysis = SerializedDetectorAnalysis()
+    private val analysisFreshnessGate = AnalysisFreshnessGate()
     private val inconclusiveSnapshotGate = InconclusiveSnapshotGate()
     @Volatile private var transitionDirectionForLedger: DirectionStateSnapshot? = null
     @Volatile private var transitionSnapshotForLedger: DetectionSnapshot? = null
@@ -104,6 +104,7 @@ class ReelTrackerService : AccessibilityService() {
     private var hideJob: Job? = null
     private var watchdogJob: Job? = null
     private var overlaySyncJob: Job? = null
+    private var inconclusiveHideJob: Job? = null
     @Volatile private var strictEnforcementJob: Job? = null
     @Volatile private var strictModeRecheckJob: Job? = null
     private val strictEnforcementGate = com.reeltrak.app.services.tracking.StrictModeEnforcementGate()
@@ -117,6 +118,7 @@ class ReelTrackerService : AccessibilityService() {
     private var wasOverlayOpenLastFrame = false
 
     @Volatile private var lastEventProcessingTime = 0L
+    @Volatile private var isSystemOverlayActive = false
     private val EVENT_DEBOUNCE_MS = 50L
     private val analysisEventPolicy = AccessibilityAnalysisEventPolicy(EVENT_DEBOUNCE_MS)
     private var lastProcessedDateString: String? = null
@@ -187,8 +189,8 @@ class ReelTrackerService : AccessibilityService() {
         Log.d("STARTUP_DEBUG", "ReelTrackerService: onCreate() called")
 
         sessionManager = SessionManager(
-            onStateChanged = { oldState, newState, completedSession ->
-                handleSessionStateChange(oldState, newState, completedSession)
+            onStateChanged = { oldState, newState ->
+                handleSessionStateChange(oldState, newState)
             }
         )
     }
@@ -225,7 +227,6 @@ class ReelTrackerService : AccessibilityService() {
                     }
 
                     if (isDateChanged) {
-                         saveSessionToDb()
                          sessionManager.resetSessionCount()
                          // Preserve 10-entry deduplication history across midnight so the active reel
                          // watched across midnight is not spuriously double-counted on the new day.
@@ -322,6 +323,7 @@ class ReelTrackerService : AccessibilityService() {
         // One conflated consumer serializes every tree read and retains the newest pending state.
         val queue = processingQueue ?: LatestStateAnalysisQueue<TrackingAnalysisRequest>(
             scope = serviceScope,
+            retryDelayMs = 25L,
             onFailure = { failure ->
                 if (failure == null) {
                     Log.e("PipelineAudit", "Accessibility analysis retry exhausted")
@@ -332,8 +334,10 @@ class ReelTrackerService : AccessibilityService() {
             analyze = ::processLatestUIState
         ).also { processingQueue = it }
         queue.start()
+        val initialEventTime = android.os.SystemClock.elapsedRealtime()
+        analysisFreshnessGate.observeEvent(initialEventTime)
         queue.request(TrackingAnalysisRequest(
-            android.os.SystemClock.elapsedRealtime(),
+            initialEventTime,
             directionManager.snapshot()
         ))
 
@@ -349,11 +353,57 @@ class ReelTrackerService : AccessibilityService() {
         }
         if (event == null) return
 
-        // Capture direction immediately on every relevant event
-        directionManager.updateDirection(event)
+        val eventPkg = event.packageName?.toString()
+
+        // A system window can be a volume panel or another transient surface over a still-valid
+        // reel. Preserve the last confirmed reel state; package identity alone is not departure
+        // evidence. Do not drain pending/in-flight reel analysis.
+        val isSystemUi = eventPkg != null && isSystemOverlay(eventPkg)
+        val isWindowState = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        val isSystemOverlayEvent = isSystemUi && (isWindowState || isSystemOverlayActive)
+
+        if (isSystemOverlayEvent) {
+            isSystemOverlayActive = true
+            // Preserve only an already-confirmed reel session. System UI package/event identity
+            // is not departure evidence; screen/app/watchdog paths still invalidate stale state.
+            if (!TransientSystemUiVisibilityPolicy.shouldPreserveConfirmedReel(
+                    sessionManager.currentState,
+                    isScreenInteractiveAndUnlocked()
+                )) {
+                overlayStateManager.evaluateVisibility(
+                    isOnReels = false,
+                    isSystemOverlay = true,
+                    isScreenReady = isScreenInteractiveAndUnlocked()
+                )
+            }
+            return
+        }
+
+        val isSelf = isSelfApp(eventPkg)
+
+        if (eventPkg != null && sessionManager.isTrackedApp(eventPkg)) {
+            isSystemOverlayActive = false
+        } else if (eventPkg != null && !isSystemOverlay(eventPkg) && !isSelf) {
+            // A real foreground app event clears the system-window guard immediately.
+            // Self-overlay events from this app do not clear system-overlay state.
+            isSystemOverlayActive = false
+        }
+
+        // Internal overlay events (Compose layout passes, redraws, touches on the counter)
+        // must not alter feed scroll direction.
+        if (!isSelf) {
+            directionManager.updateDirection(event)
+        }
 
         val eventType = event.eventType
         if (!analysisEventPolicy.isRelevant(eventType)) return
+
+        // Internal overlay non-window-state events (e.g. content change, view focused)
+        // do not represent external feed mutations; ignore them to prevent feedback loops.
+        if (isSelf && eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            return
+        }
+
         val directionSnapshot = directionManager.snapshot()
 
         // Attachment retries are isolated from analysis. The manager catches and records its own
@@ -375,38 +425,57 @@ class ReelTrackerService : AccessibilityService() {
         }
 
         lastEventProcessingTime = now
+        analysisFreshnessGate.observeEvent(now)
 
         // Unconditionally update session app if it was a window state change
         // We do this immediately on the binder thread to prevent missing fast app switches
         if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val eventPkg = event.packageName?.toString()
-            val activePkg = analysisEventPolicy.resolveWindowStatePackage(
-                eventPackage = eventPkg,
-                isTrackedPackage = sessionManager::isTrackedApp,
-                rootProvider = { rootInActiveWindow },
-                packageFromRoot = { it.packageName?.toString() },
-                releaseRoot = { it.recycle() }
-            )
+            val activePkg = if (eventPkg != null && !isSystemOverlay(eventPkg) && !isSelf) {
+                // A non-system, non-self window-state event names the newly foreground app. It is stronger
+                // departure evidence than a possibly stale active-root result.
+                eventPkg
+            } else {
+                analysisEventPolicy.resolveWindowStatePackage(
+                    eventPackage = eventPkg,
+                    isTrackedPackage = sessionManager::isTrackedApp,
+                    isSelfPackage = ::isSelfApp,
+                    rootProvider = { rootInActiveWindow },
+                    packageFromRoot = { it.packageName?.toString() },
+                    releaseRoot = { it.recycle() }
+                )
+            }
 
             // IMMEDIATE VISIBILITY INTERRUPT:
             // If we are definitely NOT in a tracked app, hide the overlay immediately
             // on the Binder thread to ensure <100ms response.
-            if (!sessionManager.isTrackedApp(activePkg) && !isSystemOverlay(activePkg)) {
-                overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
+            if (activePkg != null && !sessionManager.isTrackedApp(activePkg)) {
+                overlayStateManager.evaluateVisibility(
+                    isOnReels = false,
+                    isSystemOverlay = false,
+                    isScreenReady = isScreenInteractiveAndUnlocked()
+                )
                 strictEnforcementGate.observe(null)
                 cancelStrictEnforcementCycle(resetGate = false)
+                processingQueue?.clearPending()
             }
 
-            serviceScope.launch {
-                pipelineMutex.withLock {
-                    Log.d("PipelineAudit", "updateCurrentApp: $activePkg")
-                    sessionManager.updateCurrentApp(activePkg)
-
-                    // Fail-safe: if the app is definitely not tracked, hide overlay immediately
-                    if (!sessionManager.isTrackedApp(activePkg)) {
-                        overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false)
+            if (activePkg != null) {
+                serviceScope.launch {
+                    pipelineMutex.withLock {
+                        Log.d("PipelineAudit", "updateCurrentApp: $activePkg")
+                        sessionManager.updateCurrentApp(activePkg)
                     }
                 }
+            }
+
+            if (activePkg != null && !sessionManager.isTrackedApp(activePkg)) {
+                return
+            }
+
+            // If the window state event originated from our own overlay, the active app has already
+            // been verified/updated above; skip queueing redundant analysis.
+            if (isSelf) {
+                return
             }
         }
 
@@ -417,11 +486,63 @@ class ReelTrackerService : AccessibilityService() {
         processingQueue?.request(TrackingAnalysisRequest(now, directionSnapshot))
     }
 
+    private fun isSelfApp(packageName: String?): Boolean {
+        if (packageName == null) return false
+        return packageName == this.packageName
+    }
+
     private fun isSystemOverlay(packageName: String?): Boolean {
-        return packageName == null ||
-               packageName == "com.android.systemui" ||
+        if (packageName == null) return false
+        return packageName == "com.android.systemui" ||
                packageName.contains("inputmethod", ignoreCase = true) ||
-               packageName == "android"
+               packageName == "android" ||
+               isMotorolaSystemOverlay(packageName)
+    }
+
+    private fun isMotorolaSystemOverlay(packageName: String): Boolean {
+        return packageName == "com.motorola.gamemode" ||
+               packageName == "com.motorola.actions" ||
+               packageName == "com.motorola.gesture" ||
+               packageName == "com.motorola.motocare" ||
+               packageName.startsWith("com.motorola.systemui")
+    }
+
+    private fun scheduleInconclusiveHide() {
+        if (inconclusiveHideJob?.isActive == true) return
+        val deadline = inconclusiveSnapshotGate.recoveryDeadlineMs ?: return
+        inconclusiveHideJob = serviceScope.launch {
+            val remaining = (deadline - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            delay(remaining)
+            pipelineMutex.withLock {
+                if (!inconclusiveSnapshotGate.hasPendingRecovery()) return@withLock
+                if (isSystemOverlayActive) return@withLock
+                if (!isScreenInteractiveAndUnlocked()) {
+                    inconclusiveSnapshotGate.reset()
+                    return@withLock
+                }
+
+                // Recheck foreground ownership at the deadline. Null/incomplete trees get this
+                // single bounded recovery window; a different confirmed app is handled immediately.
+                val root = try { rootInActiveWindow } catch (_: Exception) { null }
+                val foregroundPackage = try {
+                    root?.packageName?.toString()
+                } finally {
+                    try { root?.recycle() } catch (_: Exception) { }
+                }
+                if (foregroundPackage == null || sessionManager.isTrackedApp(foregroundPackage)) {
+                    inconclusiveSnapshotGate.reset()
+                    sessionManager.transitionTo(SessionState.IDLE)
+                } else if (!isSystemOverlay(foregroundPackage)) {
+                    inconclusiveSnapshotGate.reset()
+                    sessionManager.updateCurrentApp(foregroundPackage)
+                }
+            }
+        }
+    }
+
+    private fun clearInconclusiveHide() {
+        inconclusiveHideJob?.cancel()
+        inconclusiveHideJob = null
     }
 
     private suspend fun processLatestUIState(request: TrackingAnalysisRequest): Boolean {
@@ -432,7 +553,7 @@ class ReelTrackerService : AccessibilityService() {
 
             // Throttling: If this event arrived while we were already processing a more recent one,
             // we can safely skip it to maintain performance and avoid redundant BFS walks.
-            if (eventTime < lastEventProcessingTime) {
+            if (!analysisFreshnessGate.isCurrent(eventTime)) {
                 if (com.reeltrak.app.BuildConfig.DEBUG) {
                     Log.d("PipelineAudit", "Skipping stale event: $eventTime < $lastEventProcessingTime")
                 }
@@ -447,7 +568,11 @@ class ReelTrackerService : AccessibilityService() {
                 delay(40)
                 rootNode = try { rootInActiveWindow } catch (e: Exception) { null }
             }
-            if (rootNode == null) return false
+            if (rootNode == null) {
+                inconclusiveSnapshotGate.markInconclusive(eventTime)
+                scheduleInconclusiveHide()
+                return false
+            }
             val rootNodeIdentity = System.identityHashCode(rootNode)
             if (com.reeltrak.app.BuildConfig.DEBUG) {
                 Log.d("PipelineAudit", "5. rootNode acquired [id: $rootNodeIdentity] (retries: $retryCount)")
@@ -466,20 +591,33 @@ class ReelTrackerService : AccessibilityService() {
                     // Performing BFS analysis
                     val detectedSnapshot = detectorAnalysis.run { detector.analyze(rootNode) }
                         .copy(feedTransitionToken = request.direction.feedTransitionToken)
-                    // A missing reel anchor can be a transient accessibility-tree gap. Preserve the
-                    // current session/overlay and ask the conflated queue for one delayed fresh read.
-                    // A second inconclusive result for this trigger is treated as confirmed departure.
+                    // A repeated read of the same event is not independent departure evidence.
                     val snapshot = inconclusiveSnapshotGate.resolve(detectedSnapshot, eventTime)
-                        ?: return false
+                    if (snapshot == null) {
+                        scheduleInconclusiveHide()
+                        return false
+                    }
+                    clearInconclusiveHide()
                     Log.d("STARTUP_DEBUG", "ReelTrackerService: snapshot produced: platform=${snapshot.platform}, classification=${snapshot.classification}, isInternalOverlay=${snapshot.isInternalOverlay}")
 
                     pipelineMutex.withLock {
+                        if (isSystemOverlayActive) {
+                            return true
+                        }
+                        // Drop a result if a newer event arrived while its root/tree was being read.
+                        if (!analysisFreshnessGate.isCurrent(eventTime)) return true
+
                         // --- VISIBILITY HARDENING: Internal Overlay Logic ---
                         // Rule 1: We are "Active" if COMMITTED, PENDING, or an INTERNAL_OVERLAY (but only if already in a session).
-                        val isInternalOverlay = snapshot.isInternalOverlay &&
-                                               (sessionManager.currentState == SessionState.ACTIVE || sessionManager.currentState == SessionState.PAUSED)
+                        val isInternalOverlay = CounterSurfacePolicy.isPreservingReelOverlay(
+                            snapshot,
+                            sessionManager.currentState
+                        )
+                        val isCommentsOnlySurface = snapshot.isInternalOverlay &&
+                            snapshot.internalOverlayKind == InternalOverlayKind.REEL_COMMENTS
 
-                        val isActiveScreen = snapshot.isCommitted || snapshot.isPending || isInternalOverlay
+                        val isActiveScreen = !isCommentsOnlySurface &&
+                            (snapshot.isCommitted || snapshot.isPending || isInternalOverlay)
 
                         // 1. First record detection so SessionManager transitions to ACTIVE
                         if (snapshot.isCommitted || snapshot.isPending) {
@@ -487,6 +625,14 @@ class ReelTrackerService : AccessibilityService() {
                         } else if (isInternalOverlay) {
                             // Keep session alive but block counting
                             sessionManager.transitionTo(SessionState.PAUSED)
+                        } else if (isCommentsOnlySurface) {
+                            // Comments-only content is not a reel surface; pause the session while
+                            // hiding the counter. A fresh reel snapshot resumes the same session.
+                            if (sessionManager.currentState == SessionState.ACTIVE ||
+                                sessionManager.currentState == SessionState.ENTERING_REELS ||
+                                sessionManager.currentState == SessionState.PAUSED) {
+                                sessionManager.transitionTo(SessionState.PAUSED)
+                            }
                         } else if (snapshot.isDiscarded) {
                             // We are in Instagram/YouTube but NOT on a Reel or an Internal Overlay (e.g. Feed)
                             // Transition to IDLE to hide widget and end session.
@@ -536,9 +682,15 @@ class ReelTrackerService : AccessibilityService() {
                     }
                 } else {
                     inconclusiveSnapshotGate.reset()
+                    clearInconclusiveHide()
                     strictEnforcementGate.observe(null)
                     cancelStrictEnforcementCycle(resetGate = false)
                     pipelineMutex.withLock {
+                        if (!analysisFreshnessGate.isCurrent(eventTime)) return true
+                        if (isSystemOverlay(activePackage)) {
+                            isSystemOverlayActive = true
+                            return true
+                        }
                         // Not a supported app. Ensure session transitions to IDLE and overlay is hidden.
                         if (!isSystemOverlay(activePackage)) {
                             sessionManager.updateCurrentApp(activePackage)
@@ -811,7 +963,7 @@ class ReelTrackerService : AccessibilityService() {
         Log.d("PipelineAudit", "incrementProductionCount called. New reelsCount=${sessionManager.reelsCount}")
     }
 
-    private fun handleSessionStateChange(oldState: SessionState, newState: SessionState, completedSession: SessionData? = null) {
+    private fun handleSessionStateChange(oldState: SessionState, newState: SessionState) {
         Log.d("SessionDebug", "handleSessionStateChange: $oldState -> $newState")
         Log.d("STARTUP_DEBUG", "ReelTrackerService.handleSessionStateChange: $oldState -> $newState")
         overlayStateManager.updateState {
@@ -852,18 +1004,12 @@ class ReelTrackerService : AccessibilityService() {
                 hideJob?.cancel()
                 overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
 
-                if (completedSession != null) {
-                    saveSessionToDb(completedSession)
-                }
                 transitionLedger.clearActive()
             }
             SessionState.DESTROYED -> {
                 // Clear active focal reel reference while preserving 10-entry deduplication history
                 // in persistent storage across service recreation.
                 transitionLedger.clearActive()
-                if (completedSession != null) {
-                    saveSessionToDb(completedSession)
-                }
                 // Destroy synchronously to guarantee execution before serviceScope is cancelled
                 // (onDestroy runs on the companion thread)
                 try {
@@ -884,6 +1030,7 @@ class ReelTrackerService : AccessibilityService() {
         watchdogJob = serviceScope.launch {
             // Give the system a brief moment to settle before the first check
             delay(500)
+            var consecutiveNullWatchdogCount = 0
             while (isActive) {
                 try {
                     pipelineMutex.withLock {
@@ -895,12 +1042,22 @@ class ReelTrackerService : AccessibilityService() {
                             // Check if we are still in a tracked app or system overlay
                             val isTracked = sessionManager.isTrackedApp(activePackage)
                             val isSystemOverlay = isSystemOverlay(activePackage)
+                            val isSelfApp = activePackage == packageName
 
-                            if (!isTracked && !isSystemOverlay) {
-                                Log.w("ReelCounter-Debug", "[Watchdog] Inconsistency detected! Overlay is active but foreground app is $activePackage. Synchronizing state.")
-                                // Force state synchronization
-                                sessionManager.updateCurrentApp(activePackage)
-                                overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
+                            if (activePackage == null) {
+                                consecutiveNullWatchdogCount++
+                                if (consecutiveNullWatchdogCount >= 2) {
+                                    sessionManager.updateCurrentApp(null)
+                                    overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
+                                }
+                            } else {
+                                consecutiveNullWatchdogCount = 0
+                                if (!isTracked && !isSystemOverlay && !isSelfApp) {
+                                    Log.w("ReelCounter-Debug", "[Watchdog] Inconsistency detected! Overlay is active but foreground app is $activePackage. Synchronizing state.")
+                                    // Force state synchronization
+                                    sessionManager.updateCurrentApp(activePackage)
+                                    overlayStateManager.evaluateVisibility(isOnReels = false, isSystemOverlay = false, isScreenReady = isScreenInteractiveAndUnlocked())
+                                }
                             }
                         } finally {
                             rootNode?.recycle()
@@ -918,26 +1075,6 @@ class ReelTrackerService : AccessibilityService() {
     private fun stopWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = null
-    }
-
-    private fun saveSessionToDb(sessionToSave: SessionData) {
-        if (sessionToSave.reelsScrolled <= 0) return
-        CoroutineScope(Dispatchers.IO + NonCancellable).launch {
-            try {
-                val token = appAuthorizationManager.activeToken
-                dayManager.appendSession(sessionToSave, token)
-                Log.d("ReelTrakEngine", "Saved session to DB: $sessionToSave")
-            } catch (e: Exception) {
-                Log.e("ReelTrakEngine", "Error saving session to DB", e)
-            }
-        }
-    }
-
-    private fun saveSessionToDb() {
-        val snapshot = sessionManager.extractCurrentSessionSnapshot(resetCount = false)
-        if (snapshot != null) {
-            saveSessionToDb(snapshot)
-        }
     }
 
     override fun onDestroy() {

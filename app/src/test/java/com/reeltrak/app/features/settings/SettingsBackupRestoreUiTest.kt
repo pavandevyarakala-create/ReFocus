@@ -88,6 +88,22 @@ class SettingsBackupRestoreUiTest {
     }
 
     @Test
+    fun `Restore limit exceeded transitions to LimitExceeded state and blocks retry taps`() = runBlocking {
+        coordinator.isEntitled = true
+        coordinator.restoreResult = Result.failure(com.reeltrak.app.core.sync.RestoreLimitExceededException("You can restore your data once per day."))
+
+        coordinator.restoreBackup()
+
+        assertEquals(1, coordinator.restoreFromCloudCallCount)
+        assertTrue(coordinator.restoreUiState.value is RestoreUiState.LimitExceeded)
+        assertEquals("You can restore your data once per day.", (coordinator.restoreUiState.value as RestoreUiState.LimitExceeded).message)
+
+        // Subsequent tap while limit is exceeded must be ignored
+        coordinator.restoreBackup()
+        assertEquals("Call count must NOT increase when limit is exceeded", 1, coordinator.restoreFromCloudCallCount)
+    }
+
+    @Test
     fun `Duplicate restoreBackup tap while in progress is ignored`() = runBlocking {
         coordinator.isEntitled = true
         coordinator.simulateLongRunning = true
@@ -173,6 +189,9 @@ class SettingsBackupRestoreUiTest {
             if (restoreUiState.value is RestoreUiState.InProgress || restoreState.value == RestoreState.LOADING) {
                 return
             }
+            if (restoreUiState.value is RestoreUiState.LimitExceeded) {
+                return
+            }
             if (backupUiState.value is BackupUiState.InProgress) {
                 return
             }
@@ -186,9 +205,14 @@ class SettingsBackupRestoreUiTest {
                     restoreState.value = RestoreState.SUCCESS
                     restoreUiState.value = RestoreUiState.Success("Data restored successfully")
                 } else {
-                    restoreState.value = RestoreState.ERROR
                     val errorMsg = restoreResult.exceptionOrNull()?.message ?: "Restore failed. Tap to retry."
-                    restoreUiState.value = RestoreUiState.Error(errorMsg)
+                    if (errorMsg.contains("once per day", ignoreCase = true) || errorMsg.contains("once every 24 hours", ignoreCase = true)) {
+                        restoreState.value = RestoreState.IDLE
+                        restoreUiState.value = RestoreUiState.LimitExceeded(errorMsg)
+                    } else {
+                        restoreState.value = RestoreState.ERROR
+                        restoreUiState.value = RestoreUiState.Error(errorMsg)
+                    }
                 }
             }
         }

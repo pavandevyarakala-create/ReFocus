@@ -138,3 +138,51 @@ Execute the following test sequence against `https://refocus-razorpay-worker-sta
 8. **Razorpay Webhook Delivery:** Trigger `subscription.activated` from Razorpay Test Dashboard $\rightarrow$ Expect `200 OK`, `status: "processed"`.
 9. **Cancellation Flow:** `POST /api/cancel-subscription` $\rightarrow$ Expect `200 OK`, `cancelAtPeriodEnd: true`.
 10. **Account Deletion:** `POST /api/account/request-deletion` $\rightarrow$ Expect `200 OK`, `accountStatus: "PENDING_DELETION"`.
+
+---
+
+## 8. Firestore Deployment & Explicit Project Target Policy
+
+> [!CAUTION]
+> **MANDATORY `--project` FLAG ENFORCEMENT:**
+> Never invoke `firebase deploy` without an explicit `--project <PROJECT_ID>` argument. Running `firebase deploy` without `--project` targets the locally cached active project in `.firebaserc`, which creates a high risk of applying staging rules or indexes to production, or vice versa.
+
+### Firestore Rules & Composite Indexes Deployment
+Deploy rules and composite indexes to the dedicated staging Firebase project:
+```bash
+firebase deploy --only firestore:rules,firestore:indexes --project <STAGING_FIREBASE_PROJECT_ID>
+```
+To deploy to production:
+```bash
+firebase deploy --only firestore:rules,firestore:indexes --project refocus-504119
+```
+
+---
+
+## 9. Android Staging Build Variant & Fail-Safe Architecture
+
+The Android app provides isolated build variants:
+- **`prodDebug` / `prodRelease`**: Targets production package `com.reeltrak.app`, production Firebase (`refocus-504119`), and authoritative production Worker (`https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev`).
+- **`stagingDebug` / `stagingRelease`**: Targets package `com.reeltrak.app.staging`, dedicated staging Firebase, and isolated staging Worker.
+
+### Build-Time Fail-Fast Protection (`validateStagingEnvironment`)
+The Gradle build strictly halts with an error if:
+1. `app/src/staging/google-services.json` contains `PLACEHOLDER` or points to production project `refocus-504119`.
+2. Staging Worker base URL is blank, contains `PLACEHOLDER`, or points to production Worker.
+3. Staging configuration attempts to fall back silently to production resources.
+
+### Runtime Isolation Enforcement (`NetworkConstants.resolveWorkerBaseUrl`)
+If an APK is assembled with mismatched parameters:
+- `prod` variant will throw `IllegalStateException` immediately on launch if configured with anything other than the canonical production Worker URL.
+- `staging` variant will throw `IllegalStateException` immediately on launch if configured with the production Worker URL or unresolved placeholders.
+
+### App Check Configuration in Staging
+- **Staging Debug (`stagingDebug`)**: Uses `DebugAppCheckProviderFactory`. On launch, the debug secret is output to Logcat (`FirebaseAppCheck: Enter this debug secret into the Firebase Console...`). Register this secret in Firebase Console -> App Check -> Apps -> Debug tokens for the staging Firebase project.
+- **Staging Release (`stagingRelease`)**: Uses `PlayIntegrityAppCheckProviderFactory`. Register the staging release keystore SHA-256 fingerprint in the staging Google Cloud Console / Firebase Console under Play Integrity.
+
+### Controlled Configuration Review (2026-10-29)
+- Repository configuration separates the production and staging Worker names, Firebase project IDs/numbers, Android Firebase projects/packages, and staging cron schedule.
+- `RAZORPAY_PLAN_ID` is currently identical in the production and staging Wrangler variables. The repository cannot establish whether the staging value is a Razorpay Test Mode plan or whether deployed Worker secrets are correctly paired with it.
+- Before treating staging payments as isolated, verify the staging plan in Razorpay Test Mode, verify staging Worker secrets use test credentials, and confirm the deployed Cloudflare environment variables match this file. Do not substitute a guessed plan ID.
+- `.firebaserc` selects production by default. Firebase staging rules/index deployments must continue to use an explicit staging `--project` value as documented above.
+

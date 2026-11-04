@@ -35,6 +35,7 @@ sealed class RestoreUiState {
     object Idle : RestoreUiState()
     object InProgress : RestoreUiState()
     data class Success(val message: String = "Data restored successfully") : RestoreUiState()
+    data class LimitExceeded(val message: String = "You can restore your data once per day.") : RestoreUiState()
     data class Error(val message: String = "Restore failed. Tap to retry.") : RestoreUiState()
 }
 
@@ -69,7 +70,8 @@ class SettingsViewModel @Inject constructor(
     val accountAccessInfo: StateFlow<AccountAccessInfo> = accountRepository.accountAccessInfo
         .stateIn(viewModelScope, SharingStarted.Eagerly, AccountAccessInfo.LOADING)
 
-    val accountStatus: StateFlow<AccountStatus> = accountRepository.accountStatus
+    val accountStatus: StateFlow<AccountStatus> = accountAccessInfo
+        .map { it.accountStatus }
         .stateIn(viewModelScope, SharingStarted.Eagerly, AccountStatus.ACTIVE)
 
 
@@ -190,6 +192,42 @@ class SettingsViewModel @Inject constructor(
     private val _restoreUiState = MutableStateFlow<RestoreUiState>(RestoreUiState.Idle)
     val restoreUiState: StateFlow<RestoreUiState> = _restoreUiState.asStateFlow()
 
+    val firstLaunchRecoveryState = syncManager.firstLaunchRecoveryState
+
+    init {
+        viewModelScope.launch {
+            syncManager.cloudBackupStatusFlow.collect { }
+        }
+        viewModelScope.launch {
+            syncManager.isRestoreRestricted.collect { restricted ->
+                if (restricted && _restoreUiState.value is RestoreUiState.Idle) {
+                    _restoreUiState.value = RestoreUiState.LimitExceeded("You can restore your data once per day.")
+                }
+            }
+        }
+        viewModelScope.launch {
+            syncManager.firstLaunchRecoveryState.collect { state ->
+                when (state) {
+                    is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.Restoring -> {
+                        _restoreState.value = RestoreState.LOADING
+                        _restoreUiState.value = RestoreUiState.InProgress
+                    }
+                    is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.RestoreFailed -> {
+                        _restoreState.value = RestoreState.ERROR
+                        _restoreUiState.value = RestoreUiState.Error("Remote backup found. Restore failed: ${state.message}. Tap to retry.")
+                    }
+                    is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.Completed -> {
+                        if (_restoreState.value == RestoreState.LOADING) {
+                            _restoreState.value = RestoreState.SUCCESS
+                            _restoreUiState.value = RestoreUiState.Success("Data restored successfully")
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        }
+    }
+
     fun setStrictMode(enabled: Boolean) {
         if (!subscriptionManager.hasActiveEntitlementNow()) return
         dayManager.setStrictMode(enabled)
@@ -266,8 +304,31 @@ class SettingsViewModel @Inject constructor(
         if (_isRefreshingSubscription.value) return
         viewModelScope.launch {
             _isRefreshingSubscription.value = true
-            subscriptionManager.refreshSubscription()
+            subscriptionManager.restoreSubscription()
             _isRefreshingSubscription.value = false
+        }
+    }
+
+    fun restorePurchases(onComplete: (Boolean, String?) -> Unit = { _, _ -> }) {
+        if (appAuthorizationManager.getOperationalMode() == OperationalMode.UNAUTHENTICATED_FREE) {
+            onComplete(false, "Please sign in to restore purchases.")
+            return
+        }
+        if (_isRefreshingSubscription.value) return
+        viewModelScope.launch {
+            _isRefreshingSubscription.value = true
+            val result = subscriptionManager.restoreSubscription()
+            _isRefreshingSubscription.value = false
+            result.fold(
+                onSuccess = { info ->
+                    val isRestored = info.isUnlocked
+                    val msg = if (isRestored) "Purchases restored successfully." else "No active subscription found to restore."
+                    onComplete(isRestored, msg)
+                },
+                onFailure = { error ->
+                    onComplete(false, error.message ?: "Failed to restore purchases.")
+                }
+            )
         }
     }
 
@@ -329,6 +390,10 @@ class SettingsViewModel @Inject constructor(
             android.util.Log.d("Restore", "performBackup currently in progress, ignoring restore")
             return
         }
+        if (_restoreUiState.value is RestoreUiState.LimitExceeded) {
+            android.util.Log.d("Restore", "restoreBackup rejected: Daily restore limit reached.")
+            return
+        }
         viewModelScope.launch {
             _restoreState.value = RestoreState.LOADING
             _restoreUiState.value = RestoreUiState.InProgress
@@ -338,20 +403,32 @@ class SettingsViewModel @Inject constructor(
                 _restoreUiState.value = RestoreUiState.Success("Data restored successfully")
                 kotlinx.coroutines.delay(3500)
                 if (_restoreUiState.value is RestoreUiState.Success) {
-                    _restoreUiState.value = RestoreUiState.Idle
+                    _restoreUiState.value = RestoreUiState.LimitExceeded("You can restore your data once per day.")
                     _restoreState.value = RestoreState.IDLE
                 }
             } else {
-                _restoreState.value = RestoreState.ERROR
-                val errorMsg = result.exceptionOrNull()?.message ?: "Restore failed. Tap to retry."
-                _restoreUiState.value = RestoreUiState.Error(errorMsg)
+                val exception = result.exceptionOrNull()
+                val errorMsg = exception?.message ?: "Restore failed. Tap to retry."
+                if (exception is com.reeltrak.app.core.sync.RestoreLimitExceededException ||
+                    errorMsg.contains("once every 24 hours", ignoreCase = true) ||
+                    errorMsg.contains("once per day", ignoreCase = true) ||
+                    errorMsg.contains("restore attempt limit", ignoreCase = true) ||
+                    errorMsg.contains("RESTORE_LIMIT_EXCEEDED", ignoreCase = true)) {
+                    _restoreState.value = RestoreState.IDLE
+                    _restoreUiState.value = RestoreUiState.LimitExceeded(errorMsg)
+                } else {
+                    _restoreState.value = RestoreState.ERROR
+                    _restoreUiState.value = RestoreUiState.Error(errorMsg)
+                }
             }
         }
     }
 
     fun resetRestoreState() {
-        _restoreState.value = RestoreState.IDLE
-        _restoreUiState.value = RestoreUiState.Idle
+        if (_restoreUiState.value !is RestoreUiState.LimitExceeded) {
+            _restoreState.value = RestoreState.IDLE
+            _restoreUiState.value = RestoreUiState.Idle
+        }
     }
 
     val hasActiveEntitlement: StateFlow<Boolean> = subscriptionManager.hasActiveEntitlement
@@ -373,6 +450,15 @@ class SettingsViewModel @Inject constructor(
         }
         if (_restoreUiState.value is RestoreUiState.InProgress || _restoreState.value == RestoreState.LOADING) {
             android.util.Log.d("Backup", "restoreBackup currently in progress, ignoring backup")
+            return
+        }
+        val recoveryState = syncManager.firstLaunchRecoveryState.value
+        if (recoveryState is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.Evaluating ||
+            recoveryState is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.Restoring ||
+            recoveryState is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.RemoteBackupFound ||
+            recoveryState is com.reeltrak.app.core.sync.FirstLaunchRecoveryState.RestoreFailed) {
+            android.util.Log.w("Backup", "performBackup rejected: Remote data restore is pending or failed.")
+            _backupUiState.value = BackupUiState.Error("Remote data restore is pending. Please restore your remote data first.")
             return
         }
         if (isBackupRestricted.value || isBackedUpToday.value) {

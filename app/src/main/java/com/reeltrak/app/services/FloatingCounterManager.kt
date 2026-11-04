@@ -228,7 +228,7 @@ class FloatingCounterManager(
     fun attach() {
         Log.d("OverlayDebug", "[FloatingCounterManager] attach() called.")
         if (isDestroyed || attachRequestPending || attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHING) return
-        if (attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHED && composeView?.isAttachedToWindow == true) return
+        if (attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHED && composeView != null) return
 
         attachRequestPending = true
         val attachRunnable = Runnable {
@@ -239,7 +239,7 @@ class FloatingCounterManager(
             if (isDestroyed) return@Runnable
             try {
                 if (attachmentPolicy.state == OverlayAttachmentRetryPolicy.State.ATTACHED) {
-                    if (composeView?.isAttachedToWindow == true) return@Runnable
+                    if (composeView != null) return@Runnable
                     releaseViewAfterFailedAttachment()
                     attachmentPolicy.windowDetached()
                 }
@@ -250,6 +250,14 @@ class FloatingCounterManager(
                     setViewTreeLifecycleOwner(this@FloatingCounterManager)
                     setViewTreeSavedStateRegistryOwner(this@FloatingCounterManager)
                     setViewTreeViewModelStoreOwner(this@FloatingCounterManager)
+                    addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                        override fun onViewAttachedToWindow(v: View) {}
+                        override fun onViewDetachedFromWindow(v: View) {
+                            synchronized(this@FloatingCounterManager) {
+                                attachmentPolicy.windowDetached()
+                            }
+                        }
+                    })
                     
                     setContent {
                         val state by stateFlow.collectAsState()

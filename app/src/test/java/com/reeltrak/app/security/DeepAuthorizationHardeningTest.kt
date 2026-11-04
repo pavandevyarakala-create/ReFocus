@@ -592,7 +592,7 @@ class DeepAuthorizationHardeningTest {
         var lastNewState: SessionState? = null
 
         val sessionManager = SessionManager(
-            onStateChanged = { old, new, _ ->
+            onStateChanged = { old, new ->
                 lastOldState = old
                 lastNewState = new
             }

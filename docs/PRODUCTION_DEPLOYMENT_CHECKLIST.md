@@ -17,9 +17,11 @@ To take Re:Focus from repository code to public production on Google Play and li
 
 ## PHASE A — BACKEND CONFIGURATION (CLOUDFLARE WORKER)
 
+Before producing the production Android App Bundle, validate local signing configuration with `./gradlew :app:requireProdReleaseSigning`. The `bundleProdRelease` task also depends on this gate and fails if any required signing value or the keystore file is missing. Do not pass signing values on the command line where shell history or logs could retain them.
+
 ### 1. Worker Identity & Endpoints
 - **Worker Project Name:** `refocus-razorpay-worker` (Defined in [`worker/wrangler.jsonc`](file:///c:/Users/pavan/OneDrive/Documents/REEL/worker/wrangler.jsonc))
-- **Production URL:** `https://refocus-api.pavan-yarakala.workers.dev` (Configured in client [`NetworkConstants.kt`](file:///c:/Users/pavan/OneDrive/Documents/REEL/app/src/main/java/com/reeltrak/app/core/network/NetworkConstants.kt))
+- **Production URL:** `https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev` (Configured in client [`NetworkConstants.kt`](file:///c:/Users/pavan/OneDrive/Documents/REEL/app/src/main/java/com/reeltrak/app/core/network/NetworkConstants.kt))
 
 ### 2. Environment Variables vs Secrets Classification
 
@@ -103,7 +105,7 @@ npx wrangler deploy
 
 ### 3. Webhook Setup
 - [ ] In Razorpay Dashboard $\to$ **Settings** $\to$ **Webhooks** $\to$ **Add New Webhook**:
-  - **Webhook URL:** `https://refocus-api.pavan-yarakala.workers.dev/api/razorpay-webhook`
+  - **Webhook URL:** `https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev/api/razorpay-webhook`
   - **Secret:** Enter a strong random alphanumeric string (and set the exact same value in `wrangler secret put RAZORPAY_WEBHOOK_SECRET`).
   - **Alert Email:** Your operational alerting email.
   - **Active Events to Subscribe:**
@@ -231,7 +233,7 @@ Before promoting the release build to 100% Production Rollout on Google Play, ev
 
 ```
 [ ] 1. Cloudflare Worker production secrets uploaded (RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET, FIREBASE_SERVICE_ACCOUNT_KEY).
-[ ] 2. Worker deployed via `wrangler deploy` and responding healthy at `https://refocus-api.pavan-yarakala.workers.dev/health`.
+[ ] 2. Worker deployed via `wrangler deploy` and responding healthy at `https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev/health`.
 [ ] 3. Razorpay Live webhook URL and active event subscriptions configured.
 [ ] 4. Legal static pages (`privacy.html` & `terms.html`) deployed to Firebase Hosting and resolving publicly.
 [ ] 5. Firebase App Check registered with Play Integrity provider for project `refocus-504119`.

@@ -1,7 +1,6 @@
 package com.reeltrak.app.services.tracking
 
 import android.util.Log
-import com.reeltrak.app.data.local.entity.SessionData
 import com.reeltrak.app.data.security.authorization.AuthorizationToken
 
 enum class SessionState {
@@ -17,7 +16,7 @@ enum class SessionState {
  * Finite State Machine managing the Reel session lifecycle.
  */
 class SessionManager(
-    private val onStateChanged: (SessionState, SessionState, SessionData?) -> Unit,
+    private val onStateChanged: (SessionState, SessionState) -> Unit,
     private val timeProvider: () -> Long = { System.currentTimeMillis() }
 ) {
 
@@ -36,10 +35,6 @@ class SessionManager(
         private set
         
     @Volatile
-    var lastSuccessfulDetection: Long = 0L
-        private set
-        
-    @Volatile
     var reelsCount: Int = 0
         private set
 
@@ -47,63 +42,30 @@ class SessionManager(
     var activeAuthorizationToken: AuthorizationToken? = null
         private set
         
-    val sessionDurationMs: Long
-        get() = synchronized(lock) {
-            if (currentState != SessionState.IDLE && sessionStartTime > 0) {
-                timeProvider() - sessionStartTime
-            } else 0L
-        }
-
-    fun transitionTo(newState: SessionState): SessionData? {
+    fun transitionTo(newState: SessionState) {
         synchronized(lock) {
-            if (currentState == newState) return null
+            if (currentState == newState) return
             
             Log.d("SessionDebug", "[Session] Transition: $currentState -> $newState")
             val oldState = currentState
             val now = timeProvider()
-
-            // Capture completed session snapshot BEFORE in-memory state is cleared
-            val completedSession = if ((oldState == SessionState.ACTIVE || 
-                                        oldState == SessionState.ENTERING_REELS || 
-                                        oldState == SessionState.PAUSED ||
-                                        oldState == SessionState.EXITING) &&
-                                       (newState == SessionState.IDLE || newState == SessionState.DESTROYED)) {
-                val app = currentApp
-                val count = reelsCount
-                val startTime = sessionStartTime
-                if (app != null && count > 0 && startTime > 0) {
-                    SessionData(
-                        appName = app,
-                        startTimeStamp = startTime,
-                        endTimeStamp = maxOf(startTime, now),
-                        reelsScrolled = count
-                    )
-                } else {
-                    null
-                }
-            } else {
-                null
-            }
 
             currentState = newState
             
             when (newState) {
                 SessionState.ENTERING_REELS -> {
                     sessionStartTime = now
-                    lastSuccessfulDetection = now
                     reelsCount = 0
                 }
                 SessionState.IDLE, SessionState.DESTROYED -> {
                     currentApp = null
                     reelsCount = 0
                     sessionStartTime = 0L
-                    lastSuccessfulDetection = 0L
                 }
                 else -> {}
             }
             
-            onStateChanged(oldState, newState, completedSession)
-            return completedSession
+            onStateChanged(oldState, newState)
         }
     }
 
@@ -150,7 +112,6 @@ class SessionManager(
     fun recordSuccessfulDetection() {
         synchronized(lock) {
             val now = timeProvider()
-            lastSuccessfulDetection = now
             if (currentState == SessionState.ENTERING_REELS) {
                 transitionTo(SessionState.ACTIVE)
             } else if (currentState == SessionState.IDLE) {
@@ -189,33 +150,6 @@ class SessionManager(
             Log.d("SessionDebug", "[Session] Daily Reset: reelsCount reset to 0")
             reelsCount = 0
             sessionStartTime = timeProvider()
-        }
-    }
-
-    /**
-     * Extracts an immutable snapshot of the current active session.
-     * Optionally resets the session counter and start time (used at midnight date rollover).
-     */
-    fun extractCurrentSessionSnapshot(resetCount: Boolean = false): SessionData? {
-        synchronized(lock) {
-            val app = currentApp
-            val count = reelsCount
-            val startTime = sessionStartTime
-            val now = timeProvider()
-            if (app != null && count > 0 && startTime > 0) {
-                val snapshot = SessionData(
-                    appName = app,
-                    startTimeStamp = startTime,
-                    endTimeStamp = maxOf(startTime, now),
-                    reelsScrolled = count
-                )
-                if (resetCount) {
-                    reelsCount = 0
-                    sessionStartTime = now
-                }
-                return snapshot
-            }
-            return null
         }
     }
 

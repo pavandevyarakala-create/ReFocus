@@ -11,7 +11,6 @@ import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Security
-import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Widgets
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,7 +23,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.reeltrak.app.core.auth.UserAuthData
-import com.reeltrak.app.core.ui.components.DailyLimitEntitlementDialog
 import com.reeltrak.app.core.ui.components.ReFocusTopBar
 import com.reeltrak.app.data.security.authorization.OperationalMode
 import com.reeltrak.app.core.ui.theme.ReFocusBrandTheme
@@ -70,12 +68,6 @@ fun SettingsScreen(
     val restoreUiState by viewModel.restoreUiState.collectAsStateWithLifecycle()
     var showRestoreConfirmationDialog by remember { mutableStateOf(false) }
 
-    val defaultDailyLimit by viewModel.defaultDailyLimit.collectAsStateWithLifecycle()
-    val isDailyLimitEntitled by viewModel.isDailyLimitEntitled.collectAsStateWithLifecycle()
-    val operationalMode by viewModel.operationalMode.collectAsStateWithLifecycle()
-    val showDailyLimitDialog by viewModel.showDailyLimitDialog.collectAsStateWithLifecycle()
-    val showDailyLimitEntitlementDialog by viewModel.showDailyLimitEntitlementDialog.collectAsStateWithLifecycle()
-
     var showDeleteAccountDialog by remember { mutableStateOf(false) }
     val isDeletingAccount by viewModel.isDeletingAccount.collectAsStateWithLifecycle()
 
@@ -104,33 +96,6 @@ fun SettingsScreen(
             onConfirmRestore = {
                 showRestoreConfirmationDialog = false
                 viewModel.restoreBackup()
-            }
-        )
-    }
-
-    if (showDailyLimitDialog) {
-        DailyLimitSelectionDialog(
-            initialLimit = if (defaultDailyLimit > 0) defaultDailyLimit else 50,
-            onDismiss = { viewModel.dismissDailyLimitDialog() },
-            onSaveLimit = { newLimit ->
-                viewModel.dismissDailyLimitDialog()
-                viewModel.saveDailyLimit(newLimit)
-            }
-        )
-    }
-
-    showDailyLimitEntitlementDialog?.let { mode ->
-        val isUnauthenticated = mode == OperationalMode.UNAUTHENTICATED_FREE
-        DailyLimitEntitlementDialog(
-            isUnauthenticated = isUnauthenticated,
-            onDismiss = { viewModel.dismissDailyLimitEntitlementDialog() },
-            onPrimaryAction = {
-                viewModel.dismissDailyLimitEntitlementDialog()
-                if (isUnauthenticated) {
-                    onNavigateToLoginForUpgrade()
-                } else {
-                    viewModel.openSubscriptionPaywall()
-                }
             }
         )
     }
@@ -221,39 +186,6 @@ fun SettingsScreen(
                 SettingsSectionHeader(title = "PREFERENCES")
                 Spacer(modifier = Modifier.height(6.dp))
                 SettingsGroupContainer {
-                    // Daily Reel Limit Setting Row
-                    SettingsItemRow(
-                        title = "Daily Reel Limit",
-                        subtitle = if (isDailyLimitEntitled) {
-                            if (defaultDailyLimit > 0) "Daily threshold: $defaultDailyLimit reels" else "Set maximum daily reels threshold"
-                        } else {
-                            "Trial & Premium feature • Limit daily usage"
-                        },
-                        icon = Icons.Outlined.Timer,
-                        trailing = {
-                            if (isDailyLimitEntitled && defaultDailyLimit > 0) {
-                                Text(
-                                    text = "$defaultDailyLimit",
-                                    style = MaterialTheme.typography.titleMedium.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = colors.inkPrimary
-                                    )
-                                )
-                            } else if (!isDailyLimitEntitled) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Lock,
-                                    contentDescription = "Premium Only",
-                                    tint = colors.inkMuted,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                            }
-                        },
-                        onClick = {
-                            viewModel.onDailyLimitSettingClicked()
-                        },
-                        showDivider = true
-                    )
-
                     // Dedicated In-Line Counter Appearance Control: [ Light ] [ Dark ]
                     AppearanceSettingControl(
                         title = "Counter Appearance",

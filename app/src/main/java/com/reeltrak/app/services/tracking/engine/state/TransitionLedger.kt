@@ -181,8 +181,8 @@ class TransitionLedger(
 
     constructor(
         onIncrement: () -> Unit,
-        onHistoricalMatch: (() -> Unit)?,
-        historyStore: HistoryStore?,
+        onHistoricalMatch: (() -> Unit)? = null,
+        historyStore: HistoryStore? = null,
         transitionAcceptance: () -> TransitionAcceptance,
         onTransitionCommitted: ((TransitionAcceptance) -> Unit)? = null
     ) : this(onIncrement) {
@@ -317,6 +317,11 @@ class TransitionLedger(
 
                 // Do not mutate the ledger until production has accepted the increment.
                 val acceptance = acceptCandidateTransition() ?: return false
+                if (acceptance == TransitionAcceptance.SUPPRESSED) {
+                    Log.d("V3_Engine", "  SUPPRESSED: Transition suppressed without mutating active focal fingerprint -> $incoming")
+                    notifyTransitionCommitted(acceptance)
+                    return true
+                }
 
                 // Confidently identified new initial reel
                 Log.d("V3_Engine", "  ACCEPTED: Initial Reel Established -> $incoming")
@@ -337,6 +342,11 @@ class TransitionLedger(
 
                 if (isConfirmedForwardTransition) {
                     val acceptance = acceptCandidateTransition() ?: return false
+                    if (acceptance == TransitionAcceptance.SUPPRESSED) {
+                        Log.d("V3_Engine", "  SUPPRESSED: Transition suppressed without mutating active focal fingerprint -> $incoming")
+                        notifyTransitionCommitted(acceptance)
+                        return true
+                    }
                     Log.d("V3_Engine", "  ACCEPTED: Confirmed feed transition for metadata-free reel (token=${snapshot.feedTransitionToken})")
                     lastConsumedFeedTransitionToken = snapshot.feedTransitionToken
                     activeFingerprint = incoming
@@ -386,6 +396,11 @@ class TransitionLedger(
             // Acceptance runs before any ledger mutation. A rejected or throwing callback leaves
             // the same snapshot eligible for a later explicit analysis after its gate changes.
             val acceptance = acceptCandidateTransition() ?: return false
+            if (acceptance == TransitionAcceptance.SUPPRESSED) {
+                Log.d("V3_Engine", "  SUPPRESSED: Transition suppressed without mutating active focal fingerprint -> $incoming")
+                notifyTransitionCommitted(acceptance)
+                return true
+            }
 
             // Instantly transfer focal ownership and record into bounded rolling history
             lastConsumedFeedTransitionToken = maxOf(lastConsumedFeedTransitionToken, snapshot.feedTransitionToken)

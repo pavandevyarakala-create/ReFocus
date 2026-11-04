@@ -75,10 +75,10 @@ fun HeroProgressCard(
 
     val subtitleText = when {
         !isEntitled -> "Premium feature"
-        isLimitLocked -> "Locked until tomorrow"
+        isLimitLocked -> "Locked until tomorrow • 1 change used"
         isInvalid -> "Enter 0 to 10,000 reels"
         isNotSet -> "Limit not set for today"
-        else -> "Active daily goal"
+        else -> "Active daily goal • Editable once today"
     }
 
     val subtitleColor = when {
@@ -237,7 +237,7 @@ fun HeroProgressCard(
                                 .background(inputBgColor)
                                 .border(inputBorder, inputShape)
                                 .then(
-                                    if (!isEntitled) {
+                                    if (!isEntitled || isLimitLocked) {
                                         Modifier.clickable { onDailyLimitLockedClick() }
                                     } else Modifier
                                 )
@@ -363,6 +363,7 @@ fun HeroProgressCard(
                                         .clip(saveButtonShape)
                                         .background(savedBg)
                                         .border(savedBorder, saveButtonShape)
+                                        .clickable { onDailyLimitLockedClick() }
                                         .padding(horizontal = 12.dp),
                                     contentAlignment = Alignment.Center
                                 ) {

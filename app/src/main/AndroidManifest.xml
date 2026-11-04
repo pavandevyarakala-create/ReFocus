@@ -18,10 +18,6 @@
         android:networkSecurityConfig="@xml/network_security_config"
         tools:ignore="RemoveWorkManagerInitializer">
 
-        <!-- Google Mobile Ads (AdMob) App ID -->
-        <meta-data
-            android:name="com.google.android.gms.ads.APPLICATION_ID"
-            android:value="ca-app-pub-5284347714670334~9887795933" />
 
         <!-- Disable default WorkManager initializer for custom Configuration.Provider (Hilt) -->
         <provider

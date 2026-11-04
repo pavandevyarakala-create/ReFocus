@@ -112,24 +112,25 @@ class LoginViewModel @Inject constructor(
         }
     }
 
-    private suspend fun performSecureTeardown(todayStr: String) {
+    private suspend fun performSecureTeardown(@Suppress("UNUSED_PARAMETER") todayStr: String) {
         cancelPendingSyncWork()
         subscriptionManager.getAppAuthorizationManager()?.revokeAuthorization(
             com.reeltrak.app.data.security.authorization.AuthorizationLockReason.NO_AUTHENTICATED_ACCOUNT
         )
-        database.dailyReelDataDao.clearHistoricalDataExcept(todayStr)
-        val today = database.dailyReelDataDao.getDailyDataSync(todayStr)
-        if (today != null) {
-            database.dailyReelDataDao.insertOrReplace(
-                today.copy(
-                    dailyGoal = -1,
-                    isLimitLocked = false,
-                    isStrictModeOn = false,
-                    isStrictModeLocked = false
-                )
-            )
-        }
+        dayManager.switchAccountScope(null)
         preferencesRepository.clearAllPreferences()
+        dayManager.resetAccountSession()
+        _pendingSubscriptionAfterLogin.value = false
+        googleAuthManager.signOut()
+    }
+
+    private suspend fun performGhostSessionCleanup() {
+        cancelPendingSyncWork()
+        subscriptionManager.getAppAuthorizationManager()?.revokeAuthorization(
+            com.reeltrak.app.data.security.authorization.AuthorizationLockReason.NO_AUTHENTICATED_ACCOUNT
+        )
+        dayManager.switchAccountScope(null)
+        preferencesRepository.clearAuthSession()
         dayManager.resetAccountSession()
         _pendingSubscriptionAfterLogin.value = false
         googleAuthManager.signOut()
@@ -159,13 +160,17 @@ class LoginViewModel @Inject constructor(
 
                     var firebaseUser = Firebase.auth.currentUser
                     if (firebaseUser == null) {
-                        // Allow brief moment for Firebase Auth local cache restoration if needed
-                        delay(100)
-                        firebaseUser = Firebase.auth.currentUser
+                        // Allow grace period for asynchronous Firebase Auth token cache restoration on cold start
+                        val startWait = android.os.SystemClock.elapsedRealtime()
+                        while (firebaseUser == null && android.os.SystemClock.elapsedRealtime() - startWait < 1500L) {
+                            delay(150)
+                            firebaseUser = Firebase.auth.currentUser
+                        }
                     }
 
                     Log.d("SUB_DEBUG_AUTH", "Session restoration check: email=${userData.email}, Firebase UID=${firebaseUser?.uid}")
                     if (firebaseUser != null) {
+                        dayManager.switchAccountScope(firebaseUser.uid)
                         val accessInfoResult = accountRepository.checkAccountAccessInfo(firebaseUser.uid)
                         val accessInfo = accessInfoResult.getOrDefault(com.reeltrak.app.domain.models.AccountAccessInfo.DEFAULT)
                         when (accessInfo.accountStatus) {
@@ -210,11 +215,10 @@ class LoginViewModel @Inject constructor(
                         }
                     } else {
                         // Ghost session: local data exists but Firebase is signed out.
-                        Log.w("AuthCrashDebug", "Ghost session detected. Firebase is not authenticated.")
+                        Log.w("AuthCrashDebug", "Ghost session detected. Firebase is not authenticated. Preserving local preferences.")
                         applicationScope.launch(ioDispatcher) {
                             withContext(NonCancellable) {
-                                val todayStr = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
-                                performSecureTeardown(todayStr)
+                                performGhostSessionCleanup()
                             }
                         }
                         if (isFree) {
@@ -267,8 +271,13 @@ class LoginViewModel @Inject constructor(
             Log.i("RESTORE_TRACE", "cloud_sync_allowed=$isEntitled")
 
             if (isEntitled) {
-                // Strict manual-only policy: No automatic cloud migration or restore upon sign-in.
-                // Local data remains strictly local until the user explicitly requests Back Up Data or Restore Data.
+                // Safe first-launch recovery: evaluate remote server backup before allowing manual backup or destructive sync
+                try {
+                    syncManager.evaluateAndRecoverFreshInstall()
+                } catch (e: Exception) {
+                    Log.w("LoginViewModel", "Safe first-launch recovery check encountered an error: ${e.message}", e)
+                }
+
                 val tSyncStart = android.os.SystemClock.elapsedRealtime()
                 val restoredGoal = preferencesRepository.defaultDailyLimit.first()
                 if (restoredGoal > 0) {
@@ -313,11 +322,16 @@ class LoginViewModel @Inject constructor(
                         Log.d("AUTH_PERF", "[AUTH_PERF] Google + Firebase Auth succeeded in ${tAuth - t0}ms")
                         val firebaseUid = Firebase.auth.currentUser?.uid
                         if (firebaseUid != null) {
+                            dayManager.switchAccountScope(firebaseUid)
                             val tAccountStart = android.os.SystemClock.elapsedRealtime()
                             val accessInfoResult = accountRepository.checkAccountAccessInfo(firebaseUid)
                             val tAccountDone = android.os.SystemClock.elapsedRealtime()
                             if (accessInfoResult.isFailure) {
-                                Log.e("MasterAccess", "Google login rejected: Failed to verify account access info for $firebaseUid", accessInfoResult.exceptionOrNull())
+                                val err = accessInfoResult.exceptionOrNull()
+                                val sanitizedUid = if (firebaseUid.length > 6) "${firebaseUid.take(3)}...${firebaseUid.takeLast(3)}" else "***"
+                                val errClass = err?.javaClass?.simpleName ?: "Unknown"
+                                val errCode = (err as? com.google.firebase.firestore.FirebaseFirestoreException)?.code?.name ?: "N/A"
+                                Log.e("MasterAccess", "Google login rejected: Stage 5 AccountAccessInfo check failed for uid=$sanitizedUid: type=$errClass, code=$errCode, message=${err?.message}", err)
                                 Log.d("AUTH_PERF", "[AUTH_PERF] Stage 5 (Account/profile data resolution): FAILED after ${tAccountDone - tAccountStart}ms (fail-closed)")
                                 _uiState.value = LoginState.Error("Unable to verify account access. Please check your internet connection and try again.")
                                 return@fold
@@ -452,6 +466,7 @@ class LoginViewModel @Inject constructor(
 
                 if (firebaseUser != null) {
                     val uid = firebaseUser.uid
+                    dayManager.switchAccountScope(uid)
                     val tAccessStart = android.os.SystemClock.elapsedRealtime()
                     val accessInfoResult = accountRepository.checkAccountAccessInfo(uid)
                     val tAccess = android.os.SystemClock.elapsedRealtime()
@@ -542,6 +557,7 @@ class LoginViewModel @Inject constructor(
             cancelResult.fold(
                 onSuccess = {
                     val newUid = Firebase.auth.currentUser?.uid ?: ""
+                    dayManager.switchAccountScope(newUid)
                     _uiState.value = LoginState.Success(userData)
                     _startupAuthState.value = StartupAuthState.AUTHENTICATED
                     Log.d("AUTH_PERF", "[AUTH_PERF] Account restored, navigated in ${android.os.SystemClock.elapsedRealtime() - t0}ms")

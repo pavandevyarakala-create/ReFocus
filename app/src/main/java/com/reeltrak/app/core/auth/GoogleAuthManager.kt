@@ -61,21 +61,11 @@ class GoogleAuthManager @Inject constructor(
         else -> null
     }
 
-    /**
-     * Resolves the Web Client ID dynamically from resources (generated from google-services.json)
-     * with fallback to the configured OAuth client ID. Cached via lazy evaluation to avoid repeated reflection.
-     */
+    /** Resolves the variant's Firebase-generated Web Client ID; missing config fails closed. */
     private val webClientId: String by lazy {
-        try {
-            val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
-            if (resId != 0) {
-                context.getString(resId)
-            } else {
-                "524118238647-fhocd7sf7t3nkmdbbanf3a33bgqcgj90.apps.googleusercontent.com"
-            }
-        } catch (e: Exception) {
-            "524118238647-fhocd7sf7t3nkmdbbanf3a33bgqcgj90.apps.googleusercontent.com"
-        }
+        val resId = context.resources.getIdentifier("default_web_client_id", "string", context.packageName)
+        val configuredId = if (resId == 0) null else context.getString(resId)
+        resolveGoogleWebClientId(com.reeltrak.app.BuildConfig.ENVIRONMENT, configuredId)
     }
 
     private fun isCancellationException(throwable: Throwable): Boolean {
@@ -98,11 +88,10 @@ class GoogleAuthManager @Inject constructor(
         callerContext: Context = context,
         tapTimestampMs: Long = android.os.SystemClock.elapsedRealtime()
     ): Result<UserAuthData> {
-        val serverClientId = webClientId
-        val activityContext = findActivity(callerContext) ?: callerContext
-        Log.d("GoogleAuth", "Initiating Google Sign-In with Web Client ID: $serverClientId, Context is Activity: ${activityContext is Activity}")
-
         try {
+            val serverClientId = webClientId
+            val activityContext = findActivity(callerContext) ?: callerContext
+            Log.d("GoogleAuth", "Initiating Google Sign-In, Context is Activity: ${activityContext is Activity}")
             val tReqStart = android.os.SystemClock.elapsedRealtime()
             Log.d("AUTH_PERF", "[AUTH_PERF] Stage 1 (Tap -> Credential Manager request start): ${tReqStart - tapTimestampMs}ms")
 
@@ -246,6 +235,15 @@ class GoogleAuthManager @Inject constructor(
             }
 
             when (e) {
+                is IllegalStateException -> {
+                    Log.e("GoogleAuth", "Google Sign-In build configuration error", e)
+                    return Result.failure(
+                        GoogleAuthException.ConfigurationError(
+                            message = e.message ?: "Google Sign-In configuration is missing for this build variant.",
+                            cause = e
+                        )
+                    )
+                }
                 is NoCredentialException -> {
                     Log.w("GoogleAuth", "NoCredentialException: ${e.message}", e)
                     return Result.failure(

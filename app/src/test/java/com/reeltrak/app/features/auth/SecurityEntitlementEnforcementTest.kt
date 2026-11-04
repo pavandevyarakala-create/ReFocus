@@ -772,9 +772,9 @@ class SecurityEntitlementEnforcementTest {
 
         val settingsScreenFile = findSourceFile("src/main/java/com/reeltrak/app/features/settings/ui/SettingsScreen.kt")
         val settingsScreenContent = settingsScreenFile.readText()
-        assertTrue("SettingsScreen must render Daily Reel Limit row", settingsScreenContent.contains("\"Daily Reel Limit\""))
-        assertTrue("SettingsScreen must render DailyLimitEntitlementDialog", settingsScreenContent.contains("DailyLimitEntitlementDialog("))
-        assertTrue("SettingsScreen must render DailyLimitSelectionDialog", settingsScreenContent.contains("DailyLimitSelectionDialog("))
+        assertFalse("SettingsScreen must not render Daily Reel Limit row (removed from settings)", settingsScreenContent.contains("\"Daily Reel Limit\""))
+        assertFalse("SettingsScreen must not render DailyLimitEntitlementDialog", settingsScreenContent.contains("DailyLimitEntitlementDialog("))
+        assertFalse("SettingsScreen must not render DailyLimitSelectionDialog", settingsScreenContent.contains("DailyLimitSelectionDialog("))
 
         val dashboardScreenFile = findSourceFile("src/main/java/com/reeltrak/app/features/dashboard/ui/DashboardScreen.kt")
         val dashboardScreenContent = dashboardScreenFile.readText()

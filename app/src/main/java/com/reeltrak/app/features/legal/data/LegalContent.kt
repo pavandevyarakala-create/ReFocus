@@ -66,7 +66,6 @@ object LegalContent {
                 "Google Play Integrity & Firebase App Check: Provides device attestation to ensure only authentic Re:Focus installations access backend APIs.",
                 "Google Play Billing: Facilitates secure processing of digital subscriptions and in-app purchases through your Google account.",
                 "Cloudflare Workers: Edge API infrastructure hosting server-authoritative time, subscription verification, and account deletion workflows.",
-                "Google AdMob (Google Mobile Ads SDK): Serves user-initiated rewarded advertisements that allow you to unlock temporary extensions or trial allowances. AdMob may process device identifiers including the Google Advertising ID (AD_ID) and diagnostic data for ad serving and fraud prevention, governed by Google's Privacy Policy. AdMob SDK does not have access to your video-tracking habits or accessibility data.",
                 "Razorpay: Secure payment gateway processing recurring monthly subscriptions via UPI and cards where applicable. Re:Focus NEVER handles, processes, or stores your credit/debit card numbers, UPI PINs, or banking credentials."
             )
         ),

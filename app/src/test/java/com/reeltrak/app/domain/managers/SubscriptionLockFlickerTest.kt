@@ -13,9 +13,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -253,16 +255,22 @@ class SubscriptionLockFlickerTest {
 
         // Case 1: Unauthenticated / missing user
         repo._subscriptionState.value = SubscriptionState.Success(SubscriptionInfo.LOCKED_DEFAULT)
-        Thread.sleep(50)
+        val lockedState = withTimeoutOrNull(2000L) {
+            manager.isConfirmedLocked.first { it }
+        }
 
+        assertTrue(lockedState == true)
         assertEquals(AccessState.LOCKED, manager.accessState.value)
         assertFalse(manager.isAppUnlockedNow())
         assertTrue(manager.isConfirmedLockedNow())
 
         // Case 2: Repository error fallback
         repo._subscriptionState.value = SubscriptionState.Error("Network error", SubscriptionInfo.LOCKED_DEFAULT)
-        Thread.sleep(50)
+        val errorLockedState = withTimeoutOrNull(2000L) {
+            manager.isConfirmedLocked.first { it }
+        }
 
+        assertTrue(errorLockedState == true)
         assertEquals(AccessState.LOCKED, manager.accessState.value)
         assertFalse(manager.isAppUnlockedNow())
         assertTrue(manager.isConfirmedLockedNow())

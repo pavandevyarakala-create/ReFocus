@@ -24,6 +24,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -72,61 +74,66 @@ class InAppUpdateManager @Inject constructor(
     @Volatile
     private var lastUpdateCheckTimestampMs: Long = 0L
 
+    private val updateCheckMutex = Mutex()
+
     /**
      * Checks Google Play for pending immediate updates.
      * Google Play is the sole authority for update availability.
-     * Checks are throttled by [UPDATE_CHECK_COOLDOWN_MS] unless [force] is true.
+     * Enforces single-flight concurrency via [updateCheckMutex] and throttles
+     * checks by [UPDATE_CHECK_COOLDOWN_MS] unless [force] is true.
      */
     suspend fun checkForUpdate(force: Boolean = false): AppUpdateStatus = withContext(Dispatchers.IO) {
-        val currentElapsed = android.os.SystemClock.elapsedRealtime()
-        val currentStatus = _updateStatus.value
-        if (!force &&
-            currentStatus != AppUpdateStatus.UPDATE_REQUIRED &&
-            currentStatus != AppUpdateStatus.UPDATE_IN_PROGRESS &&
-            lastUpdateCheckTimestampMs > 0L &&
-            (currentElapsed - lastUpdateCheckTimestampMs) < UPDATE_CHECK_COOLDOWN_MS
-        ) {
-            Log.d(TAG, "Skipping Google Play update check (cooldown active: ${currentElapsed - lastUpdateCheckTimestampMs}ms < ${UPDATE_CHECK_COOLDOWN_MS}ms)")
-            return@withContext currentStatus
-        }
+        updateCheckMutex.withLock {
+            val currentElapsed = android.os.SystemClock.elapsedRealtime()
+            val currentStatus = _updateStatus.value
+            if (!force &&
+                currentStatus != AppUpdateStatus.UPDATE_REQUIRED &&
+                currentStatus != AppUpdateStatus.UPDATE_IN_PROGRESS &&
+                lastUpdateCheckTimestampMs > 0L &&
+                (currentElapsed - lastUpdateCheckTimestampMs) < UPDATE_CHECK_COOLDOWN_MS
+            ) {
+                Log.d(TAG, "Skipping Google Play update check (cooldown active: ${currentElapsed - lastUpdateCheckTimestampMs}ms < ${UPDATE_CHECK_COOLDOWN_MS}ms)")
+                return@withContext currentStatus
+            }
 
-        try {
-            Log.d(TAG, "Requesting AppUpdateInfo from Google Play (installed versionCode: $currentInstalledVersionCode)...")
-            val info = appUpdateManager.requestAppUpdateInfo()
-            lastUpdateCheckTimestampMs = android.os.SystemClock.elapsedRealtime()
-            cachedAppUpdateInfo = info
+            try {
+                Log.d(TAG, "Requesting AppUpdateInfo from Google Play (installed versionCode: $currentInstalledVersionCode)...")
+                val info = appUpdateManager.requestAppUpdateInfo()
+                lastUpdateCheckTimestampMs = android.os.SystemClock.elapsedRealtime()
+                cachedAppUpdateInfo = info
 
-            val availability = info.updateAvailability()
-            val isImmediateAllowed = info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)
+                val availability = info.updateAvailability()
+                val isImmediateAllowed = info.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)
 
-            Log.d(TAG, "Play updateAvailability: $availability, isImmediateAllowed: $isImmediateAllowed, availableVersionCode: ${info.availableVersionCode()}, installedVersionCode: $currentInstalledVersionCode")
+                Log.d(TAG, "Play updateAvailability: $availability, isImmediateAllowed: $isImmediateAllowed, availableVersionCode: ${info.availableVersionCode()}, installedVersionCode: $currentInstalledVersionCode")
 
-            when {
-                availability == UpdateAvailability.DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS -> {
-                    _updateStatus.value = AppUpdateStatus.UPDATE_IN_PROGRESS
-                }
-                availability == UpdateAvailability.UPDATE_AVAILABLE && isImmediateAllowed -> {
-                    _updateStatus.value = AppUpdateStatus.UPDATE_REQUIRED
-                }
-                availability == UpdateAvailability.UPDATE_NOT_AVAILABLE -> {
-                    // Update successfully completed or no update available
-                    _updateStatus.value = AppUpdateStatus.UPDATE_NOT_REQUIRED
-                }
-                else -> {
-                    // If we were previously locked, remain locked until Play confirms UPDATE_NOT_AVAILABLE
-                    if (_updateStatus.value != AppUpdateStatus.UPDATE_REQUIRED && _updateStatus.value != AppUpdateStatus.UPDATE_FAILED) {
+                when {
+                    availability == UpdateAvailability.DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS -> {
+                        _updateStatus.value = AppUpdateStatus.UPDATE_IN_PROGRESS
+                    }
+                    availability == UpdateAvailability.UPDATE_AVAILABLE && isImmediateAllowed -> {
+                        _updateStatus.value = AppUpdateStatus.UPDATE_REQUIRED
+                    }
+                    availability == UpdateAvailability.UPDATE_NOT_AVAILABLE -> {
+                        // Update successfully completed or no update available
                         _updateStatus.value = AppUpdateStatus.UPDATE_NOT_REQUIRED
                     }
+                    else -> {
+                        // If we were previously locked, remain locked until Play confirms UPDATE_NOT_AVAILABLE
+                        if (_updateStatus.value != AppUpdateStatus.UPDATE_REQUIRED && _updateStatus.value != AppUpdateStatus.UPDATE_FAILED) {
+                            _updateStatus.value = AppUpdateStatus.UPDATE_NOT_REQUIRED
+                        }
+                    }
                 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query Google Play AppUpdateInfo: ${e.message}")
+                // Development / debug safety:
+                // Sideloaded or local debug builds may throw InstallException (e.g., app not owned or store unavailable).
+                // Do NOT lock the app permanently on initial check if Google Play cannot provide update info.
+                // If already locked in UPDATE_REQUIRED / UPDATE_FAILED, remain locked.
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to query Google Play AppUpdateInfo: ${e.message}")
-            // Development / debug safety:
-            // Sideloaded or local debug builds may throw InstallException (e.g., app not owned or store unavailable).
-            // Do NOT lock the app permanently on initial check if Google Play cannot provide update info.
-            // If already locked in UPDATE_REQUIRED / UPDATE_FAILED, remain locked.
+            _updateStatus.value
         }
-        _updateStatus.value
     }
 
     /**

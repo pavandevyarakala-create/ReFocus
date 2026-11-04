@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Lock
-import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -42,7 +41,7 @@ fun StrictModeCard(
                 spotColor = ReFocusColors.shadowSpot
             )
             .then(
-                if (!isEntitled) {
+                if (!isEntitled || dailyState == StrictModeDailyState.REACTIVATED_LOCKED) {
                     Modifier.clickable(enabled = !isLoading) { onLockedCardClick() }
                 } else {
                     Modifier
@@ -141,7 +140,7 @@ fun StrictModeCard(
                     !isEntitled -> "Auto-closes apps at limit • Premium feature"
                     isLoading -> "Loading..."
                     dailyState == StrictModeDailyState.REACTIVATED_LOCKED -> "Enforcement active • Locked until tomorrow"
-                    dailyState == StrictModeDailyState.DISABLED_TODAY -> "Off for today • Tap to reactivate"
+                    dailyState == StrictModeDailyState.DISABLED_TODAY -> "Off for today • Toggle to enable (will lock)"
                     else -> "Enforcement active • You can turn this off once today"
                 }
 
@@ -195,34 +194,16 @@ fun StrictModeCard(
                     }
 
                     StrictModeDailyState.DISABLED_TODAY -> {
-                        Box(
-                            modifier = Modifier
-                                .height(34.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(ReFocusColors.surfaceStrong)
-                                .border(BorderStroke(1.dp, ReFocusColors.border), RoundedCornerShape(8.dp))
-                                .clickable(enabled = !isLoading) { onReactivateClick() }
-                                .padding(horizontal = 12.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Refresh,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(14.dp),
-                                    tint = if (ReFocusColors.isDark) ReFocusColors.accentHighlight else ReFocusColors.accentDark
-                                )
-                                Spacer(modifier = Modifier.width(5.dp))
-                                Text(
-                                    text = "Reactivate",
-                                    style = MaterialTheme.typography.labelMedium.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 12.sp
-                                    ),
-                                    color = ReFocusColors.textPrimary
-                                )
-                            }
-                        }
+                        Switch(
+                            checked = false,
+                            onCheckedChange = { if (it) onReactivateClick() },
+                            enabled = !isLoading,
+                            colors = SwitchDefaults.colors(
+                                uncheckedThumbColor = ReFocusColors.textMuted,
+                                uncheckedTrackColor = ReFocusColors.surfaceSoft,
+                                uncheckedBorderColor = ReFocusColors.border
+                            )
+                        )
                     }
 
                     StrictModeDailyState.REACTIVATED_LOCKED -> {

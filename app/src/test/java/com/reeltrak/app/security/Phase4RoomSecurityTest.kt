@@ -69,6 +69,7 @@ class Phase4RoomSecurityTest {
 
         // Allowed telemetry and enforcement fields
         val expectedFields = setOf(
+            "accountScope",
             "dateString",
             "totalReelsCount",
             "totalTimeSpentMillis",

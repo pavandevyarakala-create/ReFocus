@@ -850,7 +850,7 @@ class ReelCounterAuditRegressionTest {
     fun testBUG_G01_TransientNullRoot_SessionContinuity() {
         var currentState = SessionState.IDLE
         val sessionManager = SessionManager(
-            onStateChanged = { _, newState, _ -> currentState = newState }
+            onStateChanged = { _, newState -> currentState = newState }
         )
 
         // Start session in Instagram

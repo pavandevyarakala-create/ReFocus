@@ -44,6 +44,11 @@
     public void onPaymentError(int, java.lang.String, com.razorpay.PaymentData);
 }
 -keep class com.google.android.gms.auth.api.phone.** {*;}
+-keep class com.reeltrak.app.MainActivity {
+    public void onPaymentSuccess(java.lang.String, com.razorpay.PaymentData);
+    public void onPaymentError(int, java.lang.String, com.razorpay.PaymentData);
+}
+-keep class com.reeltrak.app.data.services.RazorpaySubscriptionPurchaseServiceImpl { *; }
 
 # Security Hardening (P4-02): Strip verbose, debug, and info logs from release builds
 -assumenosideeffects class android.util.Log {

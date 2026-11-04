@@ -47,6 +47,8 @@ class LocalBackupRestoreTest {
     private lateinit var fakeDailyDao: FakeDailyReelDataDao
     private lateinit var fakeJournalDao: FakeLocalRestoreJournalDao
     private lateinit var fakePrefsRepo: FakePreferencesRepository
+    private lateinit var fakeRestoreSimulator: DeterministicMergeSimulator
+    private lateinit var fakeBackupSimulator: FakeBackupSimulator
     private val todayStr: String = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
 
     @Before
@@ -54,6 +56,8 @@ class LocalBackupRestoreTest {
         fakeDailyDao = FakeDailyReelDataDao()
         fakeJournalDao = FakeLocalRestoreJournalDao()
         fakePrefsRepo = FakePreferencesRepository()
+        fakeRestoreSimulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        fakeBackupSimulator = FakeBackupSimulator(fakeDailyDao, fakePrefsRepo)
     }
 
     // =========================================================================
@@ -542,6 +546,147 @@ class LocalBackupRestoreTest {
         assertEquals("rst_in_flight_456", fakePrefsRepo.currentRestoreRequestId.first())
     }
 
+    @Test
+    fun `Deterministic Merge - Historical record with valid local count is protected from zero-wiping cloud record`() = runBlocking {
+        val histDate = "2026-10-15"
+        val localHist = DailyReelData(
+            dateString = histDate,
+            totalReelsCount = 38,
+            dailyGoal = 40,
+            isSkullDay = false,
+            totalTimeSpentMillis = 1500000L,
+            syncStatus = 0
+        )
+        fakeDailyDao.insertOrReplace(localHist)
+
+        // Cloud snapshot payload arrives with zeroed reel count (e.g. from previous serialization bug)
+        val cloudRecords = listOf(
+            CloudSnapshotRecordDto(
+                dateString = histDate,
+                count = 0,
+                totalReelsCount = 0,
+                dailyGoal = 40,
+                isSkullDay = false,
+                totalTimeSpentMillis = 0L
+            )
+        )
+
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        val result = simulator.applyRestore(
+            cloudRecords = cloudRecords,
+            idempotencyKey = "key_anti_zero",
+            backupId = "bk_anti_zero",
+            cloudDailyLimit = 50
+        )
+
+        assertTrue(result is RestoreResult.Success)
+        val actual = fakeDailyDao.getDailyDataSync(histDate)
+        assertNotNull(actual)
+        assertEquals("Local positive reel count must NOT be overwritten by 0", 38, actual!!.totalReelsCount)
+        assertEquals("Local positive time spent must NOT be overwritten by 0", 1500000L, actual.totalTimeSpentMillis)
+    }
+
+    @Test
+    fun `Deterministic Merge - Preserves isSkullDay and totalTimeSpentMillis across restore`() = runBlocking {
+        val histDate = "2026-10-14"
+        val localHist = DailyReelData(
+            dateString = histDate,
+            totalReelsCount = 20,
+            dailyGoal = 30,
+            isSkullDay = false,
+            totalTimeSpentMillis = 500000L,
+            syncStatus = 0
+        )
+        fakeDailyDao.insertOrReplace(localHist)
+
+        val cloudRecords = listOf(
+            CloudSnapshotRecordDto(
+                dateString = histDate,
+                count = 50,
+                totalReelsCount = 50,
+                dailyGoal = 30,
+                isSkullDay = true,
+                totalTimeSpentMillis = 2000000L
+            )
+        )
+
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        val result = simulator.applyRestore(
+            cloudRecords = cloudRecords,
+            idempotencyKey = "key_fields",
+            backupId = "bk_fields",
+            cloudDailyLimit = 50
+        )
+
+        assertTrue(result is RestoreResult.Success)
+        val actual = fakeDailyDao.getDailyDataSync(histDate)
+        assertNotNull(actual)
+        assertEquals(50, actual!!.totalReelsCount)
+        assertTrue("isSkullDay must be true from cloud", actual.isSkullDay)
+        assertEquals(2000000L, actual.totalTimeSpentMillis)
+    }
+
+    @Test
+    fun `Serialization - CloudSnapshotRecordDto effectiveCount returns count when totalReelsCount is 0 or vice versa`() {
+        val legacyDto = CloudSnapshotRecordDto(dateString = "2026-10-10", count = 33, totalReelsCount = 0)
+        assertEquals("effectiveCount must fall back to 'count' when 'totalReelsCount' is 0", 33, legacyDto.effectiveCount)
+
+        val currentDto = CloudSnapshotRecordDto(dateString = "2026-10-10", count = 0, totalReelsCount = 44)
+        assertEquals("effectiveCount must use 'totalReelsCount' when non-zero", 44, currentDto.effectiveCount)
+
+        val bothDto = CloudSnapshotRecordDto(dateString = "2026-10-10", count = 55, totalReelsCount = 55)
+        assertEquals(55, bothDto.effectiveCount)
+    }
+
+    @Test
+    fun `Validation - Corrupt date format in downloaded snapshot record aborts before Room commit and preserves local data`() = runBlocking {
+        val histDate = "2026-10-12"
+        val localHist = DailyReelData(
+            dateString = histDate,
+            totalReelsCount = 25,
+            syncStatus = 0
+        )
+        fakeDailyDao.insertOrReplace(localHist)
+
+        val corruptRecords = listOf(
+            CloudSnapshotRecordDto(dateString = "INVALID-DATE-FORMAT", count = 999)
+        )
+
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        val result = simulator.applyRestoreWithPreCommitValidation(
+            cloudRecords = corruptRecords,
+            idempotencyKey = "key_corrupt",
+            backupId = "bk_corrupt",
+            cloudDailyLimit = 100
+        )
+
+        assertTrue("Must fail on corrupt date validation", result is RestoreResult.Error)
+        assertTrue(simulator.abortedKeys.contains("key_corrupt"))
+
+        // Verify local data remained completely untouched
+        val actual = fakeDailyDao.getDailyDataSync(histDate)
+        assertNotNull(actual)
+        assertEquals(25, actual!!.totalReelsCount)
+    }
+
+    @Test
+    fun `Daily Quota - Failed restore operation aborts cleanly and does not consume success allowance`() = runBlocking {
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+
+        // Attempt 1 fails
+        val result1 = simulator.performRestoreWithRetrySimulation(
+            shouldFailFirstAttempt = true,
+            cloudRecords = emptyList(),
+            backupId = "bk_fail",
+            cloudDailyLimit = 50
+        )
+        assertTrue("Attempt 1 must fail", result1 is RestoreResult.Error)
+
+        // User should still have a pending or reusable request ID, and journal must NOT have an ACKNOWLEDGED entry
+        val journals = fakeJournalDao.journals.values
+        assertTrue("Failed restore must not have committed journal rows", journals.isEmpty())
+    }
+
     // =========================================================================
     // SECTION 7: Room Database Migration 11 - 12
     // =========================================================================
@@ -634,6 +779,212 @@ class LocalBackupRestoreTest {
         assertNotNull(merged)
         assertEquals("Offline local progress must win via maxOf", 25, merged!!.totalReelsCount)
         assertEquals("Merged record must retain syncStatus = 1 (PENDING) for future backup", 1, merged.syncStatus)
+    }
+
+    @Test
+    fun `Deterministic Merge - Today record adopts higher count from cloud when cloud is greater than local`() = runBlocking {
+        // Local today only has 2 reels tracked
+        val localToday = DailyReelData(
+            dateString = todayStr,
+            totalReelsCount = 2,
+            dailyGoal = 20,
+            syncStatus = 1
+        )
+        fakeDailyDao.insertOrReplace(localToday)
+
+        // Cloud snapshot has 35 reels for today
+        val cloudRecords = listOf(
+            CloudSnapshotRecordDto(
+                dateString = todayStr,
+                count = 35,
+                totalReelsCount = 35,
+                dailyGoal = 20,
+                isStrictModeOn = true
+            )
+        )
+
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        val result = simulator.applyRestore(cloudRecords, "key_today_higher", "bk_today", 100)
+
+        assertTrue(result is RestoreResult.Success)
+        val actualToday = fakeDailyDao.getDailyDataSync(todayStr)
+        assertNotNull(actualToday)
+        assertEquals("Higher cloud count (35) must be adopted for today over local (2)", 35, actualToday!!.totalReelsCount)
+    }
+
+    @Test
+    fun `Deterministic Merge - Historical local records absent from backup are safely preserved in Room`() = runBlocking {
+        val absentDate = "2026-10-05"
+        val backedUpDate = "2026-10-06"
+
+        val localAbsent = DailyReelData(dateString = absentDate, totalReelsCount = 19, syncStatus = 0)
+        val localPresent = DailyReelData(dateString = backedUpDate, totalReelsCount = 10, syncStatus = 0)
+        fakeDailyDao.insertOrReplace(localAbsent)
+        fakeDailyDao.insertOrReplace(localPresent)
+
+        // Backup only contains backedUpDate, completely omitting absentDate
+        val cloudRecords = listOf(
+            CloudSnapshotRecordDto(dateString = backedUpDate, count = 25, totalReelsCount = 25)
+        )
+
+        val simulator = DeterministicMergeSimulator(fakeDailyDao, fakeJournalDao, fakePrefsRepo, todayStr)
+        val result = simulator.applyRestore(cloudRecords, "key_absent_preservation", "bk_partial", 50)
+
+        assertTrue(result is RestoreResult.Success)
+        // Record absent from backup MUST remain safely in Room (non-destructive merge)
+        val preservedAbsent = fakeDailyDao.getDailyDataSync(absentDate)
+        assertNotNull("Local record absent from backup must not be deleted", preservedAbsent)
+        assertEquals(19, preservedAbsent!!.totalReelsCount)
+
+        // Record present in backup was updated
+        val updatedPresent = fakeDailyDao.getDailyDataSync(backedUpDate)
+        assertNotNull(updatedPresent)
+        assertEquals(25, updatedPresent!!.totalReelsCount)
+    }
+
+    @Test
+    fun `Count Normalization - Positive count wins over stale zero in JSON payload parsing`() {
+        val resolved1 = com.reeltrak.app.data.remote.dto.normalizeReelCount(rawTotal = 0, rawCount = 25)
+        assertEquals("count: 25 must win over totalReelsCount: 0", 25, resolved1)
+
+        val resolved2 = com.reeltrak.app.data.remote.dto.normalizeReelCount(rawTotal = 42, rawCount = 0)
+        assertEquals("totalReelsCount: 42 must win over count: 0", 42, resolved2)
+    }
+
+    @Test
+    fun `Count Normalization - Legitimate zero count is strictly preserved when both fields are zero`() {
+        val resolved = com.reeltrak.app.data.remote.dto.normalizeReelCount(rawTotal = 0, rawCount = 0)
+        assertEquals("Legitimate zero count must be preserved as 0", 0, resolved)
+    }
+
+    // =========================================================================
+    // PART 1 & 4: FRESH-INSTALL DATA LOSS PREVENTION & SAFE RECOVERY TESTS
+    // =========================================================================
+
+    @Test
+    fun `Anti-Data-Loss - Empty local database with existing remote backup fails backup with Ineligible`() = runBlocking {
+        // 1. Simulates fresh install: Room is completely empty (0 records)
+        fakeDailyDao.clearAll()
+        assertEquals(0, fakeDailyDao.getAllDailyDataSync().size)
+
+        // 2. Server already has an existing active backup of 50 historical records
+        val serverRecordCount = 50
+
+        // 3. User taps "Back Up Now" from empty local state
+        val backupResult = fakeBackupSimulator.performProtectedBackup(serverRecordCount)
+
+        // 4. Verification: Backup MUST be rejected as Ineligible with anti-data-loss explanation
+        assertTrue("Empty local backup over non-empty server data must be ineligible", backupResult is BackupResult.Ineligible)
+        val ineligibleReason = (backupResult as BackupResult.Ineligible).reason
+        assertTrue("Reason must explain data-loss prevention", ineligibleReason.contains("Cannot overwrite existing remote backup with empty local data"))
+    }
+
+    @Test
+    fun `Anti-Data-Loss - All-zero local records with existing remote backup fails backup with Ineligible`() = runBlocking {
+        fakeDailyDao.clearAll()
+        // Local records exist but all have 0 reels (empty defaults)
+        fakeDailyDao.insertOrReplace(
+            DailyReelData(dateString = "2026-10-08", totalReelsCount = 0, syncStatus = 0)
+        )
+        fakeDailyDao.insertOrReplace(
+            DailyReelData(dateString = "2026-10-09", totalReelsCount = 0, syncStatus = 0)
+        )
+
+        val serverRecordCount = 100
+        val backupResult = fakeBackupSimulator.performProtectedBackup(serverRecordCount)
+
+        assertTrue("Zero-count local records over non-empty server data must be rejected", backupResult is BackupResult.Ineligible)
+        assertTrue((backupResult as BackupResult.Ineligible).reason.contains("Cannot overwrite existing remote backup"))
+    }
+
+    @Test
+    fun `Anti-Data-Loss - Genuinely new user with no remote backup initializes safely without corruption`() = runBlocking {
+        fakeDailyDao.clearAll()
+        // No server backup (0 records on server)
+        val serverRecordCount = 0
+
+        val backupResult = fakeBackupSimulator.performProtectedBackup(serverRecordCount)
+        assertTrue("New user without remote backup can execute backup safely", backupResult is BackupResult.Success)
+    }
+
+    @Test
+    fun `Safe First-Launch Recovery - Fresh install detects remote backup and restores it before enabling backup`() = runBlocking {
+        // Fresh install: Room empty
+        fakeDailyDao.clearAll()
+
+        // Remote snapshot to restore
+        val remoteRecords = listOf(
+            CloudSnapshotRecordDto(dateString = "2026-10-07", count = 35, totalReelsCount = 35, dailyGoal = 60),
+            CloudSnapshotRecordDto(dateString = "2026-10-08", count = 42, totalReelsCount = 42, dailyGoal = 60)
+        )
+
+        // Execute safe restore sequence
+        val restoreResult = fakeRestoreSimulator.applyRestore(remoteRecords)
+        assertTrue(restoreResult is RestoreResult.Success)
+
+        // Verify Room is now populated with restored remote records
+        val allLocal = fakeDailyDao.getAllDailyDataSync()
+        assertEquals(2, allLocal.size)
+        assertEquals(35, fakeDailyDao.getDailyDataSync("2026-10-07")?.totalReelsCount)
+        assertEquals(42, fakeDailyDao.getDailyDataSync("2026-10-08")?.totalReelsCount)
+
+        // Now local database is populated; subsequent backup is safe and permitted
+        val backupResult = fakeBackupSimulator.performProtectedBackup(serverRecordCount = 2)
+        assertTrue("Backup permitted after successful restore populated local state", backupResult is BackupResult.Success)
+    }
+
+    @Test
+    fun `Safe First-Launch Recovery - Failed restore preserves server data, keeps backup locked, and allows retry`() = runBlocking {
+        fakeDailyDao.clearAll()
+
+        // Attempt 1: Corrupted remote chunk payload triggers pre-commit abort
+        val corruptRecords = listOf(
+            CloudSnapshotRecordDto(dateString = "invalid_date_format", count = 10, totalReelsCount = 10)
+        )
+        val failResult = fakeRestoreSimulator.applyRestoreWithPreCommitValidation(corruptRecords)
+        assertTrue(failResult is RestoreResult.Error)
+
+        // Verify Room was NOT corrupted or partially modified
+        assertEquals(0, fakeDailyDao.getAllDailyDataSync().size)
+
+        // Backup remains strictly locked while restore is in failed state
+        val backupResult = fakeBackupSimulator.performProtectedBackup(serverRecordCount = 25)
+        assertTrue("Backup must remain ineligible after failed restore", backupResult is BackupResult.Ineligible)
+
+        // Attempt 2: User retries restore with valid payload
+        val validRecords = listOf(
+            CloudSnapshotRecordDto(dateString = "2026-10-08", count = 25, totalReelsCount = 25, dailyGoal = 50)
+        )
+        val retryResult = fakeRestoreSimulator.applyRestore(validRecords)
+        assertTrue("Retry restore succeeds cleanly", retryResult is RestoreResult.Success)
+        assertEquals(25, fakeDailyDao.getDailyDataSync("2026-10-08")?.totalReelsCount)
+    }
+
+    @Test
+    fun `Idempotent Restore - Repeated restore executions do not duplicate records or inflate reel counts`() = runBlocking {
+        fakeDailyDao.clearAll()
+
+        val remoteRecords = listOf(
+            CloudSnapshotRecordDto(dateString = "2026-10-05", count = 15, totalReelsCount = 15, dailyGoal = 40),
+            CloudSnapshotRecordDto(dateString = "2026-10-06", count = 28, totalReelsCount = 28, dailyGoal = 40),
+            CloudSnapshotRecordDto(dateString = "2026-10-07", count = 33, totalReelsCount = 33, dailyGoal = 40)
+        )
+
+        // First restore execution
+        val result1 = fakeRestoreSimulator.applyRestore(remoteRecords)
+        assertTrue(result1 is RestoreResult.Success)
+        val countAfterFirst = fakeDailyDao.getAllDailyDataSync().size
+        assertEquals(3, countAfterFirst)
+        assertEquals(28, fakeDailyDao.getDailyDataSync("2026-10-06")?.totalReelsCount)
+
+        // Replay: Second restore execution of identical remote records
+        val result2 = fakeRestoreSimulator.applyRestore(remoteRecords)
+        assertTrue(result2 is RestoreResult.Success)
+
+        // Verification: No duplicate records created, and reel counts are strictly identical (NOT doubled)
+        val countAfterSecond = fakeDailyDao.getAllDailyDataSync().size
+        assertEquals("Record count must remain exactly 3 without duplication", 3, countAfterSecond)
+        assertEquals("Reel count must remain exactly 28 without inflation", 28, fakeDailyDao.getDailyDataSync("2026-10-06")?.totalReelsCount)
     }
 
     // =========================================================================
@@ -877,9 +1228,9 @@ class LocalBackupRestoreTest {
 
         suspend fun applyRestore(
             cloudRecords: List<CloudSnapshotRecordDto>,
-            idempotencyKey: String,
-            backupId: String,
-            cloudDailyLimit: Int?
+            idempotencyKey: String = "sim_idempotency_key",
+            backupId: String = "sim_backup_id",
+            cloudDailyLimit: Int? = 50
         ): RestoreResult {
             // Check in-flight retry
             val existing = journalDao.getByIdempotencyKey(idempotencyKey)
@@ -898,19 +1249,24 @@ class LocalBackupRestoreTest {
                 val localRec = dailyDao.getDailyDataSync(date)
 
                 if (date == todayStr) {
-                    if (localRec != null && localRec.totalReelsCount > 0) {
-                        // LOCAL WINS
-                        continue
-                    } else {
-                        dailyDao.insertOrReplace(DailyReelData(
-                            dateString = date,
-                            totalReelsCount = cloudRec.effectiveCount,
-                            dailyGoal = cloudRec.dailyGoal,
-                            isStrictModeOn = cloudRec.isStrictModeOn,
-                            syncStatus = 0
-                        ))
-                        restoredCount++
-                    }
+                    val localCount = localRec?.totalReelsCount ?: 0
+                    val cloudCount = cloudRec.effectiveCount
+                    val resolvedTodayCount = maxOf(localCount, cloudCount)
+                    val resolvedTodayTime = maxOf(localRec?.totalTimeSpentMillis ?: 0L, cloudRec.totalTimeSpentMillis)
+                    val resolvedGoal = if (cloudRec.dailyGoal > 0) cloudRec.dailyGoal else (localRec?.dailyGoal ?: 0)
+
+                    dailyDao.insertOrReplace(DailyReelData(
+                        dateString = date,
+                        totalReelsCount = resolvedTodayCount,
+                        totalTimeSpentMillis = resolvedTodayTime,
+                        dailyGoal = resolvedGoal,
+                        isSkullDay = (localRec?.isSkullDay == true) || cloudRec.isSkullDay,
+                        isStrictModeOn = cloudRec.isStrictModeOn,
+                        isStrictModeLocked = (localRec?.isStrictModeLocked == true) || cloudRec.isStrictModeLocked,
+                        isLimitLocked = (localRec?.isLimitLocked == true) || cloudRec.isLimitLocked,
+                        syncStatus = if (localRec != null && localCount > cloudCount) 1 else 0
+                    ))
+                    restoredCount++
                 } else {
                     if (localRec == null) {
                         dailyDao.insertOrReplace(DailyReelData(
@@ -922,10 +1278,25 @@ class LocalBackupRestoreTest {
                         ))
                         restoredCount++
                     } else if (localRec.syncStatus == 0) {
-                        // CLOUD WINS
+                        // CLOUD WINS, EXCEPT NEVER overwrite valid local reel count with zero!
+                        val effectiveCloudCount = cloudRec.effectiveCount
+                        val resolvedCount = if (effectiveCloudCount > 0) {
+                            effectiveCloudCount
+                        } else if (localRec.totalReelsCount > 0) {
+                            localRec.totalReelsCount
+                        } else {
+                            0
+                        }
+                        val resolvedTimeSpent = if (cloudRec.totalTimeSpentMillis > 0L) {
+                            cloudRec.totalTimeSpentMillis
+                        } else {
+                            localRec.totalTimeSpentMillis
+                        }
                         dailyDao.insertOrReplace(localRec.copy(
-                            totalReelsCount = cloudRec.effectiveCount,
-                            dailyGoal = cloudRec.dailyGoal,
+                            totalReelsCount = resolvedCount,
+                            totalTimeSpentMillis = resolvedTimeSpent,
+                            dailyGoal = if (cloudRec.dailyGoal > 0) cloudRec.dailyGoal else localRec.dailyGoal,
+                            isSkullDay = cloudRec.isSkullDay || localRec.isSkullDay,
                             isStrictModeOn = cloudRec.isStrictModeOn,
                             syncStatus = 0
                         ))
@@ -970,11 +1341,18 @@ class LocalBackupRestoreTest {
             return RestoreResult.Success(backupId, restoredCount, cloudDailyLimit, isIdempotent = false)
         }
 
+        suspend fun applyRestoreWithPreCommitValidation(
+            cloudRecords: List<CloudSnapshotRecordDto>,
+            idempotencyKey: String = "sim_val_key",
+            backupId: String = "sim_val_bk",
+            cloudDailyLimit: Int? = 50
+        ): RestoreResult = applyRestoreWithValidation(cloudRecords, idempotencyKey, backupId, cloudDailyLimit)
+
         suspend fun applyRestoreWithValidation(
             cloudRecords: List<CloudSnapshotRecordDto>,
-            idempotencyKey: String,
-            backupId: String,
-            cloudDailyLimit: Int?
+            idempotencyKey: String = "sim_val_key",
+            backupId: String = "sim_val_bk",
+            cloudDailyLimit: Int? = 50
         ): RestoreResult {
             val dateRegex = Regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
             for (rec in cloudRecords) {
@@ -1060,6 +1438,16 @@ class LocalBackupRestoreTest {
             isRestricted.value = true
 
             return BackupResult.Success("bk_chunked", nowMs, nowMs + 86400000L)
+        }
+
+        suspend fun performProtectedBackup(serverRecordCount: Int): BackupResult {
+            val all = dailyDao.getAllDailyDataSync()
+            if (all.isEmpty() || all.all { it.totalReelsCount == 0 }) {
+                if (serverRecordCount > 0) {
+                    return BackupResult.Ineligible("Cannot overwrite existing remote backup with empty local data. Please restore your data first.")
+                }
+            }
+            return performFastPathBackup(true)
         }
 
         fun simulateCooldown(nextEligibleTimeMs: Long): BackupResult {

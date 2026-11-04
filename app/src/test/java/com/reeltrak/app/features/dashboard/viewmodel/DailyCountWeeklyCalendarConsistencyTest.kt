@@ -7,8 +7,6 @@ import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.Companio
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.Companion.calculateStreakStats
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.Companion.generateHabitTrackerData
 import com.reeltrak.app.features.dashboard.viewmodel.DashboardViewModel.DailyBlocks
-import com.reeltrak.app.services.overlay.OverlayState
-import com.reeltrak.app.services.tracking.SessionState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -27,13 +25,6 @@ import java.time.format.DateTimeFormatter
  * Calendar, and Analytics totals represents EXACTLY the same daily count everywhere.
  */
 class DailyCountWeeklyCalendarConsistencyTest {
-
-    private val idleOverlay = OverlayState(
-        sessionState = SessionState.IDLE,
-        currentApp = null,
-        sessionStartTime = 0L,
-        currentSessionReels = 0
-    )
 
     private val todayStr = "2026-09-27"
     private val todayDate = LocalDate.parse(todayStr, DateTimeFormatter.ISO_LOCAL_DATE)
@@ -150,12 +141,12 @@ class DailyCountWeeklyCalendarConsistencyTest {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Test 5: Multiple sessions on the same day accumulate consistently
+    // Test 5: Daily count is authoritative; legacy session rows do not drive reports.
     // ---------------------------------------------------------------------------------------------
     @Test
-    fun multipleSessionsSameDay_accumulatesCorrectlyAcrossAllComponents() {
+    fun dailyCountRemainsAuthoritativeWhenLegacySessionRowsExist() {
         val s1 = SessionData(appName = "com.instagram.android", reelsScrolled = 10, startTimeStamp = 1000L, endTimeStamp = 2000L)
-        val s2 = SessionData(appName = "com.google.android.youtube", reelsScrolled = 15, startTimeStamp = 3000L, endTimeStamp = 4000L)
+        val s2 = SessionData(appName = "com.google.android.youtube", reelsScrolled = 5, startTimeStamp = 3000L, endTimeStamp = 4000L)
         val todayStats = DailyReelData(
             dateString = todayStr,
             totalReelsCount = 25,
@@ -167,11 +158,8 @@ class DailyCountWeeklyCalendarConsistencyTest {
         val todayBlock = habitData.last()
 
         assertEquals(25, todayBlock.totalReelsScrolled)
-        assertEquals(2, todayBlock.blocks.size)
-        assertEquals(10, todayBlock.blocks[0].reelsCount)
-        assertEquals(15, todayBlock.blocks[1].reelsCount)
 
-        val lifetime = calculateLifetimeReels(emptyList(), todayStr, todayStats, idleOverlay)
+        val lifetime = calculateLifetimeReels(emptyList(), todayStr, todayStats)
         assertEquals(25L, lifetime)
     }
 
@@ -212,12 +200,12 @@ class DailyCountWeeklyCalendarConsistencyTest {
         )
         val todayStats = DailyReelData(dateString = todayStr, totalReelsCount = 10, dailyGoal = 50)
 
-        val lifetime1 = calculateLifetimeReels(roomData, todayStr, todayStats, idleOverlay)
+        val lifetime1 = calculateLifetimeReels(roomData, todayStr, todayStats)
         val avg1 = calculateAvgReelsPerDay(lifetime1, roomData, todayStr, todayStats)
         val habit1 = generateHabitTrackerData(roomData, todayStr, todayStats)
         val streak1 = calculateStreakStats(habit1)
 
-        val lifetime2 = calculateLifetimeReels(roomData, todayStr, todayStats, idleOverlay)
+        val lifetime2 = calculateLifetimeReels(roomData, todayStr, todayStats)
         val avg2 = calculateAvgReelsPerDay(lifetime2, roomData, todayStr, todayStats)
         val habit2 = generateHabitTrackerData(roomData, todayStr, todayStats)
         val streak2 = calculateStreakStats(habit2)
@@ -334,7 +322,7 @@ class DailyCountWeeklyCalendarConsistencyTest {
         assertFalse(weekly.any { it.dateString > todayStr })
 
         // 3. Lifetime calculation rejects future row
-        val lifetime = calculateLifetimeReels(corruptedRoom, todayStr, todayData, idleOverlay)
+        val lifetime = calculateLifetimeReels(corruptedRoom, todayStr, todayData)
         assertEquals(35L, lifetime) // 20 + 15, 500 is rejected
 
         // 4. Daily average rejects future row
@@ -372,7 +360,7 @@ class DailyCountWeeklyCalendarConsistencyTest {
         val expectedHistoricalSum = (1..10).sumOf { it * 10 } // 550
         val expectedTotal = (expectedHistoricalSum + 37).toLong() // 587
 
-        val lifetime = calculateLifetimeReels(allData, "2026-09-11", currentDay, idleOverlay)
+        val lifetime = calculateLifetimeReels(allData, "2026-09-11", currentDay)
         assertEquals(expectedTotal, lifetime)
     }
 

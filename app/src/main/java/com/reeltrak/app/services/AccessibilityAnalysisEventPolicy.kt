@@ -31,6 +31,7 @@ internal class AccessibilityAnalysisEventPolicy(
     fun <R : Any> resolveWindowStatePackage(
         eventPackage: String?,
         isTrackedPackage: (String) -> Boolean,
+        isSelfPackage: (String?) -> Boolean = { false },
         rootProvider: () -> R?,
         packageFromRoot: (R) -> String?,
         releaseRoot: (R) -> Unit
@@ -40,12 +41,12 @@ internal class AccessibilityAnalysisEventPolicy(
             rootProvider()
         } catch (_: Exception) {
             null
-        } ?: return eventPackage
+        } ?: return if (isSelfPackage(eventPackage)) null else eventPackage
 
         return try {
-            packageFromRoot(root) ?: eventPackage
+            packageFromRoot(root) ?: if (isSelfPackage(eventPackage)) null else eventPackage
         } catch (_: Exception) {
-            eventPackage
+            if (isSelfPackage(eventPackage)) null else eventPackage
         } finally {
             try { releaseRoot(root) } catch (_: Exception) { }
         }

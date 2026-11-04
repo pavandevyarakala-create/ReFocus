@@ -19,11 +19,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.security.KeyFactory
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PublicKey
 import java.security.Signature
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -126,11 +133,41 @@ open class AppAuthorizationManager @Inject constructor(
 
     /**
      * Asynchronously requests a cryptographically signed authorization lease from the server.
-     * Note: Network lease fetching is disabled; the app relies authoritatively on real-time
-     * Firestore subscription state and security rules.
+     * Invoked when active account lacks a valid local lease or on entitlement state transition.
      */
-    fun launchServerLeaseFetch() {
-        android.util.Log.d("STARTUP_DEBUG", "AppAuthorizationManager: launchServerLeaseFetch skipped (authoritative Firestore entitlement active)")
+    open fun launchServerLeaseFetch() {
+        val uid = currentUidProvider()
+        if (uid.isNullOrBlank()) {
+            android.util.Log.d("STARTUP_DEBUG", "AppAuthorizationManager: launchServerLeaseFetch skipped (no authenticated user)")
+            return
+        }
+        scope.launch {
+            try {
+                android.util.Log.d("STARTUP_DEBUG", "AppAuthorizationManager: launchServerLeaseFetch executing for UID=$uid")
+                val result = subscriptionRepository.fetchAuthorizationLease()
+                if (result.isSuccess) {
+                    val token = result.getOrThrow()
+                    updateServerLease(token)
+                    android.util.Log.i("STARTUP_DEBUG", "AppAuthorizationManager: launchServerLeaseFetch successfully updated lease for UID=${token.uid}")
+                } else {
+                    android.util.Log.w("STARTUP_DEBUG", "AppAuthorizationManager: launchServerLeaseFetch failed: ${result.exceptionOrNull()?.message}")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to fetch server lease: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Suspending call to refresh authorization lease from server and update local cache.
+     */
+    open suspend fun refreshLeaseFromServer(): Result<AuthorizationToken> {
+        val result = subscriptionRepository.fetchAuthorizationLease()
+        if (result.isSuccess) {
+            val token = result.getOrThrow()
+            updateServerLease(token)
+        }
+        return result
     }
 
     /**
@@ -212,7 +249,7 @@ open class AppAuthorizationManager @Inject constructor(
 
         // 1. Premium Check
         val hasFuturePaid = currentInfo.currentPeriodEnd != null && currentInfo.currentPeriodEnd > 0L && effectiveNow < currentInfo.currentPeriodEnd
-        if (currentInfo.accessState == AccessState.ACTIVE || (currentInfo.status == SubscriptionStatus.ACTIVE && hasFuturePaid)) {
+        if (currentInfo.accessState == AccessState.ACTIVE || (hasFuturePaid && currentInfo.status != SubscriptionStatus.HALTED)) {
             return OperationalMode.PREMIUM
         }
 
@@ -287,8 +324,9 @@ open class AppAuthorizationManager @Inject constructor(
                 val effectiveNow = if (authoritativeNow > 0L) authoritativeNow else System.currentTimeMillis()
                 val hasFutureTrial = info.trialEnd != null && info.trialEnd > 0L && effectiveNow < info.trialEnd
                 val hasFuturePaid = info.currentPeriodEnd != null && info.currentPeriodEnd > 0L && effectiveNow < info.currentPeriodEnd
+                val isAccessActive = info.accessState == AccessState.ACTIVE || info.accessState == AccessState.TRIAL
 
-                if (!hasFutureTrial && !hasFuturePaid) {
+                if (!hasFutureTrial && !hasFuturePaid && !isAccessActive) {
                     val state = AuthorizationState.Locked(AuthorizationLockReason.SUBSCRIPTION_EXPIRED)
                     currentActiveToken = null
                     clearPersistedLease()
@@ -296,7 +334,7 @@ open class AppAuthorizationManager @Inject constructor(
                     Log.d("SUB_DEBUG_AUTHORIZATION", "recalculateAuthorizationState [EXPIRED]: UID=$uid -> state=$state")
                     return state
                 } else {
-                    Log.w("SUB_DEBUG_AUTHORIZATION", "recalculateAuthorizationState: Suppressing EXPIRED lock because trial/paid date is still in future (trialEnd=${info.trialEnd}, paidEnd=${info.currentPeriodEnd}, now=$effectiveNow)")
+                    Log.w("SUB_DEBUG_AUTHORIZATION", "recalculateAuthorizationState: Suppressing EXPIRED lock because trial/paid date is still in future (trialEnd=${info.trialEnd}, paidEnd=${info.currentPeriodEnd}, now=$effectiveNow, accessState=${info.accessState})")
                 }
             }
             else -> {}
@@ -349,14 +387,16 @@ open class AppAuthorizationManager @Inject constructor(
                 }
                 AccessState.INITIALIZING -> AuthorizationLockReason.NO_SERVER_LEASE
                 AccessState.FINAL_SYNC_GRACE, AccessState.LOCKED -> {
-                    if (info.status == SubscriptionStatus.EXPIRED) {
-                        AuthorizationLockReason.SUBSCRIPTION_EXPIRED
-                    } else if (info.status == SubscriptionStatus.HALTED) {
+                    val hasFuturePaid = info.currentPeriodEnd != null && info.currentPeriodEnd > 0L && effectiveNow < info.currentPeriodEnd
+                    val hasFutureTrial = info.trialEnd != null && info.trialEnd > 0L && effectiveNow < info.trialEnd
+                    if (info.status == SubscriptionStatus.HALTED) {
                         AuthorizationLockReason.SUBSCRIPTION_HALTED
                     } else if (info.currentPeriodEnd != null && effectiveNow >= info.currentPeriodEnd) {
                         AuthorizationLockReason.SUBSCRIPTION_EXPIRED
                     } else if (info.trialEnd != null && effectiveNow >= info.trialEnd) {
                         AuthorizationLockReason.TRIAL_EXPIRED
+                    } else if (info.status == SubscriptionStatus.EXPIRED && !hasFuturePaid && !hasFutureTrial) {
+                        AuthorizationLockReason.SUBSCRIPTION_EXPIRED
                     } else {
                         AuthorizationLockReason.NO_SERVER_LEASE
                     }
@@ -434,24 +474,29 @@ open class AppAuthorizationManager @Inject constructor(
     @Synchronized
     open fun loadCachedLease(): Boolean {
         try {
-            val jsonStr = prefs?.getString(KEY_CACHED_LEASE, null)
-            if (jsonStr == null) {
+            val rawStr = prefs?.getString(KEY_CACHED_LEASE, null)
+            if (rawStr == null) {
                 android.util.Log.d("STARTUP_DEBUG", "AppAuthorizationManager: loadCachedLease - No cached lease in SharedPreferences")
                 return false
             }
-            val json = org.json.JSONObject(jsonStr)
+            val jsonStr = AndroidKeystoreLeaseCrypto.decrypt(rawStr)
+            if (jsonStr.isBlank()) {
+                android.util.Log.w("STARTUP_DEBUG", "AppAuthorizationManager: loadCachedLease - Decrypted lease json is blank")
+                return false
+            }
+            val jsonObject = com.google.gson.JsonParser.parseString(jsonStr).asJsonObject
             val lease = AuthorizationToken(
-                uid = json.getString("uid"),
-                planId = json.getString("planId"),
-                accessMode = AccessMode.valueOf(json.getString("accessMode")),
-                issuedAtMs = json.getLong("issuedAtMs"),
-                expiresAtMs = json.getLong("expiresAtMs"),
-                leaseValidUntilMs = json.getLong("leaseValidUntilMs"),
-                integrityDigest = json.getString("integrityDigest"),
-                leaseVersion = json.optInt("leaseVersion", 1),
-                nonce = json.getString("nonce"),
-                subscriptionId = json.optString("subscriptionId").ifBlank { null },
-                signature = json.getString("signature")
+                uid = jsonObject.get("uid")?.asString ?: "",
+                planId = jsonObject.get("planId")?.asString ?: "",
+                accessMode = try { AccessMode.valueOf(jsonObject.get("accessMode")?.asString ?: "") } catch (e: Exception) { AccessMode.ACTIVE },
+                issuedAtMs = jsonObject.get("issuedAtMs")?.asLong ?: 0L,
+                expiresAtMs = jsonObject.get("expiresAtMs")?.asLong ?: 0L,
+                leaseValidUntilMs = jsonObject.get("leaseValidUntilMs")?.asLong ?: 0L,
+                integrityDigest = jsonObject.get("integrityDigest")?.asString ?: "",
+                leaseVersion = jsonObject.get("leaseVersion")?.asInt ?: 1,
+                nonce = jsonObject.get("nonce")?.asString ?: "",
+                subscriptionId = jsonObject.get("subscriptionId")?.let { if (!it.isJsonNull) it.asString.ifBlank { null } else null },
+                signature = jsonObject.get("signature")?.asString ?: ""
             )
             val verified = verifyToken(lease)
             Log.d("SUB_DEBUG_AUTHORIZATION", "loadCachedLease: cachedUID=${lease.uid}, accessMode=${lease.accessMode}, expiresAtMs=${lease.expiresAtMs}, validUntilMs=${lease.leaseValidUntilMs}, verified=$verified")
@@ -490,7 +535,8 @@ open class AppAuthorizationManager @Inject constructor(
                 put("subscriptionId", lease.subscriptionId ?: "")
                 put("signature", lease.signature)
             }
-            prefs?.edit()?.putString(KEY_CACHED_LEASE, json.toString())?.apply()
+            val encryptedPayload = AndroidKeystoreLeaseCrypto.encrypt(json.toString())
+            prefs?.edit()?.putString(KEY_CACHED_LEASE, encryptedPayload)?.apply()
         } catch (e: Exception) {
             Log.e(TAG, "Failed to persist server lease to cache", e)
         }
@@ -503,6 +549,76 @@ open class AppAuthorizationManager @Inject constructor(
             Log.d("SUB_DEBUG_AUTHORIZATION", "clearPersistedLease executed")
         } catch (e: Exception) {
             // Ignore cache clear error
+        }
+    }
+}
+
+/**
+ * Keystore-backed AES-256-GCM encryption helper for cached authorization leases.
+ * Protects cached leases at rest using hardware-backed AndroidKeyStore master key.
+ * Transparently falls back to private SharedPreferences if AndroidKeyStore is unavailable (e.g. JVM unit tests).
+ */
+internal object AndroidKeystoreLeaseCrypto {
+    private const val KEY_ALIAS = "refocus_auth_lease_keystore_key"
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val GCM_TAG_LENGTH_BITS = 128
+    private const val IV_LENGTH_BYTES = 12
+
+    fun encrypt(plaintext: String): String {
+        return try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (!keyStore.containsAlias(KEY_ALIAS)) {
+                val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+                val spec = KeyGenParameterSpec.Builder(
+                    KEY_ALIAS,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+                keyGen.init(spec)
+                keyGen.generateKey()
+            }
+            val secretKey = keyStore.getKey(KEY_ALIAS, null) as SecretKey
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val iv = cipher.iv
+            val encryptedBytes = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+            val combined = ByteArray(iv.size + encryptedBytes.size)
+            System.arraycopy(iv, 0, combined, 0, iv.size)
+            System.arraycopy(encryptedBytes, 0, combined, iv.size, encryptedBytes.size)
+            "enc:" + Base64.getEncoder().encodeToString(combined)
+        } catch (t: Throwable) {
+            // Fall back to plaintext if AndroidKeyStore is unavailable (e.g. JVM unit test)
+            plaintext
+        }
+    }
+
+    fun decrypt(stored: String): String {
+        if (!stored.startsWith("enc:")) {
+            // Plaintext JSON format (backward compatibility or test mode)
+            return stored
+        }
+        return try {
+            val combined = Base64.getDecoder().decode(stored.removePrefix("enc:"))
+            if (combined.size <= IV_LENGTH_BYTES) return ""
+            val iv = ByteArray(IV_LENGTH_BYTES)
+            val ciphertext = ByteArray(combined.size - IV_LENGTH_BYTES)
+            System.arraycopy(combined, 0, iv, 0, IV_LENGTH_BYTES)
+            System.arraycopy(combined, IV_LENGTH_BYTES, ciphertext, 0, ciphertext.size)
+
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            val secretKey = keyStore.getKey(KEY_ALIAS, null) as SecretKey
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, spec)
+            val decryptedBytes = cipher.doFinal(ciphertext)
+            String(decryptedBytes, Charsets.UTF_8)
+        } catch (t: Throwable) {
+            Log.w("AppAuthManager", "Keystore lease decryption failed: ${t.message}")
+            ""
         }
     }
 }

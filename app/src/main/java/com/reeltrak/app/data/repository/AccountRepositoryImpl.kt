@@ -7,19 +7,24 @@ import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Source
+import com.reeltrak.app.core.di.ApplicationScope
 import com.reeltrak.app.domain.models.AccountAccessInfo
 import com.reeltrak.app.domain.models.AccountStatus
 import com.reeltrak.app.domain.models.AccountType
 import com.reeltrak.app.domain.repository.AccountRepository
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -32,10 +37,25 @@ import javax.inject.Singleton
 @Singleton
 class AccountRepositoryImpl @Inject constructor(
     private val firestore: FirebaseFirestore,
-    private val httpClient: okhttp3.OkHttpClient
+    private val httpClient: okhttp3.OkHttpClient,
+    @ApplicationScope externalScope: CoroutineScope
 ) : AccountRepository {
 
+    internal var repositoryScope: CoroutineScope = externalScope
+
+    constructor(
+        firestore: FirebaseFirestore,
+        httpClient: okhttp3.OkHttpClient
+    ) : this(firestore, httpClient, CoroutineScope(SupervisorJob() + Dispatchers.IO))
+
     private val TAG = "AccountRepo"
+
+    @Volatile
+    private var lastServerVerifiedInfo: AccountAccessInfo? = null
+    @Volatile
+    private var lastServerVerifiedUid: String? = null
+    @Volatile
+    private var lastServerVerifiedElapsedRealtime: Long = 0L
 
     /**
      * Flow tracking Firebase Auth state transitions (login/logout/user changes).
@@ -57,6 +77,9 @@ class AccountRepositoryImpl @Inject constructor(
      */
     override val accountAccessInfo: Flow<AccountAccessInfo> = authStateFlow.flatMapLatest { uid ->
         if (uid.isNullOrBlank()) {
+            lastServerVerifiedInfo = null
+            lastServerVerifiedUid = null
+            lastServerVerifiedElapsedRealtime = 0L
             flowOf(AccountAccessInfo.DEFAULT)
         } else {
             callbackFlow<AccountAccessInfo> {
@@ -95,9 +118,21 @@ class AccountRepositoryImpl @Inject constructor(
                             deletionRequestedAt = requestedAt,
                             isLoading = false
                         )
-                        Log.d(TAG, "Real-time accountAccessInfo update for $uid: status=$status, type=$type, scheduledFor=$scheduledFor")
+                        val isFromCache = snapshot.metadata.isFromCache
+                        if (!isFromCache) {
+                            lastServerVerifiedInfo = info
+                            lastServerVerifiedUid = uid
+                            lastServerVerifiedElapsedRealtime = android.os.SystemClock.elapsedRealtime()
+                        }
+                        Log.d(TAG, "Real-time accountAccessInfo update for $uid: status=$status, type=$type, scheduledFor=$scheduledFor, isFromCache=$isFromCache")
                         trySend(info)
                     } else {
+                        val isFromCache = snapshot?.metadata?.isFromCache ?: false
+                        if (!isFromCache) {
+                            lastServerVerifiedInfo = AccountAccessInfo.DEFAULT
+                            lastServerVerifiedUid = uid
+                            lastServerVerifiedElapsedRealtime = android.os.SystemClock.elapsedRealtime()
+                        }
                         // Default to ACTIVE and NORMAL when no record exists
                         trySend(AccountAccessInfo.DEFAULT)
                     }
@@ -107,6 +142,11 @@ class AccountRepositoryImpl @Inject constructor(
             }
         }
     }.distinctUntilChanged()
+    .shareIn(
+        scope = repositoryScope,
+        started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5000, replayExpirationMillis = 0),
+        replay = 1
+    )
 
     private val workerBaseUrl = com.reeltrak.app.core.network.NetworkConstants.WORKER_BASE_URL
 
@@ -118,23 +158,20 @@ class AccountRepositoryImpl @Inject constructor(
     override val accountStatus: Flow<AccountStatus> = accountAccessInfo.map { it.accountStatus }.distinctUntilChanged()
 
     override suspend fun checkAccountAccessInfo(userId: String): Result<AccountAccessInfo> = withContext(Dispatchers.IO) {
+        val currentElapsed = android.os.SystemClock.elapsedRealtime()
+        if (lastServerVerifiedUid == userId && lastServerVerifiedInfo != null && (currentElapsed - lastServerVerifiedElapsedRealtime) < 15_000L) {
+            Log.d(TAG, "Reusing fresh server-verified accountAccessInfo for $userId (elapsed: ${currentElapsed - lastServerVerifiedElapsedRealtime}ms)")
+            return@withContext Result.success(lastServerVerifiedInfo!!)
+        }
+
         try {
-            val snapshot = withTimeout(5000L) {
-                try {
-                    firestore.collection("users")
-                        .document(userId)
-                        .collection("account")
-                        .document("status")
-                        .get(Source.CACHE)
-                        .await()
-                } catch (e: Exception) {
-                    firestore.collection("users")
-                        .document(userId)
-                        .collection("account")
-                        .document("status")
-                        .get(Source.SERVER)
-                        .await()
-                }
+            val snapshot = withTimeout(15000L) {
+                firestore.collection("users")
+                    .document(userId)
+                    .collection("account")
+                    .document("status")
+                    .get(Source.SERVER)
+                    .await()
             }
 
             if (snapshot.exists()) {
@@ -154,20 +191,34 @@ class AccountRepositoryImpl @Inject constructor(
                 } catch (e: Exception) {
                     snapshot.getLong("deletionRequestedAt")
                 }
-                Result.success(
-                    AccountAccessInfo(
-                        accountStatus = status,
-                        accountType = type,
-                        deletionScheduledFor = scheduledFor,
-                        deletionRequestedAt = requestedAt,
-                        isLoading = false
-                    )
+                val info = AccountAccessInfo(
+                    accountStatus = status,
+                    accountType = type,
+                    deletionScheduledFor = scheduledFor,
+                    deletionRequestedAt = requestedAt,
+                    isLoading = false
                 )
+                val isFromCache = snapshot.metadata.isFromCache
+                if (!isFromCache) {
+                    lastServerVerifiedInfo = info
+                    lastServerVerifiedUid = userId
+                    lastServerVerifiedElapsedRealtime = android.os.SystemClock.elapsedRealtime()
+                }
+                Result.success(info)
             } else {
+                val isFromCache = snapshot.metadata.isFromCache
+                if (!isFromCache) {
+                    lastServerVerifiedInfo = AccountAccessInfo.DEFAULT
+                    lastServerVerifiedUid = userId
+                    lastServerVerifiedElapsedRealtime = android.os.SystemClock.elapsedRealtime()
+                }
                 Result.success(AccountAccessInfo.DEFAULT)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to check accountAccessInfo from Firestore for $userId", e)
+            val projectId = try { firestore.app.options.projectId } catch (_: Exception) { "unknown" }
+            val firestoreCode = (e as? com.google.firebase.firestore.FirebaseFirestoreException)?.code?.name ?: "N/A"
+            val sanitizedUid = if (userId.length > 6) "${userId.take(3)}...${userId.takeLast(3)}" else "***"
+            Log.e(TAG, "checkAccountAccessInfo failed: projectId=$projectId, firestoreCode=$firestoreCode, exception=[${e.javaClass.simpleName}] ${e.message}, uid=$sanitizedUid", e)
             Result.failure(e)
         }
     }

@@ -225,6 +225,8 @@ private fun PremiumExperienceContent(
             isExpired = isExpired,
             remainingDurationMs = remainingDurationMs,
             checkoutState = checkoutState,
+            isRefreshing = isRefreshing,
+            onRestoreClick = onRefreshClick,
             onUpgradeClick = { onSubscribeClick(SubscriptionPlan.MONTHLY) }
         )
     }
@@ -487,6 +489,8 @@ private fun SalesAndUpgradeModule(
     isExpired: Boolean,
     remainingDurationMs: Long,
     checkoutState: CheckoutState,
+    isRefreshing: Boolean = false,
+    onRestoreClick: () -> Unit = {},
     onUpgradeClick: () -> Unit
 ) {
     val colors = ReFocusTheme.colors
@@ -702,6 +706,27 @@ private fun SalesAndUpgradeModule(
                     enabled = !isProcessing,
                     height = 56.dp
                 )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    androidx.compose.material3.TextButton(
+                        onClick = onRestoreClick,
+                        enabled = !isProcessing && !isRefreshing
+                    ) {
+                        Text(
+                            text = if (isRefreshing) "RESTORING PURCHASES..." else "ALREADY SUBSCRIBED? RESTORE PURCHASES",
+                            style = ReFocusTheme.Typography.SectionTitle.copy(
+                                fontSize = 11.sp,
+                                color = colors.inkSecondary,
+                                letterSpacing = 1.sp
+                            )
+                        )
+                    }
+                }
             }
         }
     }
@@ -804,6 +829,8 @@ private fun CheckoutStatusModule(checkoutState: CheckoutState, onReset: () -> Un
     val colors = ReFocusTheme.colors
 
     AnimatedVisibility(visible = checkoutState is CheckoutState.Error) {
+        val message = (checkoutState as? CheckoutState.Error)?.message
+            ?: "We could not confirm the payment state. Check your subscription status before retrying."
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -818,7 +845,7 @@ private fun CheckoutStatusModule(checkoutState: CheckoutState, onReset: () -> Un
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "PAYMENT INCOMPLETE",
+                        text = "PAYMENT STATUS",
                         style = ReFocusTheme.Typography.SectionTitle.copy(
                             color = colors.destructive,
                             fontSize = 11.sp,
@@ -827,7 +854,7 @@ private fun CheckoutStatusModule(checkoutState: CheckoutState, onReset: () -> Un
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "No charges were settled. You can re-attempt authorization anytime.",
+                        text = message,
                         style = ReFocusTheme.Typography.Body.copy(
                             fontSize = 12.sp,
                             color = colors.inkSecondary
@@ -864,7 +891,7 @@ private fun CheckoutStatusModule(checkoutState: CheckoutState, onReset: () -> Un
             ) {
                 Column {
                     Text(
-                        text = "MANDATE AUTHORIZED",
+                        text = "SUBSCRIPTION PENDING",
                         style = ReFocusTheme.Typography.SectionTitle.copy(
                             color = colors.accentLimeDark,
                             fontSize = 11.sp,

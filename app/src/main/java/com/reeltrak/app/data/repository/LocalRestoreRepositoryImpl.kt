@@ -13,6 +13,7 @@ import com.reeltrak.app.data.local.dao.LocalRestoreJournalDao
 import com.reeltrak.app.data.local.database.ReelTrakDatabase
 import com.reeltrak.app.data.local.entity.DailyReelData
 import com.reeltrak.app.data.local.entity.LocalRestoreJournal
+import com.reeltrak.app.data.local.entity.ReelCountAccountScope
 import com.reeltrak.app.data.remote.dto.CloudSnapshotRecordDto
 import com.reeltrak.app.data.remote.dto.RestoreResult
 import com.reeltrak.app.domain.managers.SubscriptionManager
@@ -81,6 +82,10 @@ class LocalRestoreRepositoryImpl @Inject constructor(
         }
 
         val uid = user.uid
+        val accountScope = ReelCountAccountScope.fromUid(uid)
+        if (ReelCountAccountScope.current != accountScope) {
+            return@withContext RestoreResult.Ineligible("Local account data is still switching. Please retry after sign-in completes.")
+        }
         if (!subscriptionManagerLazy.get().hasActiveEntitlementNow()) {
             Log.w(TAG, "Restore aborted: User does not have active subscription or trial.")
             return@withContext RestoreResult.Ineligible("Cloud Restore requires an active Trial or Premium subscription.")
@@ -105,7 +110,7 @@ class LocalRestoreRepositoryImpl @Inject constructor(
             Log.i(TAG, "Restore attempt $idempotencyKey was already committed locally. Skipping Room merging.")
             if (existingJournal.datastoreSynced == 0) {
                 existingJournal.restoredDailyLimit?.let { limit ->
-                    if (limit > 0) preferencesRepository.setDefaultDailyLimit(limit)
+                    if (limit > 0) preferencesRepository.setDefaultDailyLimitForScope(existingJournal.accountScope, limit)
                 }
                 localRestoreJournalDao.markDataStoreSynced(idempotencyKey)
             }
@@ -203,17 +208,86 @@ class LocalRestoreRepositoryImpl @Inject constructor(
         }
 
         // Stage 2: Download & In-Memory Verification
-        val rawDailyRecords = reservationJson.optJSONArray("dailyRecords") ?: JSONArray()
-        val parsedRecords = mutableListOf<CloudSnapshotRecordDto>()
+        val totalChunks = reservationJson.optInt("totalChunks", 1)
+        val expectedTotalRecords = reservationJson.optInt("totalRecords", -1)
+        val allRecordObjects = mutableListOf<JSONObject>()
 
         try {
-            for (i in 0 until rawDailyRecords.length()) {
-                val obj = rawDailyRecords.getJSONObject(i)
+            if (totalChunks > 1) {
+                // Multi-Chunk Download
+                Log.d(TAG, "Initiating multi-chunk restore download: totalChunks=$totalChunks, expectedRecords=$expectedTotalRecords")
+                for (chunkIdx in 0 until totalChunks) {
+                    val chunkUrl = "$workerBaseUrl/api/restore/chunk?idempotencyKey=$idempotencyKey&backupId=$backupId&chunkIndex=$chunkIdx"
+                    val chunkReq = Request.Builder()
+                        .url(chunkUrl)
+                        .header("Authorization", "Bearer $token")
+                        .get()
+                        .build()
+                    val chunkRes = httpClient.newCall(chunkReq).execute()
+                    if (!chunkRes.isSuccessful) {
+                        val chunkCode = chunkRes.code
+                        val chunkBody = chunkRes.body?.string() ?: ""
+                        Log.e(TAG, "Chunk $chunkIdx download failed (HTTP $chunkCode): $chunkBody")
+                        abortPendingRestore(idempotencyKey, backupId, "CHUNK_DOWNLOAD_FAILED_HTTP_$chunkCode")
+                        return@withContext RestoreResult.Error("Failed downloading restore chunk $chunkIdx (HTTP $chunkCode)")
+                    }
+                    val chunkJson = JSONObject(chunkRes.body?.string() ?: "{}")
+                    val reportedChunkIdx = chunkJson.optInt("chunkIndex", -1)
+                    if (reportedChunkIdx != chunkIdx) {
+                        Log.e(TAG, "Chunk index mismatch: expected $chunkIdx, got $reportedChunkIdx")
+                        abortPendingRestore(idempotencyKey, backupId, "CHUNK_INDEX_MISMATCH")
+                        return@withContext RestoreResult.Error("Restore chunk index mismatch: expected $chunkIdx, got $reportedChunkIdx")
+                    }
+                    val chunkArray = chunkJson.optJSONArray("records") ?: chunkJson.optJSONArray("dailyRecords")
+                    if (chunkArray == null) {
+                        Log.e(TAG, "Chunk $chunkIdx missing records array")
+                        abortPendingRestore(idempotencyKey, backupId, "CHUNK_RECORDS_MISSING")
+                        return@withContext RestoreResult.Error("Restore chunk $chunkIdx missing records array")
+                    }
+                    for (j in 0 until chunkArray.length()) {
+                        allRecordObjects.add(chunkArray.getJSONObject(j))
+                    }
+                }
+
+                if (expectedTotalRecords >= 0 && allRecordObjects.size != expectedTotalRecords) {
+                    Log.e(TAG, "Total record count mismatch in multi-chunk restore: expected $expectedTotalRecords, fetched ${allRecordObjects.size}")
+                    abortPendingRestore(idempotencyKey, backupId, "CHUNK_RECORD_COUNT_MISMATCH")
+                    return@withContext RestoreResult.Error("Multi-chunk restore record count mismatch: expected $expectedTotalRecords, fetched ${allRecordObjects.size}")
+                }
+            } else {
+                // Single-chunk / legacy payload from reservation response
+                val rawDailyRecords = reservationJson.optJSONArray("dailyRecords")
+                    ?: reservationJson.optJSONArray("records")
+                    ?: JSONArray()
+                for (i in 0 until rawDailyRecords.length()) {
+                    allRecordObjects.add(rawDailyRecords.getJSONObject(i))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Multi-chunk download exception: ${e.message}")
+            abortPendingRestore(idempotencyKey, backupId, "CHUNK_DOWNLOAD_EXCEPTION")
+            return@withContext RestoreResult.Error("Failed downloading restore chunks", e)
+        }
+
+        val parsedRecords = mutableListOf<CloudSnapshotRecordDto>()
+        val seenDates = mutableSetOf<String>()
+
+        try {
+            for (obj in allRecordObjects) {
                 val dateStr = obj.optString("dateString")
                 if (!DATE_REGEX.matches(dateStr)) {
                     throw IllegalArgumentException("Invalid date format in snapshot record: $dateStr")
                 }
-                val count = obj.optInt("count", obj.optInt("totalReelsCount", 0)).coerceAtLeast(0)
+                if (!seenDates.add(dateStr)) {
+                    throw IllegalArgumentException("Duplicate date record in snapshot: $dateStr")
+                }
+
+                // Priority 3: Count normalization with positive precedence
+                val rawCount = if (obj.has("count") && !obj.isNull("count")) obj.optInt("count") else null
+                val rawTotal = if (obj.has("totalReelsCount") && !obj.isNull("totalReelsCount")) obj.optInt("totalReelsCount") else null
+
+                val resolvedCount = com.reeltrak.app.data.remote.dto.normalizeReelCount(rawTotal, rawCount)
+
                 val dailyGoal = obj.optInt("dailyGoal", 0).coerceAtLeast(0)
                 val isSkullDay = obj.optBoolean("isSkullDay", false)
                 val isStrictModeOn = obj.optBoolean("isStrictModeOn", true)
@@ -224,8 +298,8 @@ class LocalRestoreRepositoryImpl @Inject constructor(
                 parsedRecords.add(
                     CloudSnapshotRecordDto(
                         dateString = dateStr,
-                        count = count,
-                        totalReelsCount = count,
+                        count = resolvedCount,
+                        totalReelsCount = resolvedCount,
                         dailyGoal = dailyGoal,
                         isSkullDay = isSkullDay,
                         isStrictModeOn = isStrictModeOn,
@@ -248,34 +322,42 @@ class LocalRestoreRepositoryImpl @Inject constructor(
 
         try {
             database.withTransaction {
+                check(ReelCountAccountScope.current == accountScope) {
+                    "Authenticated account changed while restore was in progress."
+                }
                 // Keep the accepted-transition marker across restore. The restore can preserve
                 // or merge today's locally counted reels; deleting the marker here would let a
                 // replay of the active transition increment that restored daily count again.
+                // NON-DESTRUCTIVE MERGE SEMANTICS:
+                // Historical local dates absent from the backup are intentionally preserved in Room,
+                // guaranteeing user data is never destroyed by a partial or segmented cloud snapshot.
                 for (cloudRec in parsedRecords) {
                     val date = cloudRec.dateString
                     val localRec = dailyReelDataDao.getDailyDataSync(date)
 
                     if (date == todayStr) {
-                        // Section 5.5: Today's record -> LOCAL WINS if local has tracked reels
-                        if (localRec != null && localRec.totalReelsCount > 0) {
-                            Log.d(TAG, "Merge policy: Today's tracking preserved locally ($date, local=${localRec.totalReelsCount})")
-                            continue
-                        } else {
-                            // If local is absent or count == 0, adopt cloud today
-                            val newToday = DailyReelData(
-                                dateString = date,
-                                totalReelsCount = cloudRec.effectiveCount,
-                                totalTimeSpentMillis = cloudRec.totalTimeSpentMillis,
-                                dailyGoal = cloudRec.dailyGoal,
-                                isSkullDay = cloudRec.isSkullDay,
-                                isStrictModeOn = cloudRec.isStrictModeOn,
-                                isStrictModeLocked = cloudRec.isStrictModeLocked,
-                                isLimitLocked = cloudRec.isLimitLocked,
-                                syncStatus = 0
-                            )
-                            dailyReelDataDao.insertOrReplace(newToday)
-                            recordsRestoredCount++
-                        }
+                        // Section 5.5: Today's record -> Protect local reels tracked today,
+                        // but adopt higher cloud count if cloud > local.
+                        val localCount = localRec?.totalReelsCount ?: 0
+                        val cloudCount = cloudRec.effectiveCount
+                        val resolvedTodayCount = maxOf(localCount, cloudCount)
+                        val resolvedTodayTime = maxOf(localRec?.totalTimeSpentMillis ?: 0L, cloudRec.totalTimeSpentMillis)
+                        val resolvedGoal = if (cloudRec.dailyGoal > 0) cloudRec.dailyGoal else (localRec?.dailyGoal ?: 0)
+
+                        val newToday = DailyReelData(
+                            dateString = date,
+                            totalReelsCount = resolvedTodayCount,
+                            totalTimeSpentMillis = resolvedTodayTime,
+                            dailyGoal = resolvedGoal,
+                            isSkullDay = (localRec?.isSkullDay == true) || cloudRec.isSkullDay,
+                            isStrictModeOn = cloudRec.isStrictModeOn,
+                            isStrictModeLocked = (localRec?.isStrictModeLocked == true) || cloudRec.isStrictModeLocked,
+                            isLimitLocked = (localRec?.isLimitLocked == true) || cloudRec.isLimitLocked,
+                            syncStatus = if (localRec != null && localCount > cloudCount) 1 else 0,
+                            accountScope = accountScope
+                        )
+                        dailyReelDataDao.insertOrReplace(newToday)
+                        recordsRestoredCount++
                     } else {
                         // Historical record (date < todayStr)
                         if (localRec == null) {
@@ -289,22 +371,38 @@ class LocalRestoreRepositoryImpl @Inject constructor(
                                 isStrictModeOn = cloudRec.isStrictModeOn,
                                 isStrictModeLocked = cloudRec.isStrictModeLocked,
                                 isLimitLocked = cloudRec.isLimitLocked,
-                                syncStatus = 0
+                                syncStatus = 0,
+                                accountScope = accountScope
                             )
                             dailyReelDataDao.insertOrReplace(newHistorical)
                             recordsRestoredCount++
                         } else {
                             if (localRec.syncStatus == 0) {
-                                // Synced historical -> CLOUD WINS
+                                // Synced historical -> CLOUD WINS, EXCEPT NEVER overwrite valid local reel count with zero
+                                val effectiveCloudCount = cloudRec.effectiveCount
+                                val resolvedCount = if (effectiveCloudCount > 0) {
+                                    effectiveCloudCount
+                                } else if (localRec.totalReelsCount > 0) {
+                                    Log.w(TAG, "Prevented zero-wiping local count for $date: local=${localRec.totalReelsCount}, cloud=$effectiveCloudCount")
+                                    localRec.totalReelsCount
+                                } else {
+                                    0
+                                }
+                                val resolvedTimeSpent = if (cloudRec.totalTimeSpentMillis > 0L) {
+                                    cloudRec.totalTimeSpentMillis
+                                } else {
+                                    localRec.totalTimeSpentMillis
+                                }
                                 val updatedHistorical = localRec.copy(
-                                    totalReelsCount = cloudRec.effectiveCount,
-                                    totalTimeSpentMillis = cloudRec.totalTimeSpentMillis,
-                                    dailyGoal = cloudRec.dailyGoal,
-                                    isSkullDay = cloudRec.isSkullDay,
+                                    totalReelsCount = resolvedCount,
+                                    totalTimeSpentMillis = resolvedTimeSpent,
+                                    dailyGoal = if (cloudRec.dailyGoal > 0) cloudRec.dailyGoal else localRec.dailyGoal,
+                                    isSkullDay = cloudRec.isSkullDay || localRec.isSkullDay,
                                     isStrictModeOn = cloudRec.isStrictModeOn,
                                     isStrictModeLocked = cloudRec.isStrictModeLocked,
                                     isLimitLocked = cloudRec.isLimitLocked,
-                                    syncStatus = 0
+                                    syncStatus = 0,
+                                    accountScope = accountScope
                                 )
                                 dailyReelDataDao.insertOrReplace(updatedHistorical)
                                 recordsRestoredCount++
@@ -313,8 +411,13 @@ class LocalRestoreRepositoryImpl @Inject constructor(
                                 val mergedHistorical = localRec.copy(
                                     totalReelsCount = maxOf(localRec.totalReelsCount, cloudRec.effectiveCount),
                                     totalTimeSpentMillis = maxOf(localRec.totalTimeSpentMillis, cloudRec.totalTimeSpentMillis),
+                                    dailyGoal = if (cloudRec.dailyGoal > 0) cloudRec.dailyGoal else localRec.dailyGoal,
+                                    isSkullDay = localRec.isSkullDay || cloudRec.isSkullDay,
                                     isStrictModeOn = localRec.isStrictModeOn || cloudRec.isStrictModeOn,
-                                    syncStatus = 1
+                                    isStrictModeLocked = localRec.isStrictModeLocked || cloudRec.isStrictModeLocked,
+                                    isLimitLocked = localRec.isLimitLocked || cloudRec.isLimitLocked,
+                                    syncStatus = 1,
+                                    accountScope = accountScope
                                 )
                                 dailyReelDataDao.insertOrReplace(mergedHistorical)
                                 recordsRestoredCount++
@@ -332,7 +435,8 @@ class LocalRestoreRepositoryImpl @Inject constructor(
                     recordsRestored = recordsRestoredCount,
                     restoredDailyLimit = restoredDailyLimit,
                     ackStatus = LocalRestoreJournal.STATUS_PENDING_ACK,
-                    datastoreSynced = 0
+                    datastoreSynced = 0,
+                    accountScope = accountScope
                 )
                 localRestoreJournalDao.insert(journal)
             }
@@ -348,7 +452,7 @@ class LocalRestoreRepositoryImpl @Inject constructor(
         // Stage 4: Post-Commit DataStore Outbox Flush & Journal Latch
         try {
             if (restoredDailyLimit != null && restoredDailyLimit > 0) {
-                preferencesRepository.setDefaultDailyLimit(restoredDailyLimit)
+                preferencesRepository.setDefaultDailyLimitForScope(accountScope, restoredDailyLimit)
             }
             preferencesRepository.setLastRestoreTime(System.currentTimeMillis())
             preferencesRepository.setCurrentRestoreRequestId(null)

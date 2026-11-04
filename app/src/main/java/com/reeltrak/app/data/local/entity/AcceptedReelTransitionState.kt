@@ -42,6 +42,21 @@ data class AcceptedReelTransitionState(
 
 /** Stable, non-reversible account namespace for local transition idempotency records. */
 object ReelCountAccountScope {
+    private val activeScope = kotlinx.coroutines.flow.MutableStateFlow("local")
+
+    val currentFlow: kotlinx.coroutines.flow.StateFlow<String> = activeScope
+
+    val current: String
+        get() = activeScope.value
+
+    fun setCurrent(scope: String) {
+        activeScope.value = scope.ifBlank { "local" }
+    }
+
+    fun activateUid(uid: String?) {
+        setCurrent(fromUid(uid))
+    }
+
     fun fromUid(uid: String?): String {
         if (uid.isNullOrBlank()) return "local"
         val digest = java.security.MessageDigest.getInstance("SHA-256")

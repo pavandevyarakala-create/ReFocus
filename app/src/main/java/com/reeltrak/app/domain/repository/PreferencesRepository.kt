@@ -33,6 +33,9 @@ interface PreferencesRepository {
     suspend fun setBadgeDialogShown(milestone: Int, shown: Boolean)
 
     suspend fun setDefaultDailyLimit(limit: Int)
+    suspend fun setDefaultDailyLimitForScope(accountScope: String, limit: Int) {
+        setDefaultDailyLimit(limit)
+    }
     suspend fun setLastLimitChangeDate(date: Long)
     suspend fun setLastDailySummaryDate(date: Long)
     

@@ -36,7 +36,7 @@ class RestoreReconciler @Inject constructor(
                 Log.i(TAG, "Reconciling unlatched restore journal for ${entry.idempotencyKey} (DataStore sync pending)")
                 val limit = entry.restoredDailyLimit
                 if (limit != null && limit > 0) {
-                    preferencesRepository.setDefaultDailyLimit(limit)
+                    preferencesRepository.setDefaultDailyLimitForScope(entry.accountScope, limit)
                 }
                 localRestoreJournalDao.markDataStoreSynced(entry.idempotencyKey)
                 RestoreAckWorker.enqueue(context, entry.idempotencyKey)

@@ -8,15 +8,17 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.reeltrak.app.domain.repository.PreferencesRepository
+import com.reeltrak.app.data.local.entity.ReelCountAccountScope
 import com.reeltrak.app.data.security.authorization.AppAuthorizationManager
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
 
-private val Context.dataStore by preferencesDataStore(name = "settings")
+val Context.dataStore by preferencesDataStore(name = "settings")
 
 @Singleton
 class PreferencesRepositoryImpl @Inject constructor(
@@ -40,6 +42,11 @@ class PreferencesRepositoryImpl @Inject constructor(
     private val DEFAULT_DAILY_LIMIT_KEY = intPreferencesKey("default_daily_limit")
     private val LAST_LIMIT_CHANGE_DATE_KEY = longPreferencesKey("last_limit_change_date")
     private val LAST_DAILY_SUMMARY_DATE_KEY = longPreferencesKey("last_daily_summary_date")
+
+    private fun scopedIntKey(scope: String, name: String) = intPreferencesKey("account_${scope}_$name")
+    private fun scopedLongKey(scope: String, name: String) = longPreferencesKey("account_${scope}_$name")
+    private fun scopedBooleanKey(scope: String, name: String) = booleanPreferencesKey("account_${scope}_$name")
+    private fun scopedStringKey(scope: String, name: String) = stringPreferencesKey("account_${scope}_$name")
     
     private val NOTIFICATIONS_ENABLED_KEY = booleanPreferencesKey("notifications_enabled")
     private val THEME_MODE_KEY = stringPreferencesKey("theme_mode")
@@ -153,25 +160,34 @@ class PreferencesRepositoryImpl @Inject constructor(
     }
 
 
-    override val isStrictModeLocked: Flow<Boolean> = context.dataStore.data
-        .map { preferences -> preferences[STRICT_MODE_LOCKED_KEY] ?: false }
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val isStrictModeLocked: Flow<Boolean> = ReelCountAccountScope.currentFlow.flatMapLatest { scope ->
+        context.dataStore.data.map { preferences -> preferences[scopedBooleanKey(scope, "strict_mode_locked")] ?: preferences[STRICT_MODE_LOCKED_KEY] ?: false }
+    }
 
     override suspend fun setStrictModeLocked(locked: Boolean) {
-        context.dataStore.edit { preferences -> preferences[STRICT_MODE_LOCKED_KEY] = locked }
+        val key = scopedBooleanKey(ReelCountAccountScope.current, "strict_mode_locked")
+        context.dataStore.edit { preferences -> preferences[key] = locked }
     }
 
-    override val lastStrictModeOffDate: Flow<String?> = context.dataStore.data
-        .map { preferences -> preferences[LAST_STRICT_MODE_OFF_DATE_KEY] }
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val lastStrictModeOffDate: Flow<String?> = ReelCountAccountScope.currentFlow.flatMapLatest { scope ->
+        context.dataStore.data.map { preferences -> preferences[scopedStringKey(scope, "last_strict_mode_off_date")] ?: preferences[LAST_STRICT_MODE_OFF_DATE_KEY] }
+    }
 
     override suspend fun setLastStrictModeOffDate(date: String) {
-        context.dataStore.edit { preferences -> preferences[LAST_STRICT_MODE_OFF_DATE_KEY] = date }
+        val key = scopedStringKey(ReelCountAccountScope.current, "last_strict_mode_off_date")
+        context.dataStore.edit { preferences -> preferences[key] = date }
     }
 
-    override val lastLockEpochDay: Flow<Long> = context.dataStore.data
-        .map { preferences -> preferences[LAST_LOCK_EPOCH_DAY_KEY] ?: 0L }
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val lastLockEpochDay: Flow<Long> = ReelCountAccountScope.currentFlow.flatMapLatest { scope ->
+        context.dataStore.data.map { preferences -> preferences[scopedLongKey(scope, "last_lock_epoch_day")] ?: preferences[LAST_LOCK_EPOCH_DAY_KEY] ?: 0L }
+    }
 
     override suspend fun setLastLockEpochDay(day: Long) {
-        context.dataStore.edit { preferences -> preferences[LAST_LOCK_EPOCH_DAY_KEY] = day }
+        val key = scopedLongKey(ReelCountAccountScope.current, "last_lock_epoch_day")
+        context.dataStore.edit { preferences -> preferences[key] = day }
     }
 
     override val firstRunDate: Flow<Long> = context.dataStore.data
@@ -196,20 +212,22 @@ class PreferencesRepositoryImpl @Inject constructor(
         }
     }
 
-    override val isDailyLimitLocked: Flow<Boolean> = context.dataStore.data
-        .map { preferences ->
-            preferences[DAILY_LIMIT_LOCKED_KEY] ?: false
-        }
-
-    override suspend fun setDailyLimitLocked(locked: Boolean) {
-        context.dataStore.edit { preferences ->
-            preferences[DAILY_LIMIT_LOCKED_KEY] = locked
-        }
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val isDailyLimitLocked: Flow<Boolean> = ReelCountAccountScope.currentFlow.flatMapLatest { scope ->
+        context.dataStore.data.map { preferences -> preferences[scopedBooleanKey(scope, "daily_limit_locked")] ?: preferences[DAILY_LIMIT_LOCKED_KEY] ?: false }
     }
 
-    override val defaultDailyLimit: Flow<Int> = context.dataStore.data
-        .map { preferences ->
-            preferences[DEFAULT_DAILY_LIMIT_KEY] ?: -1
+    override suspend fun setDailyLimitLocked(locked: Boolean) {
+        val key = scopedBooleanKey(ReelCountAccountScope.current, "daily_limit_locked")
+        context.dataStore.edit { preferences -> preferences[key] = locked }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val defaultDailyLimit: Flow<Int> = ReelCountAccountScope.currentFlow
+        .flatMapLatest { scope ->
+            context.dataStore.data.map { preferences ->
+                preferences[scopedIntKey(scope, "default_daily_limit")] ?: preferences[DEFAULT_DAILY_LIMIT_KEY] ?: -1
+            }
         }
 
     override suspend fun setDefaultDailyLimit(limit: Int) {
@@ -218,20 +236,30 @@ class PreferencesRepositoryImpl @Inject constructor(
             android.util.Log.w("PreferencesRepo", "setDefaultDailyLimit rejected: Daily Limit is a Trial/Premium-only feature. Current mode: ${authMgr.getOperationalMode()}")
             return
         }
+        val key = scopedIntKey(ReelCountAccountScope.current, "default_daily_limit")
         context.dataStore.edit { preferences ->
-            preferences[DEFAULT_DAILY_LIMIT_KEY] = limit
+            preferences[key] = limit
         }
     }
 
-    override val lastLimitChangeDate: Flow<Long> = context.dataStore.data
-        .map { preferences ->
-            preferences[LAST_LIMIT_CHANGE_DATE_KEY] ?: 0L
+    override suspend fun setDefaultDailyLimitForScope(accountScope: String, limit: Int) {
+        val authMgr = effectiveAuthManager
+        if (authMgr != null && !authMgr.getOperationalMode().isEntitled) {
+            android.util.Log.w("PreferencesRepo", "setDefaultDailyLimitForScope rejected: daily limit is not entitled")
+            return
         }
+        val key = scopedIntKey(accountScope, "default_daily_limit")
+        context.dataStore.edit { preferences -> preferences[key] = limit }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    override val lastLimitChangeDate: Flow<Long> = ReelCountAccountScope.currentFlow.flatMapLatest { scope ->
+        context.dataStore.data.map { preferences -> preferences[scopedLongKey(scope, "last_limit_change_date")] ?: preferences[LAST_LIMIT_CHANGE_DATE_KEY] ?: 0L }
+    }
 
     override suspend fun setLastLimitChangeDate(date: Long) {
-        context.dataStore.edit { preferences ->
-            preferences[LAST_LIMIT_CHANGE_DATE_KEY] = date
-        }
+        val key = scopedLongKey(ReelCountAccountScope.current, "last_limit_change_date")
+        context.dataStore.edit { preferences -> preferences[key] = date }
     }
 
     override val lastDailySummaryDate: Flow<Long> = context.dataStore.data
@@ -348,6 +376,8 @@ class PreferencesRepositoryImpl @Inject constructor(
         context.dataStore.edit { preferences ->
             val activeBackupId = preferences[CURRENT_BACKUP_REQUEST_ID_KEY]
             val activeRestoreId = preferences[CURRENT_RESTORE_REQUEST_ID_KEY]
+            val accountSettings = preferences.asMap()
+                .filterKeys { it.name.startsWith("account_") }
             preferences.clear()
             // Preserve active in-flight recovery identifiers across preference resets
             if (activeBackupId != null) {
@@ -355,6 +385,14 @@ class PreferencesRepositoryImpl @Inject constructor(
             }
             if (activeRestoreId != null) {
                 preferences[CURRENT_RESTORE_REQUEST_ID_KEY] = activeRestoreId
+            }
+            accountSettings.forEach { (key, value) ->
+                when (value) {
+                    is Int -> preferences[intPreferencesKey(key.name)] = value
+                    is Long -> preferences[longPreferencesKey(key.name)] = value
+                    is Boolean -> preferences[booleanPreferencesKey(key.name)] = value
+                    is String -> preferences[stringPreferencesKey(key.name)] = value
+                }
             }
         }
     }
@@ -382,16 +420,33 @@ class PreferencesRepositoryImpl @Inject constructor(
     override suspend fun getAllPreferencesSync(): Map<String, Any> {
         val prefs = context.dataStore.data.first()
         val result = mutableMapOf<String, Any>()
+        val accountScopedExportKeys = setOf(
+            DEFAULT_DAILY_LIMIT_KEY.name,
+            DAILY_LIMIT_LOCKED_KEY.name,
+            STRICT_MODE_LOCKED_KEY.name,
+            LAST_STRICT_MODE_OFF_DATE_KEY.name,
+            LAST_LOCK_EPOCH_DAY_KEY.name,
+            LAST_LIMIT_CHANGE_DATE_KEY.name
+        )
         
         for ((key, value) in prefs.asMap()) {
             // Skip auth identity and legacy token keys
             if (key.name != LEGACY_AUTH_ID_TOKEN_KEY.name && 
                 key.name != AUTH_EMAIL_KEY.name && 
                 key.name != AUTH_DISPLAY_NAME_KEY.name && 
-                key.name != AUTH_PROFILE_PICTURE_URI_KEY.name) {
+                key.name != AUTH_PROFILE_PICTURE_URI_KEY.name &&
+                !key.name.startsWith("account_") &&
+                key.name !in accountScopedExportKeys) {
                 result[key.name] = value
             }
         }
+        val scope = ReelCountAccountScope.current
+        (prefs[scopedIntKey(scope, "default_daily_limit")] ?: prefs[DEFAULT_DAILY_LIMIT_KEY])?.let { result[DEFAULT_DAILY_LIMIT_KEY.name] = it }
+        (prefs[scopedBooleanKey(scope, "daily_limit_locked")] ?: prefs[DAILY_LIMIT_LOCKED_KEY])?.let { result[DAILY_LIMIT_LOCKED_KEY.name] = it }
+        (prefs[scopedBooleanKey(scope, "strict_mode_locked")] ?: prefs[STRICT_MODE_LOCKED_KEY])?.let { result[STRICT_MODE_LOCKED_KEY.name] = it }
+        (prefs[scopedStringKey(scope, "last_strict_mode_off_date")] ?: prefs[LAST_STRICT_MODE_OFF_DATE_KEY])?.let { result[LAST_STRICT_MODE_OFF_DATE_KEY.name] = it }
+        (prefs[scopedLongKey(scope, "last_lock_epoch_day")] ?: prefs[LAST_LOCK_EPOCH_DAY_KEY])?.let { result[LAST_LOCK_EPOCH_DAY_KEY.name] = it }
+        (prefs[scopedLongKey(scope, "last_limit_change_date")] ?: prefs[LAST_LIMIT_CHANGE_DATE_KEY])?.let { result[LAST_LIMIT_CHANGE_DATE_KEY.name] = it }
         return result
     }
 
@@ -400,21 +455,36 @@ class PreferencesRepositoryImpl @Inject constructor(
             cloudData.forEach { (keyName, value) ->
                 when (keyName) {
                     "daily_intent", "default_daily_limit" -> {
-                        preferences[intPreferencesKey(keyName)] = (value as? Number)?.toInt() ?: 0
+                        val key = if (keyName == "default_daily_limit") {
+                            scopedIntKey(ReelCountAccountScope.current, "default_daily_limit")
+                        } else {
+                            intPreferencesKey(keyName)
+                        }
+                        preferences[key] = (value as? Number)?.toInt() ?: 0
                     }
                     "first_run_date", "goal_set_date", "last_lock_epoch_day", 
                     "last_limit_change_date", "last_daily_summary_date",
                     "badge_7_unlock_time", "badge_30_unlock_time", "badge_50_unlock_time", 
                     "badge_100_unlock_time", "badge_365_unlock_time" -> {
-                        preferences[longPreferencesKey(keyName)] = (value as? Number)?.toLong() ?: 0L
+                        val key = if (keyName == "last_lock_epoch_day" || keyName == "last_limit_change_date") {
+                            scopedLongKey(ReelCountAccountScope.current, keyName)
+                        } else {
+                            longPreferencesKey(keyName)
+                        }
+                        preferences[key] = (value as? Number)?.toLong() ?: 0L
                     }
                     "daily_limit_locked", "strict_mode_locked",
                     "badge_7_dialog_shown", "badge_30_dialog_shown", "badge_50_dialog_shown", 
                     "badge_100_dialog_shown", "badge_365_dialog_shown" -> {
-                        preferences[booleanPreferencesKey(keyName)] = value as? Boolean ?: false
+                        val key = if (keyName == "daily_limit_locked" || keyName == "strict_mode_locked") {
+                            scopedBooleanKey(ReelCountAccountScope.current, keyName)
+                        } else {
+                            booleanPreferencesKey(keyName)
+                        }
+                        preferences[key] = value as? Boolean ?: false
                     }
                     "last_strict_mode_off_date" -> {
-                        preferences[stringPreferencesKey(keyName)] = value as? String ?: ""
+                        preferences[scopedStringKey(ReelCountAccountScope.current, keyName)] = value as? String ?: ""
                     }
                 }
             }

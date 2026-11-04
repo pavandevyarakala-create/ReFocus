@@ -299,7 +299,7 @@ class StrictModeAndDailyResetTest {
         val file = findSourceFile("src/main/java/com/reeltrak/app/data/local/dao/DailyReelDataDao.kt")
         val content = file.readText()
         assertTrue("DailyReelDataDao clearHistoricalDataExcept preserves today's row", content.contains("clearHistoricalDataExcept"))
-        assertTrue("DailyReelDataDao does not wipe today", content.contains("WHERE dateString != :today"))
+        assertTrue("DailyReelDataDao does not wipe today", content.contains("dateString != :today"))
     }
 
     // I. Firebase sync cannot overwrite today's device-local strict state

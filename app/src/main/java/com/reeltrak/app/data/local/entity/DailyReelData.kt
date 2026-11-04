@@ -1,13 +1,12 @@
 package com.reeltrak.app.data.local.entity
 
 import androidx.room.Entity
-import androidx.room.PrimaryKey
+import androidx.room.ColumnInfo
 
 import com.reeltrak.app.domain.models.StrictModeDailyState
 
-@Entity(tableName = "daily_reel_data")
+@Entity(tableName = "daily_reel_data", primaryKeys = ["account_scope", "dateString"])
 data class DailyReelData(
-    @PrimaryKey
     val dateString: String = "", // Format: YYYY-MM-DD
     val totalReelsCount: Int = 0,
     val totalTimeSpentMillis: Long = 0L,
@@ -18,7 +17,9 @@ data class DailyReelData(
     val isLimitLocked: Boolean = false,
     val sessions: List<SessionData> = emptyList(),
     val updatedAt: Long = System.currentTimeMillis(),
-    val syncStatus: Int = 0 // 0 = SYNCED, 1 = PENDING
+    val syncStatus: Int = 0, // 0 = SYNCED, 1 = PENDING
+    @ColumnInfo(name = "account_scope")
+    val accountScope: String = ReelCountAccountScope.current
 )
 
 val DailyReelData.strictModeDailyState: StrictModeDailyState

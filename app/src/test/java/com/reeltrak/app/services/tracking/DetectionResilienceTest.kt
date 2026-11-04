@@ -38,16 +38,16 @@ class DetectionResilienceTest {
     }
 
     @Test
-    fun `repeated missing anchor confirms departure without increment`() {
+    fun `repeated missing anchor remains inconclusive until bounded recovery expires`() {
         val gate = InconclusiveSnapshotGate()
         val increments = mutableListOf<Int>()
         val ledger = TransitionLedger(onIncrement = { increments += 1 })
         val missingAnchor = snapshot(SnapshotClassification.INCONCLUSIVE)
 
         assertNull(gate.resolve(missingAnchor, 200L))
-        val confirmedAway = gate.resolve(missingAnchor, 200L)
-        assertEquals(SnapshotClassification.DISCARDED, confirmedAway?.classification)
-        assertTrue(ledger.process(confirmedAway!!))
+        val repeatedRead = gate.resolve(missingAnchor, 200L)
+        assertNull(repeatedRead)
+        assertTrue(gate.hasPendingRecovery())
         assertTrue(increments.isEmpty())
     }
 

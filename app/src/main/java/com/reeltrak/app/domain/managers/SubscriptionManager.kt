@@ -105,6 +105,8 @@ class SubscriptionManager @Inject constructor(
      */
     val remainingTrialDurationMs: StateFlow<Long> = remainingSubscriptionDurationMs
 
+    private val renewalRefreshAttempted = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /**
      * Real-time observable AccessState: INITIALIZING, TRIAL, ACTIVE, FINAL_SYNC_GRACE, or LOCKED.
      * Automatically transitions to FINAL_SYNC_GRACE or LOCKED when the server-anchored clock
@@ -139,6 +141,26 @@ class SubscriptionManager @Inject constructor(
             }
             if (targetEnd != null && targetEnd > 0L) {
                 if (authoritativeNow >= targetEnd) {
+                    // Trigger at most one online refresh to detect AutoPay renewal without retry loops
+                    if (renewalRefreshAttempted.compareAndSet(false, true)) {
+                        scope.launch {
+                            try {
+                                android.util.Log.d("STARTUP_DEBUG", "SubscriptionManager: Subscription reached expiry; checking server for AutoPay renewal")
+                                val result = refreshAuthorizationLease()
+                                if (result.isSuccess) {
+                                    val token = result.getOrThrow()
+                                    val (currentNow, _) = subscriptionTimeAuthority.getAuthoritativeSubscriptionTime()
+                                    val nowMs = if (currentNow > 0L) currentNow else System.currentTimeMillis()
+                                    if (token.expiresAtMs > nowMs) {
+                                        renewalRefreshAttempted.set(false)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.w("SubscriptionManager", "At-most-once online renewal check failed: ${e.message}")
+                            }
+                        }
+                    }
+
                     val FINAL_SYNC_WINDOW_MS = 2 * 60 * 1000L
                     val isEligibleForGrace = info.status != SubscriptionStatus.EXPIRED &&
                                              info.status != SubscriptionStatus.HALTED &&
@@ -149,6 +171,7 @@ class SubscriptionManager @Inject constructor(
                         AccessState.LOCKED
                     }
                 } else {
+                    renewalRefreshAttempted.set(false)
                     repoAccessState
                 }
             } else {
@@ -306,9 +329,14 @@ class SubscriptionManager @Inject constructor(
         val t0 = android.os.SystemClock.elapsedRealtime()
         android.util.Log.d("SUB_PERF", "[SUB_PERF] ensureAndAwaitEntitlement started")
         try {
-            ensureSubscriptionSync()
+            ensureSubscriptionSync(force = true)
         } catch (e: Exception) {
             android.util.Log.w("SubscriptionManager", "ensureSubscriptionSync failed: ${e.message}", e)
+        }
+        try {
+            refreshAuthorizationLease()
+        } catch (e: Exception) {
+            android.util.Log.w("SubscriptionManager", "refreshAuthorizationLease failed: ${e.message}", e)
         }
         try {
             refreshSubscription()
@@ -343,6 +371,13 @@ class SubscriptionManager @Inject constructor(
     }
 
     /**
+     * Reconciles and restores active recurring subscription with Razorpay and the backend worker.
+     */
+    suspend fun restoreSubscription(): Result<SubscriptionInfo> {
+        return subscriptionRepository.restoreSubscription()
+    }
+
+    /**
      * Cancels the active recurring subscription on the server at billing cycle end.
      */
     suspend fun cancelSubscription(): Result<Unit> {
@@ -360,6 +395,18 @@ class SubscriptionManager @Inject constructor(
      * Retrieves the current cryptographic, integrity-bound AuthorizationToken if active.
      */
     fun getActiveAuthorizationToken(): AuthorizationToken? = appAuthorizationManager?.activeToken
+
+    /**
+     * Refreshes the authoritative cryptographic authorization lease from the server and updates AppAuthorizationManager.
+     */
+    suspend fun refreshAuthorizationLease(): Result<AuthorizationToken> {
+        val result = subscriptionRepository.fetchAuthorizationLease()
+        if (result.isSuccess) {
+            val token = result.getOrThrow()
+            appAuthorizationManager?.updateServerLease(token)
+        }
+        return result
+    }
 
     /**
      * Direct access to AppAuthorizationManager for independent verification.

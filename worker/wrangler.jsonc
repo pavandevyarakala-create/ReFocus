@@ -12,11 +12,23 @@
     ]
   },
   "vars": {
+    "ENVIRONMENT": "production",
     "FIREBASE_PROJECT_ID": "refocus-504119",
     "FIREBASE_PROJECT_NUMBER": "524118238647",
     "APP_CHECK_ENFORCEMENT_MODE": "audit",
-    "RAZORPAY_PLAN_ID": "plan_TdtgehXIhzQ8U9"
+    "RAZORPAY_PLAN_ID": "plan_TdtgehXIhzQ8U9",
+    "REQUIRE_SHARED_RATE_LIMITER": "true"
   },
+  "ratelimits": [
+    {
+      "name": "RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    }
+  ],
   "env": {
     "staging": {
       "name": "refocus-razorpay-worker-staging",
@@ -24,11 +36,23 @@
         "crons": []
       },
       "vars": {
-        "FIREBASE_PROJECT_ID": "PLACEHOLDER_STAGING_FIREBASE_PROJECT_ID",
-        "FIREBASE_PROJECT_NUMBER": "PLACEHOLDER_STAGING_FIREBASE_PROJECT_NUMBER",
+        "ENVIRONMENT": "staging",
+        "FIREBASE_PROJECT_ID": "refocusstaging",
+        "FIREBASE_PROJECT_NUMBER": "555742442250",
         "APP_CHECK_ENFORCEMENT_MODE": "audit",
-        "RAZORPAY_PLAN_ID": "PLACEHOLDER_STAGING_RAZORPAY_TEST_PLAN_ID"
-      }
+        "RAZORPAY_PLAN_ID": "PLACEHOLDER_STAGING_RAZORPAY_PLAN_ID",
+        "REQUIRE_SHARED_RATE_LIMITER": "true"
+      },
+      "ratelimits": [
+        {
+          "name": "RATE_LIMITER",
+          "namespace_id": "1002",
+          "simple": {
+            "limit": 120,
+            "period": 60
+          }
+        }
+      ]
     }
   }
 }

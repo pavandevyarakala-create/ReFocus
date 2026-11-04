@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "account_tombstones",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "purgeState",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "updatedAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "daily_quota_claims",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "pinnedSnapshotId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "pinStatus",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

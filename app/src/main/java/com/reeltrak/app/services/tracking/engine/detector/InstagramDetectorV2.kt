@@ -41,7 +41,8 @@ class InstagramDetectorV2 : IReelDetector {
         val container: AccessibilityNodeInfo? = null,
         val overlayKind: InternalOverlayKind = InternalOverlayKind.NONE,
         val nodesVisited: Int = 0,
-        val wasTruncated: Boolean = false
+        val wasTruncated: Boolean = false,
+        val hasConfirmedNonReelSurface: Boolean = false
     )
 
     override fun analyze(rootNode: AccessibilityNodeInfo): DetectionSnapshot {
@@ -60,7 +61,8 @@ class InstagramDetectorV2 : IReelDetector {
         val firstDiscovery = findReelContainer(rootNode, viewportCenterX, viewportCenterY, MAX_SHALLOW_NODES)
         val discovery = if (firstDiscovery.container == null &&
             firstDiscovery.overlayKind == InternalOverlayKind.NONE &&
-            firstDiscovery.wasTruncated) {
+            firstDiscovery.wasTruncated &&
+            !firstDiscovery.hasConfirmedNonReelSurface) {
             findReelContainer(rootNode, viewportCenterX, viewportCenterY, MAX_RECOVERY_DISCOVERY_NODES)
         } else {
             firstDiscovery
@@ -79,11 +81,17 @@ class InstagramDetectorV2 : IReelDetector {
 
         val containerNode = discovery.container
         if (containerNode == null) {
-            return DetectionSnapshot(
+            val isConfirmedExit = discovery.hasConfirmedNonReelSurface
+            val classification = if (isConfirmedExit) {
+                SnapshotClassification.DISCARDED
+            } else {
                 // A missing anchor can mean either a confirmed non-Reel screen or a transiently
                 // incomplete accessibility hierarchy. Let the service perform one bounded re-read.
-                classification = SnapshotClassification.INCONCLUSIVE,
-                fingerprint = SemanticFingerprint("", "", ""),
+                SnapshotClassification.INCONCLUSIVE
+            }
+            return DetectionSnapshot(
+                classification = classification,
+                fingerprint = SemanticFingerprint("", "", "", platform = platformName),
                 platform = platformName,
                 nodeCount = discovery.nodesVisited,
                 isInternalOverlay = false
@@ -158,6 +166,20 @@ class InstagramDetectorV2 : IReelDetector {
         return snapshot
     }
 
+    private fun isConfirmedNonReelIdentifier(resId: String): Boolean {
+        if (resId.isEmpty()) return false
+        return resId.contains("feed_recycler", ignoreCase = true) ||
+            resId.contains("mainfeed", ignoreCase = true) ||
+            resId.contains("newsfeed", ignoreCase = true) ||
+            resId.contains("profile_pager", ignoreCase = true) ||
+            resId.contains("self_profile", ignoreCase = true) ||
+            resId.contains("search_grid", ignoreCase = true) ||
+            resId.contains("direct_inbox", ignoreCase = true) ||
+            resId.contains("direct_thread", ignoreCase = true) ||
+            resId.contains("row_feed", ignoreCase = true) ||
+            resId.contains("media_feed", ignoreCase = true)
+    }
+
     private fun findReelContainer(
         root: AccessibilityNodeInfo,
         centerX: Int,
@@ -167,6 +189,7 @@ class InstagramDetectorV2 : IReelDetector {
         val nodeBounds = android.graphics.Rect()
         var container: AccessibilityNodeInfo? = null
         var overlayKind = InternalOverlayKind.NONE
+        var hasConfirmedNonReelSurface = false
         val traversal = boundedAccessibilityBreadthFirst(
             root = root,
             maxNodes = maxShallowNodes,
@@ -190,6 +213,12 @@ class InstagramDetectorV2 : IReelDetector {
                 }
 
                 node.getBoundsInScreen(nodeBounds)
+                // A specific, visible content surface covering the viewport center is evidence;
+                // generic navigation/action-bar IDs and hidden retained nodes are not.
+                if (node.isVisibleToUser && nodeBounds.contains(centerX, centerY) &&
+                    isConfirmedNonReelIdentifier(resId)) {
+                    hasConfirmedNonReelSurface = true
+                }
                 val isCentered = nodeBounds.contains(centerX, centerY)
                 if (isCentered && (resId.contains("reels_viewer_root") || resId.contains("clips_viewer"))) {
                     container = node
@@ -203,7 +232,8 @@ class InstagramDetectorV2 : IReelDetector {
             container = container,
             overlayKind = overlayKind,
             nodesVisited = traversal.nodesVisited,
-            wasTruncated = traversal.wasTruncated
+            wasTruncated = traversal.wasTruncated,
+            hasConfirmedNonReelSurface = hasConfirmedNonReelSurface
         )
     }
 

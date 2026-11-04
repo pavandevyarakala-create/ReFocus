@@ -49,6 +49,10 @@ let serviceAccountTokenExpiry = 0;
 // Backup 24-Hour Restriction Window (Server-Authoritative)
 const BACKUP_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
 
+// Authoritative Razorpay Plan Pricing & Currency Constants (Monthly Autopay: ₹79/month)
+const EXPECTED_PLAN_AMOUNT_PAISE = 7900;
+const EXPECTED_PLAN_CURRENCY = "INR";
+
 // ---------------------------------------------------------------------------
 // 1. SECURITY HEADERS & CORS HELPERS
 // ---------------------------------------------------------------------------
@@ -57,7 +61,8 @@ const GLOBAL_SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
   "Referrer-Policy": "no-referrer",
-  "X-Frame-Options": "DENY"
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; sandbox"
 };
 
 function getCorsHeaders(request) {
@@ -116,44 +121,92 @@ function base64UrlEncode(buffer) {
 const rateLimitStore = new Map();
 const MAX_RATE_LIMIT_KEYS = 10000;
 
-function checkRateLimit(key, maxRequests, windowMs, record = true) {
+async function checkRateLimit(key, maxRequests, windowMs, options = {}, env = null) {
+  const record = typeof options === "boolean" ? options : (options.record !== undefined ? options.record : true);
+  const failClosed = typeof options === "object" && options.failClosed !== undefined ? options.failClosed : true;
+  const workerEnv = env || (typeof options === "object" ? options.env : null);
+
+  const requireShared = workerEnv?.REQUIRE_SHARED_RATE_LIMITER === "true";
+  const hasSharedLimiter = Boolean(workerEnv?.RATE_LIMITER && typeof workerEnv.RATE_LIMITER.limit === "function");
+
+  // 1. Strict shared enforcement: If shared rate limiting is required by policy, fail closed when missing
+  if (failClosed && requireShared && !hasSharedLimiter) {
+    console.error("Shared rate limiter required but binding is unavailable in environment");
+    return {
+      allowed: false,
+      unavailable: true,
+      retryAfterSec: 60
+    };
+  }
+
+  // 2. Cloudflare Native RateLimiter Binding (Atomic / Shared across edge if provisioned)
+  if (hasSharedLimiter && record) {
+    try {
+      const bindingResult = await workerEnv.RATE_LIMITER.limit({ key });
+      if (bindingResult && bindingResult.success === false) {
+        return {
+          allowed: false,
+          unavailable: false,
+          retryAfterSec: 60
+        };
+      }
+    } catch (bindingErr) {
+      console.error("Rate limiter binding error:", bindingErr?.name || "Error");
+      if (failClosed) {
+        return {
+          allowed: false,
+          unavailable: true,
+          retryAfterSec: 60
+        };
+      }
+    }
+  }
+
+  // 2. Sliding-Window In-Memory Limiter Engine (Per-Isolate)
   try {
     const now = Date.now();
-    const windowStart = now - windowMs;
+    let entry = rateLimitStore.get(key);
 
     if (rateLimitStore.size >= MAX_RATE_LIMIT_KEYS) {
-      let evicted = 0;
-      for (const [k, timestamps] of rateLimitStore.entries()) {
-        if (timestamps.length === 0 || timestamps[timestamps.length - 1] < windowStart) {
+      for (const [k, storedEntry] of rateLimitStore.entries()) {
+        const storedWindowMs = storedEntry.windowMs || windowMs;
+        const lastTimestamp = storedEntry.timestamps[storedEntry.timestamps.length - 1];
+        if (lastTimestamp === undefined || lastTimestamp <= now - storedWindowMs) {
           rateLimitStore.delete(k);
-          evicted++;
         }
-        if (evicted >= 500) break;
       }
 
-      // Hard bound fallback: if expired eviction did not free enough capacity, evict oldest entries
-      if (rateLimitStore.size >= MAX_RATE_LIMIT_KEYS) {
-        const excess = rateLimitStore.size - (MAX_RATE_LIMIT_KEYS - 500);
-        let count = 0;
-        for (const k of rateLimitStore.keys()) {
-          rateLimitStore.delete(k);
-          count++;
-          if (count >= excess) break;
+      entry = rateLimitStore.get(key);
+      if (record && !entry && rateLimitStore.size >= MAX_RATE_LIMIT_KEYS) {
+        let earliestExpiryMs = now + windowMs;
+        for (const storedEntry of rateLimitStore.values()) {
+          const lastTimestamp = storedEntry.timestamps[storedEntry.timestamps.length - 1];
+          if (lastTimestamp !== undefined) {
+            earliestExpiryMs = Math.min(earliestExpiryMs, lastTimestamp + (storedEntry.windowMs || windowMs));
+          }
         }
+        return {
+          allowed: false,
+          unavailable: false,
+          retryAfterSec: Math.max(1, Math.ceil((earliestExpiryMs - now) / 1000))
+        };
       }
     }
 
-    let timestamps = rateLimitStore.get(key) || [];
-    timestamps = timestamps.filter(ts => ts > windowStart);
+    if (!entry) entry = { timestamps: [], windowMs };
+    entry.windowMs = Math.max(entry.windowMs || 0, windowMs);
+    const windowStart = now - windowMs;
+    let timestamps = entry.timestamps.filter(ts => ts > windowStart);
 
     if (timestamps.length >= maxRequests) {
       const earliestTimestamp = timestamps[0];
       const retryAfterSec = Math.max(1, Math.ceil((earliestTimestamp + windowMs - now) / 1000));
-      // Re-insert to refresh position to MRU (tail), ensuring active blocked keys are never evicted
       rateLimitStore.delete(key);
-      rateLimitStore.set(key, timestamps);
+      entry.timestamps = timestamps;
+      rateLimitStore.set(key, entry);
       return {
         allowed: false,
+        unavailable: false,
         retryAfterSec: retryAfterSec
       };
     }
@@ -161,23 +214,31 @@ function checkRateLimit(key, maxRequests, windowMs, record = true) {
     if (record) {
       timestamps.push(now);
       rateLimitStore.delete(key);
-      rateLimitStore.set(key, timestamps);
+      entry.timestamps = timestamps;
+      rateLimitStore.set(key, entry);
     } else if (timestamps.length > 0) {
       rateLimitStore.delete(key);
-      rateLimitStore.set(key, timestamps);
+      entry.timestamps = timestamps;
+      rateLimitStore.set(key, entry);
     }
 
     return {
       allowed: true,
+      unavailable: false,
       retryAfterSec: 0
     };
   } catch (err) {
-    // Sanitize log: avoid leaking raw IP addresses or Firebase UIDs present in the rate limit key
     console.error("Rate limiter storage error:", err?.name || "Error");
-    // Fail safe on storage error: allow request to proceed so authentication and authorization can be evaluated,
-    // ensuring an outage never bypasses security checks.
+    if (failClosed) {
+      return {
+        allowed: false,
+        unavailable: true,
+        retryAfterSec: 60
+      };
+    }
     return {
       allowed: true,
+      unavailable: false,
       retryAfterSec: 0
     };
   }
@@ -389,8 +450,8 @@ async function verifyFirebaseAppCheckToken(appCheckToken, projectNumber, project
   }
 }
 
-async function validateAppCheck(request, env) {
-  const mode = env.APP_CHECK_ENFORCEMENT_MODE || "audit";
+async function validateAppCheck(request, env, options = {}) {
+  const mode = options.mode || env.APP_CHECK_ENFORCEMENT_MODE || "audit";
   if (mode === "disabled") return true;
 
   const appCheckToken = request.headers.get("X-Firebase-AppCheck");
@@ -514,7 +575,7 @@ async function getFirestoreSubscription(uid, env) {
     if (res.status === 200) {
       const doc = await res.json();
       const fields = doc.fields || {};
-      return { ...fields, exists: true, error: false, fields };
+      return { ...fields, exists: true, error: false, fields, updateTime: doc.updateTime };
     }
 
     if (res.status === 404) {
@@ -530,7 +591,7 @@ async function getFirestoreSubscription(uid, env) {
 }
 
 // Write subscription document to Firestore REST API (using PATCH for merging)
-async function updateFirestoreSubscription(uid, fields, env) {
+async function updateFirestoreSubscription(uid, fields, env, expectedUpdateTime = null) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!saKey) {
@@ -542,7 +603,10 @@ async function updateFirestoreSubscription(uid, fields, env) {
   const fieldNames = Object.keys(fields);
   const updateMaskParams = fieldNames.map(f => `updateMask.fieldPaths=${f}`).join("&");
 
-  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/subscription/status?${updateMaskParams}`;
+  let docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/subscription/status?${updateMaskParams}`;
+  if (expectedUpdateTime) {
+    docUrl += `&currentDocument.updateTime=${encodeURIComponent(expectedUpdateTime)}`;
+  }
 
   const res = await fetch(docUrl, {
     method: "PATCH",
@@ -555,7 +619,9 @@ async function updateFirestoreSubscription(uid, fields, env) {
 
   if (!res.ok) {
     const errorBody = await res.text();
-    throw new Error(`Firestore REST PATCH failed (${res.status}): ${errorBody}`);
+    const error = new Error(`Firestore REST PATCH failed (${res.status}): ${errorBody}`);
+    error.status = res.status;
+    throw error;
   }
 
   return await res.json();
@@ -1097,35 +1163,52 @@ async function getFirestoreDocument(docPath, env) {
   }
 }
 
-async function listFirestoreDocuments(collectionPath, env, pageSize = 500) {
+async function listFirestoreDocuments(collectionPath, env, maxRecords = 5000) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!saKey) return [];
 
+  const allDocuments = [];
+  let pageToken = null;
+  const pageSize = Math.min(300, maxRecords);
+
   try {
     const accessToken = await getGoogleServiceAccountAccessToken(saKey);
-    const listUrl = new URL(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collectionPath}`);
-    listUrl.searchParams.set("pageSize", pageSize.toString());
-    const res = await fetch(listUrl.toString(), {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
+    do {
+      const listUrl = new URL(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collectionPath}`);
+      listUrl.searchParams.set("pageSize", pageSize.toString());
+      if (pageToken) {
+        listUrl.searchParams.set("pageToken", pageToken);
+      }
+      const res = await fetch(listUrl.toString(), {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
 
-    if (res.status === 404) return [];
-    if (!res.ok) {
-      console.warn(`Firestore list ${collectionPath} returned ${res.status}`);
-      return [];
-    }
+      if (res.status === 404) {
+        // Parent document does not exist or collection not found
+        break;
+      }
+      if (!res.ok) {
+        console.warn(`Firestore list ${collectionPath} returned ${res.status}`);
+        break;
+      }
 
-    const data = await res.json();
-    return (data.documents || []).map(doc => ({
-      name: doc.name,
-      fields: doc.fields || {},
-      updateTime: doc.updateTime || null
-    }));
+      const data = await res.json();
+      const docs = (data.documents || []).map(doc => ({
+        name: doc.name,
+        fields: doc.fields || {},
+        updateTime: doc.updateTime || null
+      }));
+
+      allDocuments.push(...docs);
+      pageToken = data.nextPageToken || null;
+    } while (pageToken && allDocuments.length < maxRecords);
+
+    return allDocuments;
   } catch (err) {
     console.error(`Error listing Firestore ${collectionPath}:`, err?.name || "Error");
-    return [];
+    return allDocuments;
   }
 }
 
@@ -1214,28 +1297,65 @@ function parseManifestDoc(doc) {
   };
 }
 
-async function fetchSnapshotRecords(uid, backupId, env) {
-  const docs = await listFirestoreDocuments(`users/${uid}/backup_snapshots/${backupId}/daily_data`, env, 500);
-  if (docs.length > 0) {
-    return docs.map(d => ({
-      dateString: d.fields.dateString?.stringValue || d.name.split("/").pop(),
-      totalReelsCount: Number(d.fields.totalReelsCount?.integerValue || 0),
-      dailyGoal: Number(d.fields.dailyGoal?.integerValue || 0),
-      isStrictModeOn: Boolean(d.fields.isStrictModeOn?.booleanValue),
-      isStrictModeLocked: Boolean(d.fields.isStrictModeLocked?.booleanValue),
-      isLimitLocked: Boolean(d.fields.isLimitLocked?.booleanValue)
-    }));
+function parseSnapshotDocToRecord(d) {
+  const rawTotal = d.fields.totalReelsCount?.integerValue !== undefined ? Number(d.fields.totalReelsCount.integerValue) : null;
+  const rawCount = d.fields.count?.integerValue !== undefined ? Number(d.fields.count.integerValue) : null;
+
+  let countVal = 0;
+  if (rawTotal !== null && !isNaN(rawTotal) && rawTotal > 0) {
+    countVal = rawTotal;
+  } else if (rawCount !== null && !isNaN(rawCount) && rawCount > 0) {
+    countVal = rawCount;
+  } else if (rawTotal === 0 || rawCount === 0) {
+    countVal = 0;
   }
-  // Fallback for legacy backups
-  const legacyDocs = await listFirestoreDocuments(`users/${uid}/daily_data`, env, 500);
-  return legacyDocs.map(d => ({
+
+  return {
     dateString: d.fields.dateString?.stringValue || d.name.split("/").pop(),
-    totalReelsCount: Number(d.fields.totalReelsCount?.integerValue || 0),
+    totalReelsCount: countVal,
+    count: countVal,
     dailyGoal: Number(d.fields.dailyGoal?.integerValue || 0),
-    isStrictModeOn: Boolean(d.fields.isStrictModeOn?.booleanValue),
+    isSkullDay: Boolean(d.fields.isSkullDay?.booleanValue),
+    isStrictModeOn: d.fields.isStrictModeOn?.booleanValue !== undefined ? Boolean(d.fields.isStrictModeOn.booleanValue) : true,
     isStrictModeLocked: Boolean(d.fields.isStrictModeLocked?.booleanValue),
-    isLimitLocked: Boolean(d.fields.isLimitLocked?.booleanValue)
-  }));
+    isLimitLocked: Boolean(d.fields.isLimitLocked?.booleanValue),
+    totalTimeSpentMillis: Number(d.fields.totalTimeSpentMillis?.integerValue || 0)
+  };
+}
+
+async function fetchSnapshotRecords(uid, backupId, env) {
+  const isLegacy = !backupId || backupId === "legacy" || backupId.startsWith("legacy_");
+
+  if (isLegacy) {
+    // Explicit legacy restore from root daily_data
+    const legacyDocs = await listFirestoreDocuments(`users/${uid}/daily_data`, env, 1000);
+    return legacyDocs.map(parseSnapshotDocToRecord);
+  }
+
+  // Snapshot-based restore from users/${uid}/backup_snapshots/${backupId}/daily_data
+  const snapshotParentPath = `users/${uid}/backup_snapshots/${backupId}`;
+  const parentDoc = await getFirestoreDocument(snapshotParentPath, env);
+
+  if (!parentDoc || !parentDoc.exists) {
+    // Check if manifest exists to self-heal missing parent doc on previously committed backups
+    const manifestDoc = await getFirestoreDocument(`users/${uid}/backup_manifests/${backupId}`, env);
+    if (manifestDoc && manifestDoc.exists) {
+      const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
+      await commitFirestoreBatch([{
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/${snapshotParentPath}`,
+          fields: {
+            backupId: { stringValue: backupId },
+            selfHealedAtMs: { integerValue: Date.now().toString() },
+            status: { stringValue: "COMMITTED" }
+          }
+        }
+      }], env).catch(err => console.warn("Failed to self-heal parent snapshot doc:", err?.name || "Error"));
+    }
+  }
+
+  const docs = await listFirestoreDocuments(`users/${uid}/backup_snapshots/${backupId}/daily_data`, env, 5000);
+  return docs.map(parseSnapshotDocToRecord);
 }
 
 async function getFirestoreBackupStatus(uid, env) {
@@ -1281,10 +1401,14 @@ function parseBackupStatusDoc(doc) {
       claimDate: null,
       claimRequestId: null,
       claimTimeMs: 0,
-      activeBackupId: null
+      activeBackupId: null,
+      recordCount: 0
     };
   }
   const f = doc.fields;
+  const countVal = f.recordCount?.integerValue ? Number(f.recordCount.integerValue) :
+                   (f.recordCount?.stringValue ? Number(f.recordCount.stringValue) :
+                   (typeof f.recordCount === "number" ? f.recordCount : 0));
   return {
     status: f.status?.stringValue || null,
     lastBackupDate: f.lastBackupDate?.stringValue || null,
@@ -1293,7 +1417,8 @@ function parseBackupStatusDoc(doc) {
     claimDate: f.claimDate?.stringValue || null,
     claimRequestId: f.claimRequestId?.stringValue || null,
     claimTimeMs: f.claimTimeMs?.integerValue ? Number(f.claimTimeMs.integerValue) : 0,
-    activeBackupId: f.activeBackupId?.stringValue || null
+    activeBackupId: f.activeBackupId?.stringValue || null,
+    recordCount: isNaN(countVal) ? 0 : countVal
   };
 }
 
@@ -1344,6 +1469,7 @@ async function claimBackupSlotAtomic(uid, todayUtc, requestId, nowMs, currentDoc
 
   // Also write daily_quota_claims/${uid}_${todayUtc}_BACKUP
   const claimFields = {
+    uid: { stringValue: uid },
     status: { stringValue: "IN_PROGRESS" },
     fencingToken: { integerValue: fencingToken.toString() },
     backupId: { stringValue: backupId },
@@ -1388,13 +1514,27 @@ async function commitFirestoreBackup(uid, todayUtc, requestId, nowMs, dailyRecor
       if (!rec || typeof rec.dateString !== "string" || !rec.dateString.match(/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/)) {
         continue;
       }
+      const totalVal = rec.totalReelsCount !== undefined && rec.totalReelsCount !== null ? Number(rec.totalReelsCount) : null;
+      const countValRaw = rec.count !== undefined && rec.count !== null ? Number(rec.count) : null;
+      let resolvedCount = 0;
+      if (totalVal !== null && !isNaN(totalVal) && totalVal > 0) {
+        resolvedCount = totalVal;
+      } else if (countValRaw !== null && !isNaN(countValRaw) && countValRaw > 0) {
+        resolvedCount = countValRaw;
+      } else if (totalVal === 0 || countValRaw === 0) {
+        resolvedCount = 0;
+      }
+      const countVal = Math.max(0, Math.min(100000, resolvedCount));
       const recordFields = {
         dateString: { stringValue: rec.dateString },
-        totalReelsCount: { integerValue: (Math.max(0, Math.min(100000, Number(rec.totalReelsCount) || 0))).toString() },
+        totalReelsCount: { integerValue: countVal.toString() },
+        count: { integerValue: countVal.toString() },
         dailyGoal: { integerValue: (Math.max(0, Math.min(100000, Number(rec.dailyGoal) || 0))).toString() },
-        isStrictModeOn: { booleanValue: Boolean(rec.isStrictModeOn) },
+        isSkullDay: { booleanValue: Boolean(rec.isSkullDay) },
+        isStrictModeOn: rec.isStrictModeOn !== undefined ? { booleanValue: Boolean(rec.isStrictModeOn) } : { booleanValue: true },
         isStrictModeLocked: { booleanValue: Boolean(rec.isStrictModeLocked) },
-        isLimitLocked: { booleanValue: Boolean(rec.isLimitLocked) }
+        isLimitLocked: { booleanValue: Boolean(rec.isLimitLocked) },
+        totalTimeSpentMillis: { integerValue: (Math.max(0, Number(rec.totalTimeSpentMillis) || 0)).toString() }
       };
 
       // Immutable snapshot record
@@ -1456,6 +1596,20 @@ async function commitFirestoreBackup(uid, todayUtc, requestId, nowMs, dailyRecor
     }
   });
 
+  // 3b. Parent snapshot document (enables Firestore REST subcollection enumeration)
+  finalWrites.push({
+    update: {
+      name: `projects/${projectId}/databases/(default)/documents/users/${uid}/backup_snapshots/${backupId}`,
+      fields: {
+        backupId: { stringValue: backupId },
+        status: { stringValue: "COMMITTED" },
+        recordCount: { integerValue: (Array.isArray(dailyRecords) ? dailyRecords.length : 0).toString() },
+        createdAt: { stringValue: new Date(nowMs).toISOString() },
+        createdAtMs: { integerValue: nowMs.toString() }
+      }
+    }
+  });
+
   // 4. Status record marking SUCCESS
   finalWrites.push({
     update: {
@@ -1480,6 +1634,7 @@ async function commitFirestoreBackup(uid, todayUtc, requestId, nowMs, dailyRecor
     update: {
       name: `projects/${projectId}/databases/(default)/documents/daily_quota_claims/${uid}_${todayUtc}_BACKUP`,
       fields: {
+        uid: { stringValue: uid },
         status: { stringValue: "COMPLETED" },
         fencingToken: { integerValue: token.toString() },
         backupId: { stringValue: backupId },
@@ -1916,8 +2071,11 @@ async function pruneHistoricalCommittedBackups(env, uid, candidateBackupId) {
       await commitFirestoreBatch(deleteWrites, env);
     }
 
-    // Delete manifest document
-    await deleteFirestoreDocument(`users/${uid}/backup_manifests/${candidateBackupId}`, env);
+    // Delete manifest document and parent snapshot document
+    await Promise.all([
+      deleteFirestoreDocument(`users/${uid}/backup_manifests/${candidateBackupId}`, env),
+      deleteFirestoreDocument(`users/${uid}/backup_snapshots/${candidateBackupId}`, env)
+    ]);
 
     return { pruned: true, backupId: candidateBackupId };
   } catch (err) {
@@ -1977,8 +2135,11 @@ async function cleanupAbandonedUploads(env, uid, candidateBackupId) {
       await commitFirestoreBatch(deleteWrites, env);
     }
 
-    // Delete manifest
-    await deleteFirestoreDocument(`users/${uid}/backup_manifests/${candidateBackupId}`, env);
+    // Delete manifest and parent snapshot document
+    await Promise.all([
+      deleteFirestoreDocument(`users/${uid}/backup_manifests/${candidateBackupId}`, env),
+      deleteFirestoreDocument(`users/${uid}/backup_snapshots/${candidateBackupId}`, env)
+    ]);
 
     return { cleaned: true, backupId: candidateBackupId };
   } catch (err) {
@@ -2009,7 +2170,7 @@ async function verifyUserSubscriptionEntitlement(uid, env) {
   const nowMs = Date.now();
 
   let currentPeriodEndMs = 0;
-  const rawEnd = subFields.currentPeriodEnd || subFields.currentPeriodEndDate;
+  const rawEnd = subFields.currentPeriodEnd || subFields.currentPeriodEndDate || subFields.expiryDate || subFields.expiresAt || subFields.expirationDate || subFields.premiumExpiry || subFields.validUntil || subFields.current_period_end;
   if (rawEnd?.timestampValue) {
     currentPeriodEndMs = new Date(rawEnd.timestampValue).getTime();
   } else if (rawEnd?.integerValue) {
@@ -2020,7 +2181,7 @@ async function verifyUserSubscriptionEntitlement(uid, env) {
   }
 
   let trialEndMs = 0;
-  const rawTrial = subFields.trialEnd || subFields.trialEndDate;
+  const rawTrial = subFields.trialEnd || subFields.trialEndDate || subFields.trialExpiresAt || subFields.trialExpiry || subFields.trial_end;
   if (rawTrial?.timestampValue) {
     trialEndMs = new Date(rawTrial.timestampValue).getTime();
   } else if (rawTrial?.integerValue) {
@@ -2030,10 +2191,9 @@ async function verifyUserSubscriptionEntitlement(uid, env) {
     trialEndMs = new Date(rawTrial.stringValue).getTime();
   }
 
-  const isPaidActive = (status === "ACTIVE" || status === "PENDING" || status === "CANCELLED") &&
-    currentPeriodEndMs > 0 && nowMs < currentPeriodEndMs;
+  const isPaidActive = status !== "HALTED" && currentPeriodEndMs > 0 && nowMs < currentPeriodEndMs;
 
-  const isTrialActive = !isPaidActive && trialEndMs > 0 && nowMs < trialEndMs;
+  const isTrialActive = !isPaidActive && status !== "HALTED" && trialEndMs > 0 && nowMs < trialEndMs;
 
   if (isPaidActive) {
     return { entitled: true, mode: "ACTIVE" };
@@ -2130,23 +2290,18 @@ async function lookupSubscriptionUid(subscriptionId, env) {
   if (!subscriptionId) return null;
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
-  if (!saKey) return null;
+  if (!saKey) throw new Error("FIREBASE_SERVICE_ACCOUNT_KEY missing for subscription owner lookup.");
 
-  try {
-    const accessToken = await getGoogleServiceAccountAccessToken(saKey);
-    const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/subscription_map/${subscriptionId}`;
-    const res = await fetch(docUrl, {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-
-    if (!res.ok) return null;
-    const doc = await res.json();
-    return doc.fields?.firebaseUid?.stringValue || null;
-  } catch (err) {
-    console.warn("Error resolving subscription map:", err?.name || "Error");
-    return null;
-  }
+  const accessToken = await getGoogleServiceAccountAccessToken(saKey);
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/subscription_map/${encodeURIComponent(subscriptionId)}`;
+  const res = await fetch(docUrl, {
+    method: "GET",
+    headers: { "Authorization": `Bearer ${accessToken}` }
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Subscription owner lookup temporarily unavailable (${res.status}).`);
+  const doc = await res.json();
+  return doc.fields?.firebaseUid?.stringValue || null;
 }
 
 // Record subscription ID -> Firebase UID mapping in Firestore for robust webhook resolution
@@ -2200,6 +2355,234 @@ async function recordSubscriptionUidMap(subscriptionId, uid, planId, env) {
   return { success: false, reason: "MAX_RETRIES_EXCEEDED" };
 }
 
+// Validate Razorpay credentials against environment and key mode requirements
+function validateRazorpayCredentials(env) {
+  const rawKeyId = env.RAZORPAY_KEY_ID?.trim();
+  const rawKeySecret = env.RAZORPAY_KEY_SECRET?.trim();
+
+  const environment = env.ENVIRONMENT;
+  if (!['test', 'staging', 'production'].includes(environment)) {
+    return { valid: false, error: "Worker ENVIRONMENT must be explicitly set to test, staging, or production." };
+  }
+
+  if (!rawKeyId || !rawKeySecret) {
+    return { valid: false, error: "Razorpay credentials not configured in Worker environment." };
+  }
+
+  const isStaging = environment === "staging";
+  const isProduction = environment === "production";
+
+  if (environment === "test" || isStaging) {
+    if (!rawKeyId.startsWith("rzp_test_")) {
+      return {
+        valid: false,
+        error: `${environment === "staging" ? "Staging" : "Test"} environment requires Razorpay test key (rzp_test_*). Live key rejected.`
+      };
+    }
+  } else if (isProduction) {
+    if (rawKeyId.startsWith("rzp_test_")) {
+      return {
+        valid: false,
+        error: "Production environment rejects Razorpay test key (rzp_test_*). Live key required."
+      };
+    }
+    if (!rawKeyId.startsWith("rzp_live_")) {
+      return {
+        valid: false,
+        error: "Production environment requires valid Razorpay live key (rzp_live_*)."
+      };
+    }
+  }
+
+  return { valid: true, keyId: rawKeyId, keySecret: rawKeySecret };
+}
+
+// Validate Razorpay plan ID against environment and isolation requirements
+function validateRazorpayPlanId(env) {
+  const planId = env.RAZORPAY_PLAN_ID?.trim();
+  const environment = env.ENVIRONMENT;
+
+  if (!planId) {
+    return { valid: false, error: "Server payment configuration missing plan ID." };
+  }
+
+  if (planId.toUpperCase().includes("PLACEHOLDER")) {
+    return { valid: false, error: "Server payment configuration incomplete: Razorpay plan ID contains placeholder." };
+  }
+
+  if (environment === "staging") {
+    if (planId === "plan_TdtgehXIhzQ8U9") {
+      return {
+        valid: false,
+        error: "CRITICAL ISOLATION FAULT: Staging environment cannot use production Razorpay plan ID ('plan_TdtgehXIhzQ8U9')."
+      };
+    }
+  }
+
+  if (environment === "production") {
+    if (planId !== "plan_TdtgehXIhzQ8U9") {
+      return {
+        valid: false,
+        error: "Production environment requires authoritative production Razorpay plan ID ('plan_TdtgehXIhzQ8U9')."
+      };
+    }
+  }
+
+  return { valid: true, planId };
+}
+
+// Query subscription_map for all subscription IDs associated with a Firebase UID
+async function findSubscriptionsByUid(uid, env) {
+  if (!uid) return [];
+  const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
+  const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (!saKey) return [];
+
+  try {
+    const accessToken = await getGoogleServiceAccountAccessToken(saKey);
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+
+    const structuredQuery = {
+      from: [{ collectionId: "subscription_map" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: "firebaseUid" },
+          op: "EQUAL",
+          value: { stringValue: uid }
+        }
+      },
+      limit: 10
+    };
+
+    const res = await fetch(queryUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ structuredQuery })
+    });
+
+    if (!res.ok) {
+      console.warn(`Firestore runQuery for subscription_map failed (${res.status})`);
+      return [];
+    }
+
+    const queryResults = await res.json();
+    const subIds = [];
+    for (const item of queryResults) {
+      if (!item.document || !item.document.name) continue;
+      const parts = item.document.name.split("/");
+      const subId = parts[parts.length - 1];
+      if (subId && subId.startsWith("sub_")) {
+        subIds.push(subId);
+      }
+    }
+    return subIds;
+  } catch (err) {
+    console.warn("Error querying subscription_map by UID:", err?.name || "Error");
+    return [];
+  }
+}
+
+// Query daily_quota_claims for all claim documents associated with a Firebase UID
+async function findDailyQuotaClaimsByUid(uid, env) {
+  if (!uid || typeof uid !== "string") return [];
+  const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
+  const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (!saKey) return [];
+
+  const foundClaims = new Set();
+  try {
+    const accessToken = await getGoogleServiceAccountAccessToken(saKey);
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+
+    const structuredQuery = {
+      from: [{ collectionId: "daily_quota_claims" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: "uid" },
+          op: "EQUAL",
+          value: { stringValue: uid }
+        }
+      },
+      limit: 500
+    };
+
+    const res = await fetch(queryUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ structuredQuery })
+    });
+
+    if (res.ok) {
+      const results = await res.json();
+      if (Array.isArray(results)) {
+        for (const item of results) {
+          if (!item.document || !item.document.name) continue;
+          const parts = item.document.name.split("/documents/");
+          const docPath = parts[1];
+          if (docPath && docPath.startsWith(`daily_quota_claims/${uid}_`)) {
+            foundClaims.add(docPath);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Error querying daily_quota_claims by UID:", err?.name || "Error");
+  }
+
+  return Array.from(foundClaims);
+}
+
+// Fetch a subscription entity from Razorpay and verify ownership against the calling UID
+async function fetchAndVerifyRazorpaySubscription(subscriptionId, uid, env) {
+  if (!subscriptionId || !uid) return null;
+  const creds = validateRazorpayCredentials(env);
+  if (!creds.valid) throw new Error("Subscription recovery credentials are unavailable.");
+
+  let res;
+  try {
+    const authHeaderValue = "Basic " + btoa(`${creds.keyId}:${creds.keySecret}`);
+    res = await fetch(`https://api.razorpay.com/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      headers: { "Authorization": authHeaderValue }
+    });
+  } catch (err) {
+    throw new Error("Razorpay subscription recovery lookup failed temporarily.");
+  }
+
+  if (res.status === 404) return null;
+  if (res.status === 429 || res.status >= 500 || res.status === 401 || res.status === 403) {
+    throw new Error(`Razorpay subscription recovery is temporarily unavailable (${res.status}).`);
+  }
+  if (!res.ok) return null;
+
+  let subscription;
+  try {
+    subscription = await res.json();
+  } catch (err) {
+    throw new Error("Razorpay subscription recovery returned malformed data.");
+  }
+  if (!subscription || typeof subscription !== "object" || Array.isArray(subscription) || subscription.id !== subscriptionId) {
+    throw new Error("Razorpay subscription recovery returned an invalid entity.");
+  }
+
+  const noteUid = subscription.notes?.firebase_uid;
+  const mappedUid = await lookupSubscriptionUid(subscription.id, env);
+  if (noteUid && mappedUid && noteUid !== mappedUid) {
+    console.warn("fetchAndVerifyRazorpaySubscription rejected: ownership conflict.");
+    return null;
+  }
+  const ownerUid = noteUid || mappedUid;
+  if (ownerUid === uid) return subscription;
+
+  console.warn("fetchAndVerifyRazorpaySubscription rejected: ownership mismatch.");
+  return null;
+}
+
 // Read master account status from Firestore REST API
 async function getFirestoreAccountTombstone(uid, env) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
@@ -2216,7 +2599,7 @@ async function getFirestoreAccountTombstone(uid, env) {
 
     if (res.status === 200) {
       const doc = await res.json();
-      return { exists: true, error: false, fields: doc.fields || {} };
+      return { exists: true, error: false, fields: doc.fields || {}, updateTime: doc.updateTime };
     }
 
     if (res.status === 404) {
@@ -2231,7 +2614,7 @@ async function getFirestoreAccountTombstone(uid, env) {
   }
 }
 
-async function recordFirestoreAccountTombstone(uid, fields, env) {
+async function recordFirestoreAccountTombstone(uid, fields, env, options = {}) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!saKey) return { success: false, error: "Missing service account key" };
@@ -2240,7 +2623,13 @@ async function recordFirestoreAccountTombstone(uid, fields, env) {
     const accessToken = await getGoogleServiceAccountAccessToken(saKey);
     const fieldNames = Object.keys(fields);
     const updateMaskParams = fieldNames.map(f => `updateMask.fieldPaths=${f}`).join("&");
-    const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/account_tombstones/${uid}?${updateMaskParams}`;
+    let docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/account_tombstones/${uid}?${updateMaskParams}`;
+
+    if (options.expectedUpdateTime) {
+      docUrl += `&currentDocument.updateTime=${encodeURIComponent(options.expectedUpdateTime)}`;
+    } else if (options.exists !== undefined) {
+      docUrl += `&currentDocument.exists=${options.exists ? "true" : "false"}`;
+    }
 
     const res = await fetch(docUrl, {
       method: "PATCH",
@@ -2251,12 +2640,17 @@ async function recordFirestoreAccountTombstone(uid, fields, env) {
       body: JSON.stringify({ fields })
     });
 
+    if (res.status === 409 || res.status === 412) {
+      return { success: false, status: res.status, conflict: true, error: "PRECONDITION_FAILED" };
+    }
+
     if (!res.ok) {
       console.warn(`Firestore PATCH account_tombstones failed: HTTP ${res.status}`);
       return { success: false, status: res.status, error: `HTTP_${res.status}` };
     }
 
-    return { success: true, status: res.status };
+    const resJson = await res.json().catch(() => ({}));
+    return { success: true, status: res.status, updateTime: resJson.updateTime };
   } catch (err) {
     console.error("Error writing account_tombstones:", err?.name || "Error");
     return { success: false, error: err?.name || "Network error" };
@@ -2280,6 +2674,10 @@ async function claimPurgeLockAtomic(uid, nowMs, env) {
 
   if (currentDoc.exists && currentDoc.fields) {
     const purgeState = currentDoc.fields.purgeState?.stringValue;
+    const accountStatus = currentDoc.fields.accountStatus?.stringValue;
+    if (purgeState === "CANCELLED" || accountStatus === "ACTIVE") {
+      return { claimed: false, cancelled: true, reason: "ACCOUNT_ACTIVE_OR_CANCELLED" };
+    }
     if (purgeState === "COMPLETED") {
       return { claimed: false, alreadyCompleted: true, purgeState: "COMPLETED" };
     }
@@ -2428,7 +2826,7 @@ async function getFirestoreAccountStatus(uid, env) {
     if (res.status === 200) {
       const doc = await res.json();
       const fields = doc.fields || {};
-      return { ...fields, exists: true, error: false, fields };
+      return { ...fields, exists: true, error: false, fields, updateTime: doc.updateTime };
     }
 
     if (res.status !== 404) {
@@ -2451,7 +2849,7 @@ async function getFirestoreAccountStatus(uid, env) {
       // Tombstone found! Self-heal status doc and return DELETED tombstone
       const tombstoneFields = tombstoneResult.fields || {};
       updateFirestoreAccountStatus(uid, tombstoneFields, env).catch(() => {});
-      return { ...tombstoneFields, exists: true, error: false, fields: tombstoneFields };
+      return { ...tombstoneFields, exists: true, error: false, fields: tombstoneFields, updateTime: tombstoneResult.updateTime };
     }
 
     // Confirmed absence: both status doc and tombstone doc returned 404
@@ -2462,7 +2860,7 @@ async function getFirestoreAccountStatus(uid, env) {
   }
 }
 
-async function updateFirestoreAccountStatus(uid, fields, env) {
+async function updateFirestoreAccountStatus(uid, fields, env, options = {}) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!saKey) {
@@ -2473,7 +2871,13 @@ async function updateFirestoreAccountStatus(uid, fields, env) {
   const fieldNames = Object.keys(fields);
   const updateMaskParams = fieldNames.map(f => `updateMask.fieldPaths=${f}`).join("&");
 
-  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/account/status?${updateMaskParams}`;
+  let docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/account/status?${updateMaskParams}`;
+
+  if (options.expectedUpdateTime) {
+    docUrl += `&currentDocument.updateTime=${encodeURIComponent(options.expectedUpdateTime)}`;
+  } else if (options.exists !== undefined) {
+    docUrl += `&currentDocument.exists=${options.exists ? "true" : "false"}`;
+  }
 
   const res = await fetch(docUrl, {
     method: "PATCH",
@@ -2483,6 +2887,13 @@ async function updateFirestoreAccountStatus(uid, fields, env) {
     },
     body: JSON.stringify({ fields })
   });
+
+  if (res.status === 409 || res.status === 412) {
+    const err = new Error(`Firestore REST PATCH account status precondition failed: HTTP ${res.status}`);
+    err.status = res.status;
+    err.conflict = true;
+    throw err;
+  }
 
   if (!res.ok) {
     throw new Error(`Firestore REST PATCH account status failed: HTTP ${res.status}`);
@@ -2589,6 +3000,14 @@ async function purgeAccountData(uid, env) {
         alreadyCompleted: true
       };
     }
+    if (claimResult.cancelled) {
+      console.log("Permanent purge skipped: account is ACTIVE or deletion was CANCELLED.");
+      return {
+        success: true,
+        cancelled: true,
+        purgeState: "CANCELLED"
+      };
+    }
     if (claimResult.inProgress) {
       console.warn("Purge currently in progress by another worker; skipping duplicate concurrent execution.");
       return {
@@ -2642,83 +3061,127 @@ async function purgeAccountData(uid, env) {
     errors.push("Failed writing account status DELETED");
   }
 
-  // 1. If an active Razorpay recurring subscription exists, cancel mandate at gateway
+  // 1. If active Razorpay recurring subscriptions exist, cancel mandates at gateway
+  const candidateSubIds = new Set();
+  if (existingPendingSubId && existingPendingSubId.startsWith("sub_")) {
+    candidateSubIds.add(existingPendingSubId);
+  }
   let activeSubId = existingPendingSubId;
   try {
     const subDoc = await getFirestoreSubscription(uid, env);
     if (subDoc?.error) {
+      firestoreSuccess = false;
       errors.push("Failed reading subscription status during purge: service unavailable");
     } else if (subDoc?.exists && subDoc?.subscriptionId?.stringValue) {
-      activeSubId = subDoc.subscriptionId.stringValue;
-    }
-
-    if (activeSubId && activeSubId.startsWith("sub_") && env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET) {
-      const authHeaderValue = "Basic " + btoa(`${env.RAZORPAY_KEY_ID.trim()}:${env.RAZORPAY_KEY_SECRET.trim()}`);
-      const cancelUrl = `https://api.razorpay.com/v1/subscriptions/${activeSubId}/cancel`;
-      const rzpRes = await fetch(cancelUrl, {
-        method: "POST",
-        headers: { "Authorization": authHeaderValue, "Content-Type": "application/json" },
-        body: JSON.stringify({ cancel_at_cycle_end: 0 }) // Immediate mandate cancellation on permanent purge
-      });
-
-      if (rzpRes.ok || rzpRes.status === 404) {
-        gatewaySuccess = true;
-      } else if (rzpRes.status === 400) {
-        let errDesc = "";
-        try {
-          const errData = await rzpRes.json();
-          errDesc = (errData?.error?.description || "").toLowerCase();
-        } catch (_) {
-          errDesc = (await rzpRes.text().catch(() => "")).toLowerCase();
-        }
-
-        const isExplicitTerminal = errDesc.includes("already cancelled") || 
-                                   errDesc.includes("in cancelled state") ||
-                                   errDesc.includes("already completed") ||
-                                   errDesc.includes("in completed state") ||
-                                   errDesc.includes("already expired") ||
-                                   errDesc.includes("in expired state");
-
-        if (isExplicitTerminal) {
-          gatewaySuccess = true;
-        } else {
-          // Ambiguous HTTP 400 (e.g. generic "cannot be cancelled"): verify authoritative state via GET
-          console.warn("Ambiguous gateway cancellation response; verifying authoritative status via GET");
-          try {
-            const getRes = await fetch(`https://api.razorpay.com/v1/subscriptions/${activeSubId}`, {
-              method: "GET",
-              headers: { "Authorization": authHeaderValue }
-            });
-            if (getRes.ok) {
-              const subData = await getRes.json();
-              const subStatus = (subData?.status || "").toLowerCase();
-              if (subStatus === "cancelled" || subStatus === "completed" || subStatus === "expired") {
-                console.log(`Authoritative subscription check confirmed terminal status: ${subStatus}`);
-                gatewaySuccess = true;
-              } else {
-                gatewaySuccess = false;
-                errors.push(`Gateway cancellation rejected: status is ${subStatus}`);
-                console.warn(`Authoritative subscription status is ${subStatus}; not terminal.`);
-              }
-            } else {
-              gatewaySuccess = false;
-              errors.push(`Gateway status verification failed: HTTP ${getRes.status}`);
-            }
-          } catch (getErr) {
-            gatewaySuccess = false;
-            errors.push("Gateway status verification network error");
-          }
-        }
-      } else {
-        gatewaySuccess = false;
-        errors.push(`Gateway cancel failed: HTTP ${rzpRes.status}`);
-        console.warn(`Gateway subscription cancel failed during purge: HTTP ${rzpRes.status}`);
+      const sId = subDoc.subscriptionId.stringValue;
+      if (sId.startsWith("sub_")) {
+        candidateSubIds.add(sId);
+        activeSubId = sId;
       }
     }
   } catch (subErr) {
-    gatewaySuccess = false;
-    errors.push("Gateway cancel error");
+    firestoreSuccess = false;
+    errors.push(`Error checking subscription for purge: ${subErr?.name || "Error"}`);
     console.warn("Non-fatal: Error checking subscription for purge:", subErr?.name || "Error");
+  }
+
+  try {
+    const mappedSubIds = await findSubscriptionsByUid(uid, env);
+    for (const mId of mappedSubIds) {
+      if (mId.startsWith("sub_")) candidateSubIds.add(mId);
+    }
+  } catch (mapErr) {
+    firestoreSuccess = false;
+    errors.push(`Error querying subscription_map for candidate subscriptions: ${mapErr?.name || "Error"}`);
+    console.warn("Non-fatal: Error querying subscription_map for candidate subscriptions:", mapErr?.name || "Error");
+  }
+
+  const successfullyCancelledSubIds = new Set();
+  const failedSubIds = new Set();
+
+  for (const sId of candidateSubIds) {
+    if (sId && sId.startsWith("sub_")) {
+      const credValidation = validateRazorpayCredentials(env);
+      if (!credValidation.valid) {
+        failedSubIds.add(sId);
+        errors.push(`Gateway credentials invalid or missing for subscription ${sId}: ${credValidation.error}`);
+        console.warn(`Cannot cancel gateway subscription ${sId}: ${credValidation.error}`);
+        continue;
+      }
+      const authHeaderValue = "Basic " + btoa(`${credValidation.keyId}:${credValidation.keySecret}`);
+      const cancelUrl = `https://api.razorpay.com/v1/subscriptions/${sId}/cancel`;
+      try {
+        const rzpRes = await fetch(cancelUrl, {
+          method: "POST",
+          headers: { "Authorization": authHeaderValue, "Content-Type": "application/json" },
+          body: JSON.stringify({ cancel_at_cycle_end: 0 }) // Immediate mandate cancellation on permanent purge
+        });
+
+        if (rzpRes.ok || rzpRes.status === 404) {
+          successfullyCancelledSubIds.add(sId);
+        } else if (rzpRes.status === 400) {
+          let errDesc = "";
+          try {
+            const errData = await rzpRes.json();
+            errDesc = (errData?.error?.description || "").toLowerCase();
+          } catch (_) {
+            errDesc = (await rzpRes.text().catch(() => "")).toLowerCase();
+          }
+
+          const isExplicitTerminal = errDesc.includes("already cancelled") ||
+                                     errDesc.includes("in cancelled state") ||
+                                     errDesc.includes("already completed") ||
+                                     errDesc.includes("in completed state") ||
+                                     errDesc.includes("already expired") ||
+                                     errDesc.includes("in expired state");
+
+          if (isExplicitTerminal) {
+            successfullyCancelledSubIds.add(sId);
+          } else {
+            // Ambiguous HTTP 400 (e.g. generic "cannot be cancelled"): verify authoritative state via GET
+            console.warn("Ambiguous gateway cancellation response; verifying authoritative status via GET");
+            try {
+              const getRes = await fetch(`https://api.razorpay.com/v1/subscriptions/${sId}`, {
+                method: "GET",
+                headers: { "Authorization": authHeaderValue }
+              });
+              if (getRes.ok) {
+                const subData = await getRes.json();
+                const subStatus = (subData?.status || "").toLowerCase();
+                if (subStatus === "cancelled" || subStatus === "completed" || subStatus === "expired") {
+                  console.log(`Authoritative subscription check confirmed terminal status: ${subStatus}`);
+                  successfullyCancelledSubIds.add(sId);
+                } else {
+                  failedSubIds.add(sId);
+                  errors.push(`Gateway cancellation rejected for ${sId}: status is ${subStatus}`);
+                  console.warn(`Authoritative subscription status is ${subStatus}; not terminal.`);
+                }
+              } else {
+                failedSubIds.add(sId);
+                errors.push(`Gateway status verification failed for ${sId}: HTTP ${getRes.status}`);
+              }
+            } catch (getErr) {
+              failedSubIds.add(sId);
+              errors.push(`Gateway status verification network error for ${sId}`);
+            }
+          }
+        } else {
+          failedSubIds.add(sId);
+          errors.push(`Gateway cancel failed for ${sId}: HTTP ${rzpRes.status}`);
+          console.warn(`Gateway subscription cancel failed during purge for ${sId}: HTTP ${rzpRes.status}`);
+        }
+      } catch (cancelErr) {
+        failedSubIds.add(sId);
+        errors.push(`Gateway cancel network error for ${sId}`);
+        console.warn(`Gateway cancel exception for ${sId}:`, cancelErr?.name || "Error");
+      }
+    }
+  }
+
+  if (failedSubIds.size > 0) {
+    gatewaySuccess = false;
+  } else {
+    gatewaySuccess = true;
   }
 
   // 2. Delete all Firestore user subcollections & documents independently
@@ -2731,14 +3194,107 @@ async function purgeAccountData(uid, env) {
     }
   }
 
-  // Handle subscription subcollection / doc:
+  // Handle subscription subcollection / doc & subscription_map:
   // If gateway cancellation failed, DO NOT delete subscription status document yet!
   if (gatewaySuccess) {
     await deleteFirestoreSubcollection(`users/${uid}`, "subscription", env);
     await deleteFirestoreDocument(`users/${uid}/subscription/status`, env);
-  } else if (activeSubId) {
+  } else {
     firestoreSuccess = false;
     errors.push("Subscription status document preserved for gateway cancellation retry");
+  }
+
+  // Delete subscription_map entries ONLY for subscriptions with confirmed terminal gateway cancellation
+  for (const sId of successfullyCancelledSubIds) {
+    try {
+      const delMapRes = await deleteFirestoreDocument(`subscription_map/${sId}`, env);
+      if (!delMapRes?.success) {
+        firestoreSuccess = false;
+        errors.push(`Failed to delete subscription_map for ${sId}`);
+      }
+    } catch (delMapErr) {
+      firestoreSuccess = false;
+      errors.push(`Error purging subscription_map for ${sId}: ${delMapErr?.name || "Error"}`);
+    }
+  }
+
+  // Handle backup snapshots and backup manifests (including nested snapshot daily_data records)
+  try {
+    const snapshotDocs = await listFirestoreDocuments(`users/${uid}/backup_snapshots`, env, 5000);
+    const manifestDocs = await listFirestoreDocuments(`users/${uid}/backup_manifests`, env, 5000);
+    const allBackupIds = new Set();
+    if (Array.isArray(snapshotDocs)) {
+      for (const d of snapshotDocs) {
+        const bId = d?.name ? d.name.split("/").pop() : null;
+        if (bId) allBackupIds.add(bId);
+      }
+    }
+    if (Array.isArray(manifestDocs)) {
+      for (const d of manifestDocs) {
+        const bId = d?.name ? d.name.split("/").pop() : null;
+        if (bId) allBackupIds.add(bId);
+      }
+    }
+
+    for (const backupId of allBackupIds) {
+      const delSnapshotDailyRes = await deleteFirestoreSubcollection(`users/${uid}/backup_snapshots/${backupId}`, "daily_data", env);
+      if (!delSnapshotDailyRes?.success) {
+        firestoreSuccess = false;
+        errors.push(`Backup snapshot daily_data purge failed for ${backupId}`);
+      }
+      const delSnapDocRes = await deleteFirestoreDocument(`users/${uid}/backup_snapshots/${backupId}`, env);
+      if (!delSnapDocRes?.success) {
+        firestoreSuccess = false;
+        errors.push(`Backup snapshot document purge failed for ${backupId}`);
+      }
+      const delManifestDocRes = await deleteFirestoreDocument(`users/${uid}/backup_manifests/${backupId}`, env);
+      if (!delManifestDocRes?.success) {
+        firestoreSuccess = false;
+        errors.push(`Backup manifest document purge failed for ${backupId}`);
+      }
+    }
+
+    const delSnapCollRes = await deleteFirestoreSubcollection(`users/${uid}`, "backup_snapshots", env);
+    if (!delSnapCollRes?.success) {
+      firestoreSuccess = false;
+      errors.push("Subcollection purge failed for backup_snapshots");
+    }
+    const delManifestCollRes = await deleteFirestoreSubcollection(`users/${uid}`, "backup_manifests", env);
+    if (!delManifestCollRes?.success) {
+      firestoreSuccess = false;
+      errors.push("Subcollection purge failed for backup_manifests");
+    }
+  } catch (backupPurgeErr) {
+    firestoreSuccess = false;
+    errors.push(`Backup purge encountered error: ${backupPurgeErr?.name || "Error"}`);
+  }
+
+  const todayIstStr = getIstDateString(nowMs);
+  const yesterdayIstStr = getIstDateString(nowMs - 86400000);
+  const quotaClaimPaths = new Set([
+    `daily_quota_claims/${uid}_${todayIstStr}_BACKUP`,
+    `daily_quota_claims/${uid}_${todayIstStr}_RESTORE`,
+    `daily_quota_claims/${uid}_${yesterdayIstStr}_BACKUP`,
+    `daily_quota_claims/${uid}_${yesterdayIstStr}_RESTORE`
+  ]);
+
+  try {
+    const historicalClaims = await findDailyQuotaClaimsByUid(uid, env);
+    for (const cPath of historicalClaims) {
+      if (cPath && cPath.startsWith(`daily_quota_claims/${uid}_`)) {
+        quotaClaimPaths.add(cPath);
+      }
+    }
+  } catch (claimQueryErr) {
+    console.warn("Non-fatal: Error querying historical daily_quota_claims for purge:", claimQueryErr?.name || "Error");
+  }
+
+  for (const claimPath of quotaClaimPaths) {
+    const delClaimRes = await deleteFirestoreDocument(claimPath, env);
+    if (!delClaimRes?.success) {
+      firestoreSuccess = false;
+      errors.push(`Document purge failed for ${claimPath}`);
+    }
   }
 
   const individualDocs = [
@@ -2746,6 +3302,7 @@ async function purgeAccountData(uid, env) {
     `users/${uid}/settings/preferences`,
     `users/${uid}/backup/status`,
     `users/${uid}`,
+    `trial_registry/${uid}`,
     `subscription_creation_locks/${uid}`
   ];
   for (const docP of individualDocs) {
@@ -2775,8 +3332,9 @@ async function purgeAccountData(uid, env) {
     claimId: { stringValue: claimId },
     leaseExpiresAtMs: { integerValue: "0" } // Clear active lease
   };
-  if (!gatewaySuccess && activeSubId) {
-    updatedTombstoneFields.pendingSubscriptionId = { stringValue: activeSubId };
+  const targetSubIdToPreserve = failedSubIds.size > 0 ? Array.from(failedSubIds)[0] : activeSubId;
+  if (!gatewaySuccess && targetSubIdToPreserve) {
+    updatedTombstoneFields.pendingSubscriptionId = { stringValue: targetSubIdToPreserve };
   }
 
   let finalStatusSuccess = false;
@@ -2986,13 +3544,15 @@ async function listPendingAccountTombstones(env, limit = 25) {
       const pendingSubId = fields.pendingSubscriptionId?.stringValue || null;
       const updatedAtStr = fields.updatedAt?.timestampValue || fields.updatedAt?.stringValue || row.document.updateTime || null;
       const leaseExpiresAt = fields.leaseExpiresAtMs?.integerValue || fields.leaseExpiresAtMs?.stringValue || null;
+      const deletionScheduledFor = fields.deletionScheduledFor?.timestampValue || fields.deletionScheduledFor?.stringValue || null;
 
       items.push({
         uid: docUid,
         pendingSubscriptionId: pendingSubId,
         purgeState: targetState,
         updatedAt: updatedAtStr,
-        leaseExpiresAtMs: leaseExpiresAt
+        leaseExpiresAtMs: leaseExpiresAt,
+        deletionScheduledFor
       });
     }
 
@@ -3026,16 +3586,37 @@ async function listPendingAccountTombstones(env, limit = 25) {
       return errList;
     }
 
+    // 3. Discover PENDING_DELETION records whose 7-day grace period has expired
+    const pendingDelRes = await queryTombstonesByState("PENDING_DELETION", boundedLimit);
+    if (!pendingDelRes.ok) {
+      console.warn(`Firestore runQuery for PENDING_DELETION tombstones failed: HTTP ${pendingDelRes.status}`);
+      const errList = [];
+      errList.success = false;
+      errList.error = pendingDelRes.error;
+      errList.status = pendingDelRes.status;
+      errList.pending = [];
+      errList.uids = [];
+      return errList;
+    }
+
     const candidates = new Map();
 
     for (const item of retryRes.items) {
       candidates.set(item.uid, item);
     }
 
+    const nowMs = Date.now();
+    for (const item of pendingDelRes.items) {
+      if (candidates.has(item.uid)) continue;
+      const scheduledForMs = getSafeTimeMs(item.deletionScheduledFor, Infinity);
+      if (nowMs >= scheduledForMs) {
+        candidates.set(item.uid, item);
+      }
+    }
+
     // Stale IN_PROGRESS evaluation:
     // Stale if lease has expired (nowMs >= leaseExpiresAtMs) or if unleased, older than 15 min fallback.
     // Malformed or missing updatedAt evaluates to safeTimeMs = 0, so it is immediately considered stale and healed.
-    const nowMs = Date.now();
     for (const item of inProgressRes.items) {
       if (candidates.has(item.uid)) continue;
 
@@ -3134,25 +3715,106 @@ async function processPendingAccountPurges(env, limit = 25) {
   return results;
 }
 
-async function recordProcessedEventAtomic(eventId, eventData, env) {
+const WEBHOOK_EVENT_LEASE_MS = 2 * 60 * 1000;
+
+async function readWebhookEvent(eventId, env) {
   const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
   const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
   if (!saKey) throw new Error("FIREBASE_SERVICE_ACCOUNT_KEY missing.");
 
   const accessToken = await getGoogleServiceAccountAccessToken(saKey);
-  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/razorpay_events/${eventId}?currentDocument.exists=false`;
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/razorpay_events/${encodeURIComponent(eventId)}`;
+  const res = await fetch(docUrl, { headers: { "Authorization": `Bearer ${accessToken}` } });
+  if (res.status === 404) return { exists: false, docUrl, accessToken };
+  if (!res.ok) throw new Error(`Failed to read webhook event state (${res.status}).`);
+  const document = await res.json();
+  return { exists: true, docUrl, accessToken, fields: document.fields || {}, updateTime: document.updateTime };
+}
 
-  const fields = {
+async function claimProcessedEventAtomic(eventId, eventData, env, nowMs = Date.now()) {
+  const leaseOwner = crypto.randomUUID();
+  const metadata = {
     eventId: { stringValue: eventId },
     eventType: { stringValue: eventData.eventType || "unknown" },
     paymentId: { stringValue: eventData.paymentId || "" },
     subscriptionId: { stringValue: eventData.subscriptionId || "" },
     orderId: { stringValue: eventData.orderId || "" },
-    firebaseUid: { stringValue: eventData.firebaseUid || "" },
-    processedAt: { timestampValue: new Date().toISOString() }
+    firebaseUid: { stringValue: eventData.firebaseUid || "" }
   };
 
-  const res = await fetch(docUrl, {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const current = await readWebhookEvent(eventId, env);
+    if (current.exists) {
+      const state = current.fields.processingStatus?.stringValue;
+      // Preserve exact-once behavior for event records written by the previous
+      // schema, which used processedAt without an explicit processingStatus.
+      if (state === "COMPLETED" || (!state && current.fields.processedAt?.timestampValue)) {
+        return { completed: true };
+      }
+
+      const leaseExpiresAtMs = Number(current.fields.leaseExpiresAtMs?.integerValue || 0);
+      if (state === "PROCESSING" && leaseExpiresAtMs > nowMs) {
+        return { inProgress: true };
+      }
+    }
+
+    const fields = {
+      ...metadata,
+      processingStatus: { stringValue: "PROCESSING" },
+      leaseOwner: { stringValue: leaseOwner },
+      leaseExpiresAtMs: { integerValue: String(nowMs + WEBHOOK_EVENT_LEASE_MS) },
+      attemptCount: {
+        integerValue: String(Number(current.fields?.attemptCount?.integerValue || 0) + 1)
+      },
+      lastError: { stringValue: "" },
+      updatedAt: { timestampValue: new Date(nowMs).toISOString() }
+    };
+    const precondition = current.exists
+      ? `currentDocument.updateTime=${encodeURIComponent(current.updateTime)}`
+      : "currentDocument.exists=false";
+    const url = `${current.docUrl}?${precondition}`;
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `Bearer ${current.accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ fields })
+    });
+
+    if (res.status === 409 || res.status === 412) continue;
+    if (!res.ok) throw new Error(`Failed to claim webhook event (${res.status}).`);
+    const document = await res.json();
+    if (!document.updateTime) throw new Error("Webhook event claim returned no update time.");
+    return { claimed: true, leaseOwner, updateTime: document.updateTime };
+  }
+
+  return { inProgress: true };
+}
+
+async function setWebhookEventState(eventId, claim, state, env, errorName = "") {
+  const projectId = env.FIREBASE_PROJECT_ID || "refocus-504119";
+  const saKey = env.FIREBASE_SERVICE_ACCOUNT_KEY;
+  if (!saKey) throw new Error("FIREBASE_SERVICE_ACCOUNT_KEY missing.");
+  const accessToken = await getGoogleServiceAccountAccessToken(saKey);
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/razorpay_events/${encodeURIComponent(eventId)}`;
+  const nowMs = Date.now();
+  const fields = state === "COMPLETED"
+    ? {
+        processingStatus: { stringValue: "COMPLETED" },
+        processedAt: { timestampValue: new Date(nowMs).toISOString() },
+        leaseExpiresAtMs: { integerValue: "0" },
+        updatedAt: { timestampValue: new Date(nowMs).toISOString() }
+      }
+    : {
+        processingStatus: { stringValue: "FAILED" },
+        lastError: { stringValue: errorName || "ProcessingError" },
+        leaseExpiresAtMs: { integerValue: "0" },
+        updatedAt: { timestampValue: new Date(nowMs).toISOString() }
+      };
+  const url = `${docUrl}?currentDocument.updateTime=${encodeURIComponent(claim.updateTime)}`;
+
+  const res = await fetch(url, {
     method: "PATCH",
     headers: {
       "Authorization": `Bearer ${accessToken}`,
@@ -3161,15 +3823,14 @@ async function recordProcessedEventAtomic(eventId, eventData, env) {
     body: JSON.stringify({ fields })
   });
 
+  // Include the compare-and-set precondition in the URL. If ownership changed,
+  // a later attempt must not overwrite the newer processor's state.
   if (res.status === 409 || res.status === 412) {
-    return false;
+    const current = await readWebhookEvent(eventId, env);
+    if (state === "COMPLETED" && current.fields?.processingStatus?.stringValue === "COMPLETED") return true;
+    throw new Error("Webhook event claim changed before state could be recorded.");
   }
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Failed to record event idempotency record (${res.status}): ${errText}`);
-  }
-
+  if (!res.ok) throw new Error(`Failed to record webhook event state (${res.status}).`);
   return true;
 }
 
@@ -3178,7 +3839,8 @@ async function recordProcessedEventAtomic(eventId, eventData, env) {
 // ---------------------------------------------------------------------------
 
 async function verifyHmacSignature(message, signatureHex, secret) {
-  if (!secret) return false;
+  if (!secret || typeof signatureHex !== "string") return false;
+  const cleanSig = signatureHex.trim().toLowerCase();
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -3196,13 +3858,13 @@ async function verifyHmacSignature(message, signatureHex, secret) {
     calculatedHex += calculatedSigBytes[i].toString(16).padStart(2, "0");
   }
 
-  if (calculatedHex.length !== signatureHex.length) {
+  if (calculatedHex.length !== cleanSig.length) {
     return false;
   }
 
   let result = 0;
   for (let i = 0; i < calculatedHex.length; i++) {
-    result |= calculatedHex.charCodeAt(i) ^ signatureHex.charCodeAt(i);
+    result |= calculatedHex.charCodeAt(i) ^ cleanSig.charCodeAt(i);
   }
   return result === 0;
 }
@@ -3307,7 +3969,7 @@ function isEventStale(existingFields, incomingEventTimeMs) {
   }
 
   // 2. Secondary Guard: Strict ordering against updatedAt timestamp (no negative tolerance offset)
-  const storedUpdatedAtStr = existingFields.updatedAt?.timestampValue;
+  const storedUpdatedAtStr = existingFields.updatedAt?.timestampValue || existingFields.updateTime;
   if (storedUpdatedAtStr) {
     const storedUpdatedAtMs = new Date(storedUpdatedAtStr).getTime();
     if (incomingEventTimeMs < storedUpdatedAtMs) {
@@ -3318,16 +3980,79 @@ function isEventStale(existingFields, incomingEventTimeMs) {
   return false;
 }
 
+async function readBoundedRequestBody(request, maxBytes) {
+  if (!request.body) return new Uint8Array(0);
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel("Request body exceeds configured limit.").catch(() => {});
+        const error = new Error("PayloadTooLarge");
+        error.code = "PAYLOAD_TOO_LARGE";
+        throw error;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bodyBytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bodyBytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bodyBytes;
+}
+
 /**
  * Reconcile subscription activation or recurring charge (subscription.activated, subscription.charged, verify-subscription)
  */
 async function reconcileSubscriptionActivation(uid, subscriptionData, env, eventId = null, eventPayload = null) {
-  const existingFields = await getFirestoreSubscription(uid, env);
-  
   const subId = subscriptionData.id || subscriptionData.subscriptionId;
   const planId = subscriptionData.plan_id || subscriptionData.planId;
   const latestPaymentId = subscriptionData.latestPaymentId || subscriptionData.payment_id || "";
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(subscriptionData, eventPayload);
+
+  // Guard 0: Erased / Deleted Account Guard
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  const isDeleted = accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED";
+
+  if (isDeleted) {
+    console.warn(`Webhook subscription activation rejected: account is permanently deleted for UID ${uid}.`);
+    if (subId && subId.startsWith("sub_") && env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET) {
+      try {
+        const creds = validateRazorpayCredentials(env);
+        if (creds.valid) {
+          const authHeaderValue = "Basic " + btoa(`${creds.keyId}:${creds.keySecret}`);
+          await fetch(`https://api.razorpay.com/v1/subscriptions/${encodeURIComponent(subId)}/cancel`, {
+            method: "POST",
+            headers: { "Authorization": authHeaderValue, "Content-Type": "application/json" },
+            body: JSON.stringify({ cancel_at_cycle_end: 0 })
+          });
+        }
+      } catch (cancelErr) {
+        console.warn("Failed to cancel mandate on deleted account:", cancelErr?.name || "Error");
+      }
+    }
+    if (subId) {
+      await deleteFirestoreDocument(`subscription_map/${subId}`, env).catch(() => {});
+    }
+    return {
+      success: true,
+      message: "Account is permanently deleted. Webhook rejected and gateway mandate cancelled.",
+      status: "CANCELLED"
+    };
+  }
+
+  const existingFields = await getFirestoreSubscription(uid, env);
 
   // Anti-stale / Anti-regression guards
   if (existingFields && existingFields.exists) {
@@ -3366,12 +4091,14 @@ async function reconcileSubscriptionActivation(uid, subscriptionData, env, event
     endMs = subscriptionData.current_end < 1e12 ? subscriptionData.current_end * 1000 : subscriptionData.current_end;
   }
 
-  // If Razorpay omitted current_start/current_end, fall back to existing valid stored periods if available
-  if (!startMs && existingFields?.currentPeriodStart?.timestampValue) {
-    startMs = new Date(existingFields.currentPeriodStart.timestampValue).getTime();
-  }
-  if (!endMs && existingFields?.currentPeriodEnd?.timestampValue) {
-    endMs = new Date(existingFields.currentPeriodEnd.timestampValue).getTime();
+  // If Razorpay omitted current_start/current_end, fall back to existing valid stored periods only if for the same subscription
+  if (existingFields?.subscriptionId?.stringValue === subId) {
+    if (!startMs && existingFields?.currentPeriodStart?.timestampValue) {
+      startMs = new Date(existingFields.currentPeriodStart.timestampValue).getTime();
+    }
+    if (!endMs && existingFields?.currentPeriodEnd?.timestampValue) {
+      endMs = new Date(existingFields.currentPeriodEnd.timestampValue).getTime();
+    }
   }
 
   // Fail closed if authoritative billing period cannot be established
@@ -3384,6 +4111,25 @@ async function reconcileSubscriptionActivation(uid, subscriptionData, env, event
     };
   }
 
+  if (endMs <= startMs) {
+    console.warn(`Activation rejected: Billing period end timestamp must be greater than start timestamp (startMs=${startMs}, endMs=${endMs}).`);
+    return {
+      success: false,
+      message: "Invalid billing period: period end must be after period start.",
+      status: existingFields?.subscriptionStatus?.stringValue || "INCOMPLETE"
+    };
+  }
+
+  const durationDays = (endMs - startMs) / (24 * 60 * 60 * 1000);
+  if (durationDays < 26 || durationDays > 65) {
+    console.warn(`Activation rejected: Non-monthly billing cycle duration detected (${durationDays} days).`);
+    return {
+      success: false,
+      message: "Subscription billing period is not a valid monthly interval.",
+      status: existingFields?.subscriptionStatus?.stringValue || "INCOMPLETE"
+    };
+  }
+
   const now = new Date();
   let nextBillingMs = null;
   if (typeof subscriptionData.charge_at === "number" && subscriptionData.charge_at > 0) {
@@ -3391,6 +4137,9 @@ async function reconcileSubscriptionActivation(uid, subscriptionData, env, event
   } else if (!subscriptionData.ended_at) {
     nextBillingMs = endMs;
   }
+
+  const isPendingDeletion = accountDoc?.accountStatus?.stringValue === "PENDING_DELETION";
+  const cancelAtPeriodEnd = isPendingDeletion ? true : (subscriptionData.cancelAtPeriodEnd || false);
 
   const fields = {
     subscriptionStatus: { stringValue: "ACTIVE" },
@@ -3400,7 +4149,7 @@ async function reconcileSubscriptionActivation(uid, subscriptionData, env, event
     currentPeriodStart: { timestampValue: new Date(startMs).toISOString() },
     currentPeriodEnd: { timestampValue: new Date(endMs).toISOString() },
     premium: { booleanValue: true },
-    cancelAtPeriodEnd: { booleanValue: subscriptionData.cancelAtPeriodEnd || false },
+    cancelAtPeriodEnd: { booleanValue: cancelAtPeriodEnd },
     updatedAt: { timestampValue: now.toISOString() }
   };
 
@@ -3435,6 +4184,11 @@ async function reconcileSubscriptionActivation(uid, subscriptionData, env, event
  * Puts subscription in PENDING status, preserving access during grace period.
  */
 async function reconcileSubscriptionPending(uid, subId, env, eventId = null, eventPayload = null) {
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  if (accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED") {
+    return { success: true, message: "Account is permanently deleted. Pending event ignored.", status: "CANCELLED" };
+  }
+
   const existingFields = await getFirestoreSubscription(uid, env);
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(null, eventPayload);
 
@@ -3470,6 +4224,11 @@ async function reconcileSubscriptionPending(uid, subId, env, eventId = null, eve
  * Revokes premium entitlement immediately.
  */
 async function reconcileSubscriptionHalted(uid, subId, env, eventId = null, eventPayload = null) {
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  if (accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED") {
+    return { success: true, message: "Account is permanently deleted. Halted event ignored.", status: "CANCELLED" };
+  }
+
   const existingFields = await getFirestoreSubscription(uid, env);
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(null, eventPayload);
 
@@ -3506,16 +4265,27 @@ async function reconcileSubscriptionHalted(uid, subId, env, eventId = null, even
  * If cancelled at cycle end, preserves access until currentPeriodEnd.
  */
 async function reconcileSubscriptionCancelled(uid, subId, cancelAtCycleEnd, currentEndSec, env, eventId = null, eventPayload = null) {
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  if (accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED") {
+    return { success: true, message: "Account is permanently deleted. Cancellation event ignored.", status: "CANCELLED" };
+  }
+
   const existingFields = await getFirestoreSubscription(uid, env);
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(null, eventPayload);
 
   if (existingFields && existingFields.exists) {
     const existingStatus = existingFields.subscriptionStatus?.stringValue;
+    if (existingStatus === "CANCELLED" && existingFields.refundedAt) {
+      console.warn("Cancellation ignored: subscription was previously refunded and cancelled.");
+      return { success: true, message: "Subscription previously refunded and cancelled.", status: "CANCELLED" };
+    }
     if (isEventStale(existingFields, incomingEventTimeMs)) {
       console.warn("Stale or unverifiable cancellation event ignored.");
       return { success: true, message: "Ignored stale cancellation event.", status: existingStatus };
     }
   }
+
+  const isCancelAtCycleEnd = cancelAtCycleEnd === true || cancelAtCycleEnd === 1;
 
   const now = new Date();
   let currentEndMs = null;
@@ -3526,18 +4296,27 @@ async function reconcileSubscriptionCancelled(uid, subId, cancelAtCycleEnd, curr
   }
 
   const isStillInPeriod = currentEndMs ? (now.getTime() < currentEndMs) : false;
+  const shouldPreserveAccess = isCancelAtCycleEnd && isStillInPeriod;
 
   const fields = {
-    cancelAtPeriodEnd: { booleanValue: true },
+    cancelAtPeriodEnd: { booleanValue: isCancelAtCycleEnd },
     updatedAt: { timestampValue: now.toISOString() }
   };
 
-  if (isStillInPeriod) {
+  if (shouldPreserveAccess) {
     fields.subscriptionStatus = { stringValue: "ACTIVE" };
     fields.premium = { booleanValue: true };
+    if (currentEndMs) {
+      fields.currentPeriodEnd = { timestampValue: new Date(currentEndMs).toISOString() };
+    }
   } else {
     fields.subscriptionStatus = { stringValue: "CANCELLED" };
     fields.premium = { booleanValue: false };
+    if (!isCancelAtCycleEnd) {
+      fields.currentPeriodEnd = { timestampValue: now.toISOString() };
+    } else if (currentEndMs) {
+      fields.currentPeriodEnd = { timestampValue: new Date(currentEndMs).toISOString() };
+    }
   }
 
   if (eventId) {
@@ -3550,8 +4329,10 @@ async function reconcileSubscriptionCancelled(uid, subId, cancelAtCycleEnd, curr
   await updateFirestoreSubscription(uid, fields, env);
   return {
     success: true,
-    message: isStillInPeriod ? "Subscription cancelled at period end. Access remains active." : "Subscription cancelled.",
-    status: isStillInPeriod ? "ACTIVE" : "CANCELLED"
+    message: shouldPreserveAccess
+      ? "Subscription cancelled at period end. Access remains active."
+      : (isCancelAtCycleEnd ? "Subscription cancelled." : "Subscription cancelled immediately. Access revoked."),
+    status: shouldPreserveAccess ? "ACTIVE" : "CANCELLED"
   };
 }
 
@@ -3559,6 +4340,11 @@ async function reconcileSubscriptionCancelled(uid, subId, cancelAtCycleEnd, curr
  * Reconcile completed subscription (120 cycles reached)
  */
 async function reconcileSubscriptionCompleted(uid, subId, currentEndSec, env, eventId = null, eventPayload = null) {
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  if (accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED") {
+    return { success: true, message: "Account is permanently deleted. Completed event ignored.", status: "CANCELLED" };
+  }
+
   const existingFields = await getFirestoreSubscription(uid, env);
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(null, eventPayload);
 
@@ -3597,23 +4383,48 @@ async function reconcileSubscriptionCompleted(uid, subId, currentEndSec, env, ev
 /**
  * Reconcile refund on recurring subscription
  */
-async function reconcileSubscriptionRefund(uid, paymentId, refundId, env, eventId = null, eventPayload = null) {
+async function reconcileSubscriptionRefund(uid, paymentId, refundId, env, eventId = null, eventPayload = null, expectedSubId = "") {
+  const accountDoc = await getFirestoreAccountStatus(uid, env);
+  if (accountDoc?.accountStatus?.stringValue === "DELETED" || accountDoc?.purgeState?.stringValue === "COMPLETED") {
+    return { success: true, message: "Account is permanently deleted. Refund event ignored.", status: "CANCELLED" };
+  }
+
   const existingFields = await getFirestoreSubscription(uid, env);
   const incomingEventTimeMs = extractAuthoritativeEventTimeMs(null, eventPayload);
+
+  if (!existingFields?.exists) {
+    return { success: true, message: "Refund does not match an existing subscription.", status: "IGNORED" };
+  }
+
+  const currentSubId = existingFields.subscriptionId?.stringValue || "";
+  const currentPaymentId = existingFields.latestPaymentId?.stringValue || "";
+  if (!expectedSubId || expectedSubId !== currentSubId) {
+    return { success: true, message: "Refund does not match the current subscription.", status: existingFields.subscriptionStatus?.stringValue || "UNKNOWN" };
+  }
+  if (currentPaymentId && paymentId && currentPaymentId !== paymentId) {
+    return { success: true, message: "Refund does not match the current subscription payment.", status: existingFields.subscriptionStatus?.stringValue || "UNKNOWN" };
+  }
+
+  if (isEventStale(existingFields, incomingEventTimeMs)) {
+    return { success: true, message: "Ignored stale or out-of-order refund event.", status: existingFields.subscriptionStatus?.stringValue || "UNKNOWN" };
+  }
 
   if (existingFields && existingFields.exists) {
     const subId = existingFields.subscriptionId?.stringValue;
     // Cancel subscription on Razorpay if active
-    if (subId && subId.startsWith("sub_") && env.RAZORPAY_KEY_ID && env.RAZORPAY_KEY_SECRET) {
-      try {
-        const authHeaderValue = "Basic " + btoa(`${env.RAZORPAY_KEY_ID.trim()}:${env.RAZORPAY_KEY_SECRET.trim()}`);
-        await fetch(`https://api.razorpay.com/v1/subscriptions/${subId}/cancel`, {
-          method: "POST",
-          headers: { "Authorization": authHeaderValue, "Content-Type": "application/json" },
-          body: JSON.stringify({ cancel_at_cycle_end: 0 })
-        });
-      } catch (err) {
-        console.warn("Failed to auto-cancel Razorpay subscription upon refund:", err?.message || err);
+    if (subId && subId.startsWith("sub_")) {
+      const credValidation = validateRazorpayCredentials(env);
+      if (credValidation.valid) {
+        try {
+          const authHeaderValue = "Basic " + btoa(`${credValidation.keyId}:${credValidation.keySecret}`);
+          await fetch(`https://api.razorpay.com/v1/subscriptions/${encodeURIComponent(subId)}/cancel`, {
+            method: "POST",
+            headers: { "Authorization": authHeaderValue, "Content-Type": "application/json" },
+            body: JSON.stringify({ cancel_at_cycle_end: 0 })
+          });
+        } catch (err) {
+          console.warn("Failed to auto-cancel Razorpay subscription upon refund:", err?.message || err);
+        }
       }
     }
   }
@@ -3665,6 +4476,20 @@ export default {
       return jsonResponse({ error: "Payload Too Large. Request exceeds 256KB limit." }, 413, request);
     }
 
+    if (request.method === "POST" && request.body) {
+      try {
+        const boundedBody = await readBoundedRequestBody(request, 256 * 1024);
+        const boundedHeaders = new Headers(request.headers);
+        boundedHeaders.delete("Content-Length");
+        request = new Request(request, { headers: boundedHeaders, body: boundedBody });
+      } catch (bodyError) {
+        if (bodyError?.code === "PAYLOAD_TOO_LARGE") {
+          return jsonResponse({ error: "Payload Too Large. Request exceeds 256KB limit." }, 413, request);
+        }
+        return jsonResponse({ error: "Unable to read request body." }, 400, request);
+      }
+    }
+
     // Global Request Hardening: Enforce JSON content-type on mutation requests that send a request body
     if (request.method === "POST") {
       const contentType = request.headers.get("Content-Type") || "";
@@ -3677,7 +4502,11 @@ export default {
         "/api/create-subscription",
         "/api/verify-subscription",
         "/api/cancel-subscription",
-        "/api/backup"
+        "/api/restore-subscription",
+        "/api/backup",
+        "/api/backup/init",
+        "/api/backup/chunk",
+        "/api/backup/finalize"
       ];
       
       if (bodyEndpoints.includes(path) || (hasBody && contentType.length > 0)) {
@@ -3692,7 +4521,11 @@ export default {
       // Root / Health Check (Public Rate Limit: 60 req / 60s per IP)
       // ---------------------------------------------------------------------
       if (path === "/" || path === "/health") {
-        const rateCheck = checkRateLimit(`ip_health_${clientIp}`, 60, 60000);
+        if (request.method !== "GET") {
+          return jsonResponse({ error: "Method Not Allowed. Use GET." }, 405, request);
+        }
+
+        const rateCheck = await checkRateLimit(`ip_health_${clientIp}`, 60, 60000, { failClosed: false }, env);
         if (!rateCheck.allowed) {
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
@@ -3701,7 +4534,11 @@ export default {
             { "Retry-After": rateCheck.retryAfterSec.toString() }
           );
         }
-        return jsonResponse({ status: "healthy", service: "Re:Focus Edge Worker", model: "recurring_autopay_v2" }, 200, request);
+        return jsonResponse({
+          status: "healthy",
+          service: "Re:Focus Edge Worker",
+          model: "recurring_autopay_v2"
+        }, 200, request);
       }
 
       // ---------------------------------------------------------------------
@@ -3715,8 +4552,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use GET." }, 405, request);
         }
 
-        const rateCheck = checkRateLimit(`ip_time_${clientIp}`, 30, 60000);
+        const rateCheck = await checkRateLimit(`ip_time_${clientIp}`, 30, 60000, { failClosed: false }, env);
         if (!rateCheck.allowed) {
+          if (rateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (rateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
             429,
@@ -3726,7 +4571,7 @@ export default {
         }
 
         // Validate App Check attestation
-        await validateAppCheck(request, env);
+        await validateAppCheck(request, env, { mode: "audit" });
 
         const serverTime = Date.now();
         const clientEchoHeader = request.headers.get("X-Client-Timestamp");
@@ -3751,8 +4596,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const rateCheck = checkRateLimit(`ip_webhook_${clientIp}`, 120, 60000);
+        const rateCheck = await checkRateLimit(`ip_webhook_${clientIp}`, 120, 60000, { failClosed: true }, env);
         if (!rateCheck.allowed) {
+          if (rateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (rateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
             429,
@@ -3787,35 +4640,67 @@ export default {
           return jsonResponse({ error: "Invalid JSON payload" }, 400, request);
         }
 
-        const eventId = eventPayload.event_id || eventPayload.id;
-        const eventType = eventPayload.event;
+        const rawHeaderEventId = request.headers.get("x-razorpay-event-id") || request.headers.get("X-Razorpay-Event-Id");
+        const headerEventId = typeof rawHeaderEventId === "string" ? rawHeaderEventId.trim() : "";
+        const rawBodyEventId = (typeof eventPayload?.event_id === "string" && eventPayload.event_id.trim()) ||
+                               (typeof eventPayload?.id === "string" && eventPayload.id.trim()) ||
+                               "";
+        if (headerEventId && rawBodyEventId && headerEventId !== rawBodyEventId) {
+          console.warn("Razorpay webhook event ID discrepancy: header and body differ; prioritizing header event ID.");
+        }
+        const eventId = headerEventId || rawBodyEventId;
+        const eventType = typeof eventPayload?.event === "string" ? eventPayload.event.trim() : "";
 
         if (!eventId || !eventType) {
           return jsonResponse({ error: "Missing event identifier or event type" }, 400, request);
         }
 
+        if (eventId.length > 255 || eventId.includes("/")) {
+          return jsonResponse({ error: "Invalid event identifier" }, 400, request);
+        }
+
         console.log(`Processing Razorpay Webhook Event: ${eventType} (ID: ${eventId})`);
 
         const subscriptionEntity = eventPayload.payload?.subscription?.entity;
-        const paymentEntity = eventPayload.payload?.payment?.entity;
+        let paymentEntity = eventPayload.payload?.payment?.entity;
         const orderEntity = eventPayload.payload?.order?.entity;
         const refundEntity = eventPayload.payload?.refund?.entity;
 
-        const subId = subscriptionEntity?.id || paymentEntity?.subscription_id || "";
         const paymentId = paymentEntity?.id || refundEntity?.payment_id || "";
+        const isRefundEvent = eventType === "refund.processed" || eventType === "refund.created" || eventType === "refund.failed";
+        if (isRefundEvent && !paymentEntity && paymentId) {
+          const credentials = validateRazorpayCredentials(env);
+          if (!credentials.valid) throw new Error("Refund payment lookup configuration is unavailable.");
+          const authHeaderValue = "Basic " + btoa(`${credentials.keyId}:${credentials.keySecret}`);
+          const paymentResponse = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, {
+            headers: { "Authorization": authHeaderValue }
+          });
+          if (!paymentResponse.ok) throw new Error("Refund payment lookup failed.");
+          const fetchedPayment = await paymentResponse.json();
+          if (fetchedPayment?.id !== paymentId) throw new Error("Refund payment lookup returned a mismatched payment.");
+          paymentEntity = fetchedPayment;
+        }
+
+        const subId = subscriptionEntity?.id || paymentEntity?.subscription_id || "";
         const orderId = orderEntity?.id || paymentEntity?.order_id || "";
 
         // Resolve Firebase UID via notes or subscription mapping
-        let firebaseUid = subscriptionEntity?.notes?.firebase_uid || 
-                          paymentEntity?.notes?.firebase_uid || 
-                          orderEntity?.notes?.firebase_uid;
+        const noteUid = subscriptionEntity?.notes?.firebase_uid ||
+                        paymentEntity?.notes?.firebase_uid ||
+                        orderEntity?.notes?.firebase_uid;
+        const mappedUid = subId ? await lookupSubscriptionUid(subId, env) : "";
+        let firebaseUid = noteUid;
 
-        if (!firebaseUid && subId) {
-          firebaseUid = await lookupSubscriptionUid(subId, env);
+        if (isRefundEvent && noteUid && mappedUid && noteUid !== mappedUid) {
+          console.warn("Refund webhook ownership conflict between Razorpay notes and subscription mapping.");
+          firebaseUid = "";
+        } else if (!firebaseUid && mappedUid) {
+          firebaseUid = mappedUid;
         }
 
-        // Exact-once idempotency guard
-        const isFirstProcessing = await recordProcessedEventAtomic(eventId, {
+        // Claim with a Firestore compare-and-set. A duplicate active attempt is
+        // retryable, while a completed event is safe to acknowledge.
+        const claim = await claimProcessedEventAtomic(eventId, {
           eventType,
           paymentId,
           subscriptionId: subId,
@@ -3823,30 +4708,57 @@ export default {
           firebaseUid: firebaseUid || ""
         }, env);
 
-        if (!isFirstProcessing) {
+        if (claim.completed) {
           return jsonResponse({ status: "already_processed", event_id: eventId }, 200, request);
         }
+        if (claim.inProgress) {
+          return jsonResponse(
+            { status: "processing", event_id: eventId },
+            503,
+            request,
+            { "Retry-After": "5" }
+          );
+        }
 
-        switch (eventType) {
+        let outcome;
+        try {
+          switch (eventType) {
           // 1. Mandate Authenticated
           case "subscription.authenticated": {
             if (firebaseUid && subId) {
-              await recordSubscriptionUidMap(subId, firebaseUid, subscriptionEntity?.plan_id, env);
+              const mappingResult = await recordSubscriptionUidMap(subId, firebaseUid, subscriptionEntity?.plan_id, env);
+              if (!mappingResult.success) throw new Error("Failed to persist subscription ownership mapping.");
             }
-            return jsonResponse({ status: "processed_authenticated", subscription_id: subId }, 200, request);
+            outcome = { status: "processed_authenticated", subscription_id: subId };
+            break;
           }
 
           // 2. Initial Activation & 3. Recurring Charged
           case "subscription.activated":
           case "subscription.charged": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid", subscription_id: subId }, 200, request);
+              outcome = { status: "ignored_missing_uid", subscription_id: subId };
+              break;
             }
 
             const configuredPlanId = env.RAZORPAY_PLAN_ID?.trim();
             if (configuredPlanId && subscriptionEntity?.plan_id && subscriptionEntity.plan_id !== configuredPlanId) {
               console.warn(`Webhook plan mismatch: expected ${configuredPlanId}, got ${subscriptionEntity.plan_id}`);
-              return jsonResponse({ status: "ignored_plan_mismatch" }, 200, request);
+              outcome = { status: "ignored_plan_mismatch" };
+              break;
+            }
+
+            if (paymentEntity) {
+              if (paymentEntity.currency && paymentEntity.currency !== EXPECTED_PLAN_CURRENCY) {
+                console.warn(`Webhook payment currency mismatch: expected ${EXPECTED_PLAN_CURRENCY}, got ${paymentEntity.currency}`);
+                outcome = { status: "ignored_currency_mismatch" };
+                break;
+              }
+              if (typeof paymentEntity.amount === "number" && paymentEntity.amount !== EXPECTED_PLAN_AMOUNT_PAISE) {
+                console.warn(`Webhook payment amount mismatch: expected ${EXPECTED_PLAN_AMOUNT_PAISE}, got ${paymentEntity.amount}`);
+                outcome = { status: "ignored_amount_mismatch" };
+                break;
+              }
             }
 
             const result = await reconcileSubscriptionActivation(firebaseUid, {
@@ -3860,66 +4772,107 @@ export default {
               updated_at: subscriptionEntity?.updated_at || paymentEntity?.created_at
             }, env, eventId, eventPayload);
 
-            return jsonResponse({ status: "processed", result }, 200, request);
+            if (!result?.success) throw new Error("Subscription activation reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           // 4. Payment Failure / Retry Pending (Grace Period)
           case "subscription.pending": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid" }, 200, request);
+              outcome = { status: "ignored_missing_uid" };
+              break;
             }
             const result = await reconcileSubscriptionPending(firebaseUid, subId, env, eventId, eventPayload);
-            return jsonResponse({ status: "processed", result }, 200, request);
+            if (!result?.success) throw new Error("Subscription pending reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           // 5. Subscription Halted (Retries Exhausted)
           case "subscription.halted": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid" }, 200, request);
+              outcome = { status: "ignored_missing_uid" };
+              break;
             }
             const result = await reconcileSubscriptionHalted(firebaseUid, subId, env, eventId, eventPayload);
-            return jsonResponse({ status: "processed", result }, 200, request);
+            if (!result?.success) throw new Error("Subscription halted reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           // 6. Subscription Cancelled
           case "subscription.cancelled": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid" }, 200, request);
+              outcome = { status: "ignored_missing_uid" };
+              break;
             }
             const cancelAtCycleEnd = subscriptionEntity?.cancel_at_cycle_end === 1 || subscriptionEntity?.cancel_at_cycle_end === true;
             const currentEndSec = subscriptionEntity?.current_end;
             const result = await reconcileSubscriptionCancelled(firebaseUid, subId, cancelAtCycleEnd, currentEndSec, env, eventId, eventPayload);
-            return jsonResponse({ status: "processed", result }, 200, request);
+            if (!result?.success) throw new Error("Subscription cancellation reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           // 7. Subscription Completed (120 cycles reached)
           case "subscription.completed": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid" }, 200, request);
+              outcome = { status: "ignored_missing_uid" };
+              break;
             }
             const result = await reconcileSubscriptionCompleted(firebaseUid, subId, subscriptionEntity?.current_end, env, eventId, eventPayload);
-            return jsonResponse({ status: "processed", result }, 200, request);
+            if (!result?.success) throw new Error("Subscription completion reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           // 8. Payment Failed Notification
           case "payment.failed": {
-            return jsonResponse({ status: "processed_payment_failed", payment_id: paymentId }, 200, request);
+            outcome = { status: "processed_payment_failed", payment_id: paymentId };
+            break;
           }
 
-          // 9. Refund Processed
-          case "refund.processed":
+          // Refund creation is pending; only a successful refund changes entitlement.
           case "refund.created": {
+            outcome = { status: "refund_pending", refund_id: refundEntity?.id || null };
+            break;
+          }
+
+          // Failed refunds leave the current entitlement unchanged.
+          case "refund.failed": {
+            outcome = { status: "refund_failed_no_entitlement_change", refund_id: refundEntity?.id || null };
+            break;
+          }
+
+          // A processed refund is the only refund event that revokes entitlement.
+          case "refund.processed": {
             if (!firebaseUid) {
-              return jsonResponse({ status: "ignored_missing_uid" }, 200, request);
+              outcome = { status: "ignored_missing_uid" };
+              break;
             }
-            const result = await reconcileSubscriptionRefund(firebaseUid, paymentId, refundEntity?.id || "refund_auto", env, eventId, eventPayload);
-            return jsonResponse({ status: "processed", result }, 200, request);
+            const result = await reconcileSubscriptionRefund(firebaseUid, paymentId, refundEntity?.id || "refund_auto", env, eventId, eventPayload, subId);
+            if (!result?.success) throw new Error("Subscription refund reconciliation did not complete.");
+            outcome = { status: "processed", result };
+            break;
           }
 
           default: {
-            return jsonResponse({ status: "ignored_unhandled_type" }, 200, request);
+            outcome = { status: "ignored_unhandled_type" };
+            break;
           }
+          }
+        } catch (processingError) {
+          try {
+            await setWebhookEventState(eventId, claim, "FAILED", env, processingError?.name || "ProcessingError");
+          } catch (stateError) {
+            console.error("Failed to release Razorpay webhook event claim:", stateError?.name || "Error");
+          }
+          throw processingError;
         }
+
+        await setWebhookEventState(eventId, claim, "COMPLETED", env);
+        return jsonResponse(outcome, 200, request);
       }
 
       // ---------------------------------------------------------------------
@@ -3934,11 +4887,13 @@ export default {
         "/api/create-subscription",
         "/api/verify-subscription",
         "/api/cancel-subscription",
+        "/api/restore-subscription",
         "/api/backup/status",
         "/api/backup",
         "/api/backup/init",
         "/api/backup/chunk",
         "/api/backup/finalize",
+        "/api/backup/abort",
         "/api/restore",
         "/api/restore/ack",
         "/api/restore/abort",
@@ -3947,8 +4902,16 @@ export default {
       ];
 
       if (!KNOWN_AUTH_PATHS.includes(path)) {
-        const notFoundRateCheck = checkRateLimit(`ip_404_${clientIp}`, 30, 60000);
+        const notFoundRateCheck = await checkRateLimit(`ip_404_${clientIp}`, 30, 60000, { failClosed: true }, env);
         if (!notFoundRateCheck.allowed) {
+          if (notFoundRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (notFoundRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: notFoundRateCheck.retryAfterSec },
             429,
@@ -3965,8 +4928,16 @@ export default {
 
       // 1. Global Pre-Auth IP Ceiling (120 req / 60s per IP across all protected routes)
       // Enforced BEFORE expensive JWT verification to prevent unauthenticated / invalid-token DoS exhaustion
-      const globalAuthRateCheck = checkRateLimit(`ip_auth_global_${clientIp}`, 120, 60000);
+      const globalAuthRateCheck = await checkRateLimit(`ip_auth_global_${clientIp}`, 120, 60000, { failClosed: true }, env);
       if (!globalAuthRateCheck.allowed) {
+          if (globalAuthRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (globalAuthRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
         return jsonResponse(
           { error: "Too many requests. Please try again later.", retryAfter: globalAuthRateCheck.retryAfterSec },
           429,
@@ -3977,8 +4948,16 @@ export default {
 
       // 2. IP Authentication Failure Ceiling (20 failed attempts / 60s per IP)
       // Throttles credential stuffing, token fuzzing, and unauthenticated brute force before crypto verification
-      const authFailCheck = checkRateLimit(`ip_auth_fail_${clientIp}`, 20, 60000, false);
+      const authFailCheck = await checkRateLimit(`ip_auth_fail_${clientIp}`, 20, 60000, false, env);
       if (!authFailCheck.allowed) {
+          if (authFailCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (authFailCheck.retryAfterSec || 60).toString() }
+            );
+          }
         return jsonResponse(
           { error: "Too many authentication failures. Please try again later.", retryAfter: authFailCheck.retryAfterSec },
           429,
@@ -3994,10 +4973,24 @@ export default {
         user = await authenticateRequest(request, env);
       } catch (authErr) {
         // Record failed attestation/authentication attempt against this IP
-        checkRateLimit(`ip_auth_fail_${clientIp}`, 20, 60000, true);
+        await checkRateLimit(`ip_auth_fail_${clientIp}`, 20, 60000, { record: true, failClosed: false }, env);
         throw authErr;
       }
       const uid = user.uid;
+
+      // Zero-Trust Authorization: Reject client-supplied UID mismatches across all authenticated POST endpoints
+      if (request.method === "POST") {
+        try {
+          const bodyClone = await request.clone().json().catch(() => null);
+          if (bodyClone && typeof bodyClone === "object" && bodyClone.uid !== undefined && bodyClone.uid !== uid) {
+            return jsonResponse({
+              success: false,
+              code: "UID_MISMATCH",
+              error: "Forbidden: Client-supplied UID does not match authenticated token owner."
+            }, 403, request);
+          }
+        } catch (_ignored) {}
+      }
 
       // ---------------------------------------------------------------------
       // Account Lifecycle: GET /api/account/status
@@ -4008,8 +5001,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use GET." }, 405, request);
         }
 
-        const rateCheck = checkRateLimit(`uid_status_${uid}`, 30, 60000);
+        const rateCheck = await checkRateLimit(`uid_status_${uid}`, 30, 60000, { failClosed: true }, env);
         if (!rateCheck.allowed) {
+          if (rateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (rateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
             429,
@@ -4018,8 +5019,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_status_${clientIp}`, 180, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_status_${clientIp}`, 180, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4092,8 +5101,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const rateCheck = checkRateLimit(`uid_req_del_${uid}`, 5, 60000);
+        const rateCheck = await checkRateLimit(`uid_req_del_${uid}`, 5, 60000, { failClosed: true }, env);
         if (!rateCheck.allowed) {
+          if (rateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (rateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
             429,
@@ -4102,8 +5119,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_req_del_${clientIp}`, 15, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_req_del_${clientIp}`, 15, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4112,14 +5137,26 @@ export default {
           );
         }
 
-        const accountDoc = await getFirestoreAccountStatus(uid, env);
-        if (accountDoc?.error) {
+        const [accountDoc, tombstoneDoc] = await Promise.all([
+          getFirestoreAccountStatus(uid, env),
+          getFirestoreAccountTombstone(uid, env)
+        ]);
+        if (accountDoc?.error || tombstoneDoc?.error) {
           return jsonResponse({ error: "Account status verification unavailable. Please try again." }, 503, request);
         }
         const currentStatus = accountDoc?.accountStatus?.stringValue || "ACTIVE";
+        const tombstoneStatus = tombstoneDoc.fields?.accountStatus?.stringValue;
+        const tombstonePurgeState = tombstoneDoc.fields?.purgeState?.stringValue;
 
-        if (currentStatus === "DELETED") {
+        if (currentStatus === "DELETED" || tombstoneStatus === "DELETED" || tombstonePurgeState === "COMPLETED" || tombstonePurgeState === "PENDING_RETRY") {
           return jsonResponse({ error: "Account is already deleted." }, 410, request);
+        }
+
+        if (tombstonePurgeState === "IN_PROGRESS") {
+          return jsonResponse({
+            error: "Account purge is currently in progress.",
+            code: "PURGE_IN_PROGRESS"
+          }, 409, request);
         }
 
         if (currentStatus === "PENDING_DELETION" && accountDoc?.deletionScheduledFor?.timestampValue) {
@@ -4141,6 +5178,15 @@ export default {
               message: "Account deletion window expired. Data permanently purged."
             }, 410, request);
           }
+
+          // Ensure durable tombstone exists in account_tombstones for scheduled discovery
+          await recordFirestoreAccountTombstone(uid, {
+            uid: { stringValue: uid },
+            accountStatus: { stringValue: "PENDING_DELETION" },
+            purgeState: { stringValue: "PENDING_DELETION" },
+            deletionScheduledFor: { timestampValue: existingScheduledFor },
+            updatedAt: { timestampValue: new Date().toISOString() }
+          }, env).catch(() => {});
 
           return jsonResponse({
             message: "Account deletion request already pending.",
@@ -4178,6 +5224,19 @@ export default {
           updatedAt: { timestampValue: requestedAtIso }
         }, env);
 
+        // Record durable tombstone in account_tombstones with OCC precondition if tombstone exists
+        const tombstonePrecondition = (tombstoneDoc.exists && tombstoneDoc.updateTime)
+          ? { expectedUpdateTime: tombstoneDoc.updateTime }
+          : {};
+        await recordFirestoreAccountTombstone(uid, {
+          uid: { stringValue: uid },
+          accountStatus: { stringValue: "PENDING_DELETION" },
+          purgeState: { stringValue: "PENDING_DELETION" },
+          deletionRequestedAt: { timestampValue: requestedAtIso },
+          deletionScheduledFor: { timestampValue: scheduledForIso },
+          updatedAt: { timestampValue: requestedAtIso }
+        }, env, tombstonePrecondition).catch(err => console.warn("Failed recording account tombstone on request-deletion:", err?.name || "Error"));
+
         console.log(`Account deletion requested. Scheduled for ${scheduledForIso}`);
 
         return jsonResponse({
@@ -4197,8 +5256,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const rateCheck = checkRateLimit(`uid_cancel_del_${uid}`, 5, 60000);
+        const rateCheck = await checkRateLimit(`uid_cancel_del_${uid}`, 5, 60000, { failClosed: true }, env);
         if (!rateCheck.allowed) {
+          if (rateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (rateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: rateCheck.retryAfterSec },
             429,
@@ -4207,8 +5274,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_cancel_del_${clientIp}`, 15, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_cancel_del_${clientIp}`, 15, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4217,27 +5292,75 @@ export default {
           );
         }
 
-        const accountDoc = await getFirestoreAccountStatus(uid, env);
-        if (accountDoc?.error) {
+        const [accountDoc, tombstoneDoc] = await Promise.all([
+          getFirestoreAccountStatus(uid, env),
+          getFirestoreAccountTombstone(uid, env)
+        ]);
+
+        if (accountDoc?.error || tombstoneDoc?.error) {
           return jsonResponse({ error: "Account status verification unavailable. Please try again." }, 503, request);
         }
-        const currentStatus = accountDoc?.accountStatus?.stringValue || "ACTIVE";
 
-        if (currentStatus === "DELETED") {
-          return jsonResponse({ error: "Account is permanently deleted and cannot be restored." }, 410, request);
+        const currentStatus = accountDoc?.accountStatus?.stringValue || "ACTIVE";
+        const tombstoneStatus = tombstoneDoc.fields?.accountStatus?.stringValue;
+        const tombstonePurgeState = tombstoneDoc.fields?.purgeState?.stringValue;
+        const nowMs = Date.now();
+
+        // 1. Active purge check:
+        if (tombstonePurgeState === "IN_PROGRESS") {
+          const leaseExpiresAtMs = Number(tombstoneDoc.fields?.leaseExpiresAtMs?.integerValue || 0);
+          const safeUpdateTimeMs = tombstoneDoc.fields?.updatedAt?.timestampValue
+            ? new Date(tombstoneDoc.fields.updatedAt.timestampValue).getTime()
+            : (tombstoneDoc.updateTime ? new Date(tombstoneDoc.updateTime).getTime() : 0);
+          const isLeaseActive = (nowMs < leaseExpiresAtMs) && ((nowMs - safeUpdateTimeMs) < (15 * 60 * 1000));
+          if (isLeaseActive) {
+            return jsonResponse({
+              error: "Account purge is currently in progress and cannot be cancelled.",
+              code: "PURGE_IN_PROGRESS"
+            }, 409, request);
+          }
+          // Lease expired while IN_PROGRESS: partial deletion may have already occurred
+          return jsonResponse({
+            error: "Account has been permanently deleted or is undergoing irreversible purge.",
+            code: "ACCOUNT_ALREADY_PURGED",
+            accountStatus: "DELETED",
+            purgeState: "PENDING_RETRY"
+          }, 410, request);
         }
 
-        if (currentStatus !== "PENDING_DELETION") {
+        // 2. Partial deletion / awaiting retry check:
+        if (tombstonePurgeState === "PENDING_RETRY" || accountDoc?.purgeState?.stringValue === "PENDING_RETRY") {
+          return jsonResponse({
+            error: "Account has been permanently deleted or is undergoing irreversible purge.",
+            code: "ACCOUNT_ALREADY_PURGED",
+            accountStatus: "DELETED",
+            purgeState: "PENDING_RETRY"
+          }, 410, request);
+        }
+
+        // 3. Permanent/terminal deletion check:
+        if (currentStatus === "DELETED" || tombstoneStatus === "DELETED" || tombstonePurgeState === "COMPLETED") {
+          return jsonResponse({
+            error: "Account is permanently deleted and cannot be restored.",
+            code: "ACCOUNT_ALREADY_DELETED",
+            accountStatus: "DELETED",
+            purgeState: "COMPLETED"
+          }, 410, request);
+        }
+
+        // 4. Pending deletion check:
+        if (currentStatus !== "PENDING_DELETION" && tombstoneStatus !== "PENDING_DELETION") {
           return jsonResponse({
             message: "Account is not pending deletion.",
             accountStatus: currentStatus
           }, 200, request);
         }
 
-        const scheduledForStr = accountDoc?.deletionScheduledFor?.timestampValue;
+        // 5. Grace period expiration check:
+        const scheduledForStr = accountDoc?.deletionScheduledFor?.timestampValue || tombstoneDoc.fields?.deletionScheduledFor?.timestampValue;
         const scheduledForMs = scheduledForStr ? new Date(scheduledForStr).getTime() : 0;
 
-        if (Date.now() > scheduledForMs) {
+        if (nowMs > scheduledForMs) {
           console.log("Cancel deletion rejected: Grace period expired. Purging.");
           const purgeResult = await purgeAccountData(uid, env);
           if (!purgeResult.success) {
@@ -4254,12 +5377,70 @@ export default {
           }, 410, request);
         }
 
-        const nowIso = new Date().toISOString();
-        await updateFirestoreAccountStatus(uid, {
+        // 6. Atomic transition:
+        // Update account_tombstones with OCC precondition
+        const nowIso = new Date(nowMs).toISOString();
+        const tombstoneOptions = (tombstoneDoc.exists && tombstoneDoc.updateTime)
+          ? { expectedUpdateTime: tombstoneDoc.updateTime }
+          : {};
+
+        const tombstoneCancelRes = await recordFirestoreAccountTombstone(uid, {
+          uid: { stringValue: uid },
           accountStatus: { stringValue: "ACTIVE" },
+          purgeState: { stringValue: "CANCELLED" },
           restoredAt: { timestampValue: nowIso },
           updatedAt: { timestampValue: nowIso }
-        }, env);
+        }, env, tombstoneOptions);
+
+        if (!tombstoneCancelRes.success) {
+          if (tombstoneCancelRes.conflict) {
+            // Concurrent race: another worker claimed purge lock or updated tombstone!
+            const freshTomb = await getFirestoreAccountTombstone(uid, env);
+            const freshPurgeState = freshTomb.fields?.purgeState?.stringValue;
+            if (freshPurgeState === "IN_PROGRESS") {
+              return jsonResponse({
+                error: "Account purge is currently in progress and cannot be cancelled.",
+                code: "PURGE_IN_PROGRESS"
+              }, 409, request);
+            }
+            return jsonResponse({
+              error: "Account has been permanently deleted or is undergoing irreversible purge.",
+              code: "ACCOUNT_ALREADY_PURGED",
+              accountStatus: "DELETED",
+              purgeState: freshPurgeState || "DELETED"
+            }, 410, request);
+          }
+          return jsonResponse({ error: "Failed to cancel account deletion. Please try again." }, 500, request);
+        }
+
+        // Update users/${uid}/account/status
+        try {
+          const statusOptions = (accountDoc.exists && accountDoc.updateTime)
+            ? { expectedUpdateTime: accountDoc.updateTime }
+            : {};
+          await updateFirestoreAccountStatus(uid, {
+            accountStatus: { stringValue: "ACTIVE" },
+            restoredAt: { timestampValue: nowIso },
+            updatedAt: { timestampValue: nowIso }
+          }, env, statusOptions);
+        } catch (err) {
+          if (err.conflict) {
+            console.warn("Conflict updating account status to ACTIVE; re-verifying current status.");
+            const recheck = await getFirestoreAccountStatus(uid, env);
+            if (recheck?.accountStatus?.stringValue === "DELETED") {
+              return jsonResponse({
+                error: "Account has been permanently deleted and cannot be restored.",
+                code: "ACCOUNT_ALREADY_DELETED",
+                accountStatus: "DELETED"
+              }, 410, request);
+            }
+          }
+          await updateFirestoreAccountStatus(uid, {
+            accountStatus: { stringValue: "ACTIVE" },
+            restoredAt: { timestampValue: nowIso },
+            updatedAt: { timestampValue: nowIso }
+          }, env).catch(e => console.warn("Non-fatal: fallback status doc update on cancel:", e?.name || "Error"));
+        }
 
         console.log("Account deletion cancelled. Restored to ACTIVE.");
 
@@ -4278,8 +5459,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_ensure_sub_${uid}`, 10, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_ensure_sub_${uid}`, 10, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -4288,8 +5477,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_ensure_sub_${clientIp}`, 30, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_ensure_sub_${clientIp}`, 30, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4444,24 +5641,143 @@ export default {
           const isTrialActive = trialEndMs > 0 && nowMs < trialEndMs;
           const correctTrialStatus = isTrialActive ? "TRIAL" : "EXPIRED";
 
-          if (!existingFields || !existingFields.exists) {
-            // Recreated account after deletion or fresh install missing status doc:
-            // Restore document preserving original trial duration (never grant a fresh 7 days)
-            const restoredFields = {
-              subscriptionStatus: { stringValue: correctTrialStatus },
-              trialStart: claimedAtField,
-              trialEnd: { timestampValue: new Date(trialEndMs).toISOString() },
-              trialStartDate: claimedAtField,
-              trialEndDate: { timestampValue: new Date(trialEndMs).toISOString() },
-              updatedAt: { timestampValue: now.toISOString() },
-              premium: { booleanValue: false }
-            };
-            await updateFirestoreSubscription(uid, restoredFields, env);
-          } else {
-            const currentStatus = existingFields.subscriptionStatus?.stringValue || existingFields.status?.stringValue || "NONE";
-            const isPremium = existingFields.premium?.booleanValue === true || currentStatus === "ACTIVE";
+          let restoredPaidSub = false;
+          let currentStatus = "NONE";
+          let isPremium = false;
+          let gatewayCheckFailed = false;
+          let currentPeriodStartMs = 0;
+          let currentPeriodEndMs = 0;
+          let activeSubId = null;
 
-            if (!isPremium) {
+          if (!existingFields || !existingFields.exists) {
+            // Check if user has an existing paid subscription in subscription_map before reverting to trial
+            try {
+              const mappedSubs = await findSubscriptionsByUid(uid, env);
+              if (mappedSubs && mappedSubs.length > 0) {
+                for (const candidateSubId of mappedSubs) {
+                  const subEntity = await fetchAndVerifyRazorpaySubscription(candidateSubId, uid, env);
+                  if (subEntity && subEntity.status === "active") {
+                    const actRes = await reconcileSubscriptionActivation(uid, subEntity, env);
+                    if (actRes && actRes.success) {
+                      restoredPaidSub = true;
+                      isPremium = true;
+                      currentStatus = "ACTIVE";
+                      break;
+                    }
+                  }
+                }
+              }
+            } catch (checkErr) {
+              console.warn("Non-fatal: error checking subscription_map on ensure-subscription:", checkErr?.name || "Error");
+            }
+
+            if (!restoredPaidSub) {
+              // Recreated account after deletion or fresh install missing status doc:
+              // Restore document preserving original trial duration (never grant a fresh 7 days)
+              const restoredFields = {
+                subscriptionStatus: { stringValue: correctTrialStatus },
+                trialStart: claimedAtField,
+                trialEnd: { timestampValue: new Date(trialEndMs).toISOString() },
+                trialStartDate: claimedAtField,
+                trialEndDate: { timestampValue: new Date(trialEndMs).toISOString() },
+                updatedAt: { timestampValue: now.toISOString() },
+                premium: { booleanValue: false }
+              };
+              await updateFirestoreSubscription(uid, restoredFields, env);
+            }
+          } else {
+            currentStatus = existingFields.subscriptionStatus?.stringValue || existingFields.status?.stringValue || "NONE";
+
+            currentPeriodStartMs = extractFieldTimestampMs(existingFields.currentPeriodStart || existingFields.currentPeriodStartDate);
+            currentPeriodEndMs = extractFieldTimestampMs(existingFields.currentPeriodEnd || existingFields.currentPeriodEndDate);
+            activeSubId = existingFields.subscriptionId?.stringValue || null;
+
+            const isPaidPeriodExpired = currentPeriodEndMs > 0 && nowMs >= currentPeriodEndMs;
+
+            if (isPaidPeriodExpired && currentStatus === "ACTIVE") {
+              let renewed = false;
+              const subId = existingFields.subscriptionId?.stringValue;
+              if (subId && subId.startsWith("sub_")) {
+                try {
+                  const subEntity = await fetchAndVerifyRazorpaySubscription(subId, uid, env);
+                  if (subEntity && subEntity.status === "active") {
+                    const rzpEndMs = typeof subEntity.current_end === "number"
+                      ? (subEntity.current_end < 1e12 ? subEntity.current_end * 1000 : subEntity.current_end)
+                      : 0;
+                    if (rzpEndMs > nowMs) {
+                      const actRes = await reconcileSubscriptionActivation(uid, subEntity, env);
+                      if (actRes && actRes.success) {
+                        renewed = true;
+                        currentStatus = "ACTIVE";
+                        isPremium = true;
+                        currentPeriodEndMs = actRes.currentPeriodEnd || rzpEndMs;
+                        currentPeriodStartMs = actRes.currentPeriodStart || currentPeriodStartMs;
+                        activeSubId = subId;
+                      }
+                    }
+                  }
+                } catch (checkErr) {
+                  gatewayCheckFailed = true;
+                  console.warn("Non-fatal: error checking Razorpay renewal on ensure-subscription:", checkErr?.name || "Error");
+                }
+              }
+
+              if (!renewed && !gatewayCheckFailed) {
+                currentStatus = "EXPIRED";
+                isPremium = false;
+                const expireFields = {
+                  subscriptionStatus: { stringValue: "EXPIRED" },
+                  premium: { booleanValue: false },
+                  updatedAt: { timestampValue: now.toISOString() }
+                };
+                let updateTargetTime = existingFields.updateTime;
+                let attempts = 0;
+                const maxAttempts = 2;
+                while (attempts < maxAttempts) {
+                  attempts++;
+                  try {
+                    await updateFirestoreSubscription(uid, expireFields, env, updateTargetTime);
+                    currentStatus = "EXPIRED";
+                    isPremium = false;
+                    break;
+                  } catch (updateErr) {
+                    if (updateErr?.status === 412 || updateErr?.name === "PreconditionFailed") {
+                      console.warn(`Precondition failed during expiration reconciliation (attempt ${attempts}); fetching latest committed document:`, updateErr?.status || updateErr?.name);
+                      const refreshed = await getFirestoreSubscription(uid, env);
+                      if (refreshed && refreshed.exists) {
+                        currentStatus = refreshed.subscriptionStatus?.stringValue || refreshed.status?.stringValue || "NONE";
+                        const refEndMs = extractFieldTimestampMs(refreshed.currentPeriodEnd || refreshed.currentPeriodEndDate);
+                        const refPaidActive = refEndMs > nowMs;
+                        if (refPaidActive && (refreshed.premium?.booleanValue === true || currentStatus === "ACTIVE")) {
+                          isPremium = true;
+                          currentStatus = "ACTIVE";
+                          currentPeriodEndMs = refEndMs;
+                          currentPeriodStartMs = extractFieldTimestampMs(refreshed.currentPeriodStart || refreshed.currentPeriodStartDate);
+                          activeSubId = refreshed.subscriptionId?.stringValue || null;
+                          break;
+                        } else {
+                          updateTargetTime = refreshed.updateTime;
+                          currentStatus = "EXPIRED";
+                          isPremium = false;
+                        }
+                      } else {
+                        break;
+                      }
+                    } else {
+                      console.warn("Non-fatal error updating expiration in Firestore:", updateErr?.status || updateErr?.name);
+                      break;
+                    }
+                  }
+                }
+              } else if (gatewayCheckFailed) {
+                isPremium = false;
+                currentStatus = "EXPIRED";
+              }
+            } else {
+              isPremium = !isPaidPeriodExpired && (existingFields.premium?.booleanValue === true || currentStatus === "ACTIVE");
+            }
+
+            if (!isPremium && !gatewayCheckFailed) {
               if (isTrialActive && currentStatus !== "TRIAL") {
                 const reconcileFields = {
                   subscriptionStatus: { stringValue: "TRIAL" },
@@ -4486,12 +5802,17 @@ export default {
           // Ensure legacy registry is also synchronized
           recordTrialRegistry(uid, new Date(trialEndMs).toISOString(), env).catch(() => {});
 
+          const finalStatus = isPremium ? currentStatus : correctTrialStatus;
           return jsonResponse({
-            message: isTrialActive ? "Trial active" : "Trial already claimed for this account",
+            message: isPremium ? "Active premium subscription" : (isTrialActive ? "Trial active" : "Trial already claimed for this account"),
             trialAlreadyClaimed: true,
             trialActive: isTrialActive,
-            subscriptionStatus: correctTrialStatus,
-            trialEnd: trialEndMs
+            subscriptionStatus: finalStatus,
+            premium: isPremium,
+            trialEnd: trialEndMs,
+            subscriptionId: isPremium ? activeSubId : null,
+            currentPeriodStart: isPremium && currentPeriodStartMs > 0 ? new Date(currentPeriodStartMs).toISOString() : null,
+            currentPeriodEnd: isPremium && currentPeriodEndMs > 0 ? new Date(currentPeriodEndMs).toISOString() : null
           }, 200, request);
         }
 
@@ -4597,8 +5918,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_lease_${uid}`, 60, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_lease_${uid}`, 60, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -4607,8 +5936,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_lease_${clientIp}`, 60, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_lease_${clientIp}`, 60, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4644,7 +5981,7 @@ export default {
         const subscriptionId = subFields.subscriptionId?.stringValue || null;
 
         let currentPeriodEndMs = 0;
-        const rawEnd = subFields.currentPeriodEnd || subFields.currentPeriodEndDate;
+        const rawEnd = subFields.currentPeriodEnd || subFields.currentPeriodEndDate || subFields.expiryDate || subFields.expiresAt || subFields.expirationDate || subFields.premiumExpiry || subFields.validUntil || subFields.current_period_end;
         if (rawEnd?.timestampValue) {
           currentPeriodEndMs = new Date(rawEnd.timestampValue).getTime();
         } else if (rawEnd?.integerValue) {
@@ -4655,7 +5992,7 @@ export default {
         }
 
         let trialEndMs = 0;
-        const rawTrial = subFields.trialEnd || subFields.trialEndDate;
+        const rawTrial = subFields.trialEnd || subFields.trialEndDate || subFields.trialExpiresAt || subFields.trialExpiry || subFields.trial_end;
         if (rawTrial?.timestampValue) {
           trialEndMs = new Date(rawTrial.timestampValue).getTime();
         } else if (rawTrial?.integerValue) {
@@ -4668,17 +6005,24 @@ export default {
         let accessMode = null;
         let expiresAtMs = 0;
 
-        const isPaidActive = (status === "ACTIVE" || status === "PENDING" || status === "CANCELLED") &&
-          currentPeriodEndMs > 0 && nowMs < currentPeriodEndMs;
+        const isPaidActive = status !== "HALTED" && currentPeriodEndMs > 0 && nowMs < currentPeriodEndMs;
 
         // Trial is active if paid is not active and trialEnd is in the future.
-        // We do not require status === "TRIAL" because status might have been set to "EXPIRED" by the bug;
-        // if trialEnd is in future and not paid, trial is active.
-        const isTrialActive = !isPaidActive && trialEndMs > 0 && nowMs < trialEndMs;
+        const isTrialActive = !isPaidActive && status !== "HALTED" && trialEndMs > 0 && nowMs < trialEndMs;
 
         if (isPaidActive) {
           accessMode = "ACTIVE";
           expiresAtMs = currentPeriodEndMs;
+          if (status !== "ACTIVE" && status !== "CANCELLED") {
+            try {
+              await updateFirestoreSubscription(uid, {
+                subscriptionStatus: { stringValue: "ACTIVE" },
+                updatedAt: { timestampValue: new Date().toISOString() }
+              }, env);
+            } catch (reconcileErr) {
+              console.warn("Non-fatal: Failed to auto-reconcile paid subscription status during lease issuance:", reconcileErr?.name || "Error");
+            }
+          }
         } else if (isTrialActive) {
           accessMode = "TRIAL";
           expiresAtMs = trialEndMs;
@@ -4701,8 +6045,9 @@ export default {
           }, 403, request);
         }
 
-        const MAX_OFFLINE_LEASE_MS = 24 * 60 * 60 * 1000; // 24 hours
-        const leaseValidUntilMs = Math.min(nowMs + MAX_OFFLINE_LEASE_MS, expiresAtMs);
+        // Set token lease validity to the actual authoritative subscription expiration.
+        // Entitlement is validated locally against this signed lease until expiration without routine polling.
+        const leaseValidUntilMs = expiresAtMs;
         const integrityDigest = "com.reeltrak.app:df485c640bd322464a72171a516cadf3a3cbb217d0a52111f608a0300c374b66";
         const leaseVersion = 1;
         const nonce = crypto.randomUUID();
@@ -4735,8 +6080,16 @@ export default {
           return jsonResponse({ error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_create_sub_${uid}`, 5, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_create_sub_${uid}`, 5, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -4745,8 +6098,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_create_sub_${clientIp}`, 20, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_create_sub_${clientIp}`, 20, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4766,12 +6127,12 @@ export default {
 
         const body = await request.json().catch(() => ({}));
         const reqPlanId = body.planId;
-        const configuredPlanId = env.RAZORPAY_PLAN_ID?.trim();
-
-        if (!configuredPlanId) {
-          console.error("RAZORPAY_PLAN_ID configuration variable is missing in Worker environment.");
-          return jsonResponse({ error: "Server payment configuration missing plan ID" }, 500, request);
+        const planValidation = validateRazorpayPlanId(env);
+        if (!planValidation.valid) {
+          console.error("Razorpay plan validation failed:", planValidation.error);
+          return jsonResponse({ error: planValidation.error }, 500, request);
         }
+        const configuredPlanId = planValidation.planId;
 
         if (reqPlanId && reqPlanId !== configuredPlanId && reqPlanId !== "plan_monthly") {
           return jsonResponse({ error: "Invalid planId requested." }, 400, request);
@@ -4814,15 +6175,14 @@ export default {
           }
         }
 
-        const rawKeyId = env.RAZORPAY_KEY_ID;
-        const rawKeySecret = env.RAZORPAY_KEY_SECRET;
-
-        if (!rawKeyId || !rawKeySecret) {
-          return jsonResponse({ error: "Internal Server Error" }, 500, request);
+        const credValidation = validateRazorpayCredentials(env);
+        if (!credValidation.valid) {
+          console.error("Razorpay credential validation failed:", credValidation.error);
+          return jsonResponse({ error: credValidation.error || "Internal Server Error" }, 500, request);
         }
 
-        const keyId = rawKeyId.trim();
-        const keySecret = rawKeySecret.trim();
+        const keyId = credValidation.keyId;
+        const keySecret = credValidation.keySecret;
 
         // 2. Distributed atomic reservation & lock coordination across Worker isolates
         const nowMs = Date.now();
@@ -4831,7 +6191,9 @@ export default {
           if (lockResult.canReuse && lockResult.subscriptionId) {
             return jsonResponse({
               subscriptionId: lockResult.subscriptionId,
-              keyId: keyId
+              keyId: keyId,
+              amount: 7900,
+              currency: "INR"
             }, 200, request);
           }
           return jsonResponse({
@@ -4899,7 +6261,9 @@ export default {
 
         return jsonResponse({
           subscriptionId: subData.id,
-          keyId: keyId
+          keyId: keyId,
+          amount: 7900,
+          currency: "INR"
         }, 200, request);
       }
 
@@ -4912,8 +6276,16 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_verify_sub_${uid}`, 5, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_verify_sub_${uid}`, 5, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -4922,8 +6294,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_verify_sub_${clientIp}`, 20, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_verify_sub_${clientIp}`, 20, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -4944,23 +6324,22 @@ export default {
         const body = await request.json().catch(() => ({}));
         const { razorpay_subscription_id, subscription_id, razorpay_payment_id, payment_id, razorpay_signature, signature } = body;
 
-        const subId = razorpay_subscription_id || subscription_id;
-        const payId = razorpay_payment_id || payment_id;
-        const sig = razorpay_signature || signature;
+        const subId = typeof (razorpay_subscription_id || subscription_id) === "string" ? (razorpay_subscription_id || subscription_id).trim() : "";
+        const payId = typeof (razorpay_payment_id || payment_id) === "string" ? (razorpay_payment_id || payment_id).trim() : "";
+        const sig = typeof (razorpay_signature || signature) === "string" ? (razorpay_signature || signature).trim() : "";
 
         if (!subId || !payId || !sig) {
           return jsonResponse({ success: false, error: "Missing required subscription verification fields" }, 400, request);
         }
 
-        const rawKeyId = env.RAZORPAY_KEY_ID;
-        const rawKeySecret = env.RAZORPAY_KEY_SECRET;
-
-        if (!rawKeyId || !rawKeySecret) {
-          return jsonResponse({ success: false, error: "Internal Server Error" }, 500, request);
+        const credValidation = validateRazorpayCredentials(env);
+        if (!credValidation.valid) {
+          console.error("Razorpay credential validation failed:", credValidation.error);
+          return jsonResponse({ success: false, error: credValidation.error || "Internal Server Error" }, 500, request);
         }
 
-        const keyId = rawKeyId.trim();
-        const keySecret = rawKeySecret.trim();
+        const keyId = credValidation.keyId;
+        const keySecret = credValidation.keySecret;
 
         // Razorpay Subscriptions Signature format: razorpay_payment_id + "|" + razorpay_subscription_id
         const isSigValid = await verifyHmacSignature(`${payId}|${subId}`, sig, keySecret);
@@ -4970,15 +6349,43 @@ export default {
         }
 
         const authHeaderValue = "Basic " + btoa(`${keyId}:${keySecret}`);
-        const rzpRes = await fetch(`https://api.razorpay.com/v1/subscriptions/${subId}`, {
-          headers: { "Authorization": authHeaderValue }
-        });
-
-        if (!rzpRes.ok) {
-          return jsonResponse({ success: false, error: "Razorpay subscription lookup failed" }, 400, request);
+        let rzpRes;
+        try {
+          rzpRes = await fetch(`https://api.razorpay.com/v1/subscriptions/${encodeURIComponent(subId)}`, {
+            headers: { "Authorization": authHeaderValue }
+          });
+        } catch (lookupError) {
+          console.warn("Razorpay subscription lookup failed temporarily:", lookupError?.name || "Error");
+          return jsonResponse({ success: false, error: "Subscription verification is temporarily unavailable. Please retry." }, 503, request, { "Retry-After": "5" });
         }
 
-        const subscription = await rzpRes.json();
+        if (rzpRes.status === 429) {
+          const upstreamRetryAfter = rzpRes.headers.get("Retry-After");
+          const retryAfter = /^\d{1,3}$/.test(upstreamRetryAfter || "") ? upstreamRetryAfter : "5";
+          return jsonResponse({ success: false, error: "Razorpay is rate limiting verification. Please retry." }, 429, request, { "Retry-After": retryAfter });
+        }
+        if (rzpRes.status >= 500) {
+          return jsonResponse({ success: false, error: "Subscription verification is temporarily unavailable. Please retry." }, 503, request, { "Retry-After": "5" });
+        }
+        if (!rzpRes.ok) {
+          const status = rzpRes.status === 401 || rzpRes.status === 403 ? 502 : 400;
+          const error = status === 502
+            ? "Payment gateway authorization is unavailable. Please retry later."
+            : "Razorpay subscription was not found or could not be verified.";
+          return jsonResponse({ success: false, error }, status, request, status === 502 ? { "Retry-After": "5" } : {});
+        }
+
+        let subscription;
+        try {
+          subscription = await rzpRes.json();
+        } catch (malformedResponseError) {
+          console.warn("Razorpay subscription lookup returned malformed JSON.");
+          return jsonResponse({ success: false, error: "Payment gateway returned an invalid verification response. Please retry." }, 503, request, { "Retry-After": "5" });
+        }
+        if (!subscription || typeof subscription !== "object" || Array.isArray(subscription) || subscription.id !== subId) {
+          console.warn("Razorpay subscription lookup returned an invalid entity.");
+          return jsonResponse({ success: false, error: "Payment gateway returned an invalid verification response. Please retry." }, 503, request, { "Retry-After": "5" });
+        }
         
         // Confirm subscription matches configured Plan ID
         const configuredPlanId = env.RAZORPAY_PLAN_ID?.trim();
@@ -5019,7 +6426,40 @@ export default {
         const hasAuthoritativePeriod = typeof subscription.current_start === "number" && subscription.current_start > 0 &&
                                        typeof subscription.current_end === "number" && subscription.current_end > 0;
 
-        const isMandateOnly = subscription.status === "authenticated" || !hasAuthoritativePeriod;
+        let capturedPayment = null;
+        if (payId) {
+          try {
+            const payRes = await fetch(`https://api.razorpay.com/v1/payments/${payId}`, {
+              headers: { "Authorization": authHeaderValue }
+            });
+            if (payRes.ok) {
+              const paymentData = await payRes.json();
+              if (paymentData && typeof paymentData === "object") {
+                if (paymentData.currency && paymentData.currency !== EXPECTED_PLAN_CURRENCY) {
+                  console.warn(`Payment currency mismatch: expected ${EXPECTED_PLAN_CURRENCY}, got ${paymentData.currency}`);
+                  return jsonResponse({ success: false, error: "Payment currency does not match configured plan." }, 400, request);
+                }
+
+                if (paymentData.status === "captured") {
+                  if (typeof paymentData.amount === "number" && paymentData.amount !== EXPECTED_PLAN_AMOUNT_PAISE) {
+                    console.warn(`Payment amount mismatch: expected ${EXPECTED_PLAN_AMOUNT_PAISE}, got ${paymentData.amount}`);
+                    return jsonResponse({ success: false, error: "Payment amount does not match configured plan." }, 400, request);
+                  }
+                  const payNoteUid = paymentData.notes?.firebase_uid;
+                  if (!payNoteUid || payNoteUid === uid) {
+                    capturedPayment = paymentData;
+                  }
+                } else if (paymentData.status === "authorized") {
+                  console.log(`Payment ${payId} is authorized (mandate authorization), awaiting capture.`);
+                }
+              }
+            }
+          } catch (payErr) {
+            console.warn("Non-fatal: could not fetch payment entity:", payErr?.name || "Error");
+          }
+        }
+
+        const isMandateOnly = (subscription.status === "authenticated" || !hasAuthoritativePeriod) && !capturedPayment && subscription.status !== "active";
 
         if (isMandateOnly) {
           const now = new Date();
@@ -5044,15 +6484,64 @@ export default {
           }, 200, request);
         }
 
+        if (!hasAuthoritativePeriod) {
+          const existingSubscription = await getFirestoreSubscription(uid, env);
+          const existingStartMs = Date.parse(existingSubscription?.currentPeriodStart?.timestampValue || "");
+          const existingEndMs = Date.parse(existingSubscription?.currentPeriodEnd?.timestampValue || "");
+          const hasCurrentVerifiedEntitlement = existingSubscription?.exists &&
+            existingSubscription.subscriptionId?.stringValue === subId &&
+            existingSubscription.subscriptionStatus?.stringValue === "ACTIVE" &&
+            existingSubscription.premium?.booleanValue === true &&
+            Number.isFinite(existingStartMs) && Number.isFinite(existingEndMs) && existingEndMs > Date.now();
+
+          if (hasCurrentVerifiedEntitlement) {
+            return jsonResponse({
+              success: true,
+              status: "ACTIVE",
+              subscriptionId: subId,
+              message: "Existing verified subscription period preserved; Razorpay did not provide authoritative period dates."
+            }, 200, request);
+          }
+
+          return jsonResponse({
+            success: false,
+            error: "Razorpay did not provide authoritative billing-period dates. Please retry verification."
+          }, 503, request);
+        }
+
+        const startMs = subscription.current_start < 1e12 ? subscription.current_start * 1000 : subscription.current_start;
+        const endMs = subscription.current_end < 1e12 ? subscription.current_end * 1000 : subscription.current_end;
+
+        if (endMs <= startMs) {
+          console.warn(`Invalid billing period order: startMs=${startMs}, endMs=${endMs}`);
+          return jsonResponse({
+            success: false,
+            error: "Invalid billing period: period end must be after period start."
+          }, 400, request);
+        }
+
+        const durationDays = (endMs - startMs) / (24 * 60 * 60 * 1000);
+        if (durationDays < 26 || durationDays > 35) {
+          console.warn(`Non-monthly billing cycle duration detected: ${durationDays} days`);
+          return jsonResponse({
+            success: false,
+            error: "Subscription billing period is not a valid monthly interval."
+          }, 400, request);
+        }
+
         const result = await reconcileSubscriptionActivation(uid, {
           id: subscription.id,
           plan_id: subscription.plan_id,
           latestPaymentId: payId,
-          current_start: subscription.current_start,
-          current_end: subscription.current_end,
+          current_start: startMs,
+          current_end: endMs,
           charge_at: subscription.charge_at,
           ended_at: subscription.ended_at
         }, env);
+
+        if (!result?.success) {
+          return jsonResponse(result, 400, request);
+        }
 
         return jsonResponse(result, 200, request);
       }
@@ -5066,8 +6555,16 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_cancel_sub_${uid}`, 5, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_cancel_sub_${uid}`, 5, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -5076,8 +6573,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_cancel_sub_${clientIp}`, 20, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_cancel_sub_${clientIp}`, 20, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -5099,15 +6604,14 @@ export default {
           return jsonResponse({ success: false, error: "No active recurring subscription found for this account." }, 400, request);
         }
 
-        const rawKeyId = env.RAZORPAY_KEY_ID;
-        const rawKeySecret = env.RAZORPAY_KEY_SECRET;
-
-        if (!rawKeyId || !rawKeySecret) {
-          return jsonResponse({ success: false, error: "Internal Server Error" }, 500, request);
+        const credValidation = validateRazorpayCredentials(env);
+        if (!credValidation.valid) {
+          console.error("Razorpay credential validation failed:", credValidation.error);
+          return jsonResponse({ success: false, error: credValidation.error || "Internal Server Error" }, 500, request);
         }
 
-        const keyId = rawKeyId.trim();
-        const keySecret = rawKeySecret.trim();
+        const keyId = credValidation.keyId;
+        const keySecret = credValidation.keySecret;
         const authHeaderValue = "Basic " + btoa(`${keyId}:${keySecret}`);
 
         // Cancel on Razorpay at cycle end (cancel_at_cycle_end: 1)
@@ -5140,11 +6644,226 @@ export default {
           { created_at: Math.floor(Date.now() / 1000), payload: { subscription: { entity: cancelledSub } } }
         );
 
+        let finalPeriodEnd = subDoc?.currentPeriodEnd?.timestampValue || null;
+        if (typeof cancelledSub.current_end === "number" && cancelledSub.current_end > 0) {
+          const endMs = cancelledSub.current_end < 1e12 ? cancelledSub.current_end * 1000 : cancelledSub.current_end;
+          finalPeriodEnd = new Date(endMs).toISOString();
+        }
+
         return jsonResponse({
           success: true,
           message: "Subscription cancelled successfully. Access remains active until the end of the billing period.",
           cancelAtPeriodEnd: true,
-          currentPeriodEnd: subDoc?.currentPeriodEnd?.timestampValue || null
+          currentPeriodEnd: finalPeriodEnd
+        }, 200, request);
+      }
+
+      // ---------------------------------------------------------------------
+      // Endpoint: POST /api/restore-subscription (Restore & Reconcile Purchases)
+      // Rate Limit: 5 req / 60s per UID & 20 req / 3600s per IP
+      // ---------------------------------------------------------------------
+      if (path === "/api/restore-subscription") {
+        if (request.method !== "POST") {
+          return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
+        }
+
+        const uidRateCheck = await checkRateLimit(`uid_restore_sub_${uid}`, 5, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_restore_sub_${clientIp}`, 20, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const accountDoc = await getFirestoreAccountStatus(uid, env);
+        if (accountDoc?.error) {
+          return jsonResponse({ success: false, error: "Account status verification unavailable. Please try again." }, 503, request);
+        }
+        const accountStatus = accountDoc?.accountStatus?.stringValue || "ACTIVE";
+        if (accountStatus === "PENDING_DELETION" || accountStatus === "DELETED" || accountStatus === "RESTRICTED") {
+          return jsonResponse({ success: false, error: `Account status is ${accountStatus}. Subscription restore rejected.` }, 403, request);
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const requestedSubId = typeof (body.subscription_id || body.subscriptionId || body.razorpay_subscription_id) === "string"
+          ? (body.subscription_id || body.subscriptionId || body.razorpay_subscription_id).trim()
+          : "";
+
+        const candidateSubIds = new Set();
+        if (requestedSubId && requestedSubId.startsWith("sub_")) {
+          candidateSubIds.add(requestedSubId);
+        }
+
+        // 1. Check existing user subscription status doc
+        const existingDoc = await getFirestoreSubscription(uid, env);
+        if (existingDoc && existingDoc.exists && existingDoc.fields) {
+          const currentSubId = existingDoc.fields.subscriptionId?.stringValue;
+          if (currentSubId && currentSubId.startsWith("sub_")) {
+            candidateSubIds.add(currentSubId);
+          }
+        }
+
+        // 2. Query subscription_map for this UID
+        const mappedSubIds = await findSubscriptionsByUid(uid, env);
+        for (const id of mappedSubIds) {
+          candidateSubIds.add(id);
+        }
+
+        // If no candidate subscriptions found:
+        if (candidateSubIds.size === 0) {
+          const currentPeriodEndMs = Date.parse(existingDoc?.fields?.currentPeriodEnd?.timestampValue || "");
+          const isPeriodActive = Number.isFinite(currentPeriodEndMs) ? (Date.now() < currentPeriodEndMs) : true;
+          const isCurrentlyActive = (existingDoc?.fields?.premium?.booleanValue === true ||
+            existingDoc?.fields?.subscriptionStatus?.stringValue === "ACTIVE") && isPeriodActive;
+          return jsonResponse({
+            success: true,
+            restored: false,
+            message: isCurrentlyActive ? "Active subscription already present on account." : "No active subscription found to restore.",
+            status: isCurrentlyActive ? "ACTIVE" : (existingDoc?.fields?.subscriptionStatus?.stringValue || "NONE")
+          }, 200, request);
+        }
+
+        // 3. Inspect and reconcile candidates with Razorpay
+        let restoredResult = null;
+        for (const candidateId of candidateSubIds) {
+          const subscription = await fetchAndVerifyRazorpaySubscription(candidateId, uid, env);
+          if (!subscription) continue;
+
+          if (subscription.status === "created") {
+            const credentials = validateRazorpayCredentials(env);
+            if (!credentials.valid) {
+              return jsonResponse({ success: false, error: "Subscription recovery is temporarily unavailable." }, 503, request, { "Retry-After": "5" });
+            }
+            if (subscription.plan_id !== env.RAZORPAY_PLAN_ID?.trim()) continue;
+            restoredResult = {
+              success: true,
+              restored: false,
+              status: "CREATED",
+              subscriptionId: candidateId,
+              keyId: credentials.keyId,
+              amount: 7900,
+              currency: "INR",
+              message: "Existing checkout can be resumed."
+            };
+            break;
+          } else if (subscription.status === "active") {
+            const activationResult = await reconcileSubscriptionActivation(uid, subscription, env);
+            if (activationResult && activationResult.success) {
+              restoredResult = {
+                success: true,
+                restored: true,
+                status: "ACTIVE",
+                subscriptionId: candidateId,
+                currentPeriodStart: activationResult.currentPeriodStart,
+                currentPeriodEnd: activationResult.currentPeriodEnd,
+                message: "Subscription restored successfully."
+              };
+              break;
+            }
+          } else if (subscription.status === "authenticated") {
+            restoredResult = {
+              success: true,
+              restored: false,
+              mandatePending: true,
+              status: "AUTHENTICATED",
+              subscriptionId: candidateId,
+              message: "Subscription mandate is authenticated but awaiting initial charge confirmation."
+            };
+            break;
+          } else if (subscription.status === "pending") {
+            await reconcileSubscriptionPending(uid, candidateId, env);
+            restoredResult = {
+              success: true,
+              restored: true,
+              status: "PENDING",
+              subscriptionId: candidateId,
+              message: "Subscription is pending payment verification."
+            };
+            break;
+          } else if (subscription.status === "completed") {
+            await reconcileSubscriptionCompleted(uid, candidateId, subscription.current_end, env);
+            const isStillInPeriod = subscription.current_end ? (Date.now() < (subscription.current_end < 1e12 ? subscription.current_end * 1000 : subscription.current_end)) : false;
+            restoredResult = {
+              success: true,
+              restored: isStillInPeriod,
+              status: isStillInPeriod ? "ACTIVE" : "EXPIRED",
+              subscriptionId: candidateId,
+              message: isStillInPeriod ? "Subscription completed all cycles. Access remains active until period end." : "Subscription completed all cycles and has expired."
+            };
+            if (isStillInPeriod) break;
+          } else if (subscription.status === "cancelled") {
+            const isCancelAtCycleEnd = subscription.cancel_at_cycle_end === 1 || subscription.cancel_at_cycle_end === true;
+            await reconcileSubscriptionCancelled(uid, candidateId, isCancelAtCycleEnd, subscription.current_end, env);
+            const isStillInPeriod = subscription.current_end ? (Date.now() < (subscription.current_end < 1e12 ? subscription.current_end * 1000 : subscription.current_end)) : false;
+            if (isCancelAtCycleEnd && isStillInPeriod) {
+              restoredResult = {
+                success: true,
+                restored: true,
+                status: "ACTIVE",
+                cancelAtPeriodEnd: true,
+                subscriptionId: candidateId,
+                currentPeriodEnd: subscription.current_end ? new Date(subscription.current_end < 1e12 ? subscription.current_end * 1000 : subscription.current_end).toISOString() : null,
+                message: "Subscription cancelled at period end. Access remains active until billing period ends."
+              };
+              break;
+            } else {
+              restoredResult = {
+                success: true,
+                restored: false,
+                status: "CANCELLED",
+                subscriptionId: candidateId,
+                message: "Subscription is cancelled."
+              };
+            }
+          } else if (subscription.status === "halted" || subscription.status === "expired") {
+            await reconcileSubscriptionHalted(uid, candidateId, env);
+            restoredResult = {
+              success: true,
+              restored: false,
+              status: "EXPIRED",
+              subscriptionId: candidateId,
+              message: "Subscription has expired."
+            };
+          }
+        }
+
+        if (restoredResult) {
+          return jsonResponse(restoredResult, 200, request);
+        }
+
+        return jsonResponse({
+          success: true,
+          restored: false,
+          message: "No active subscription found to restore.",
+          status: existingDoc?.fields?.subscriptionStatus?.stringValue || "NONE"
         }, 200, request);
       }
 
@@ -5157,8 +6876,16 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use GET." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_backup_status_${uid}`, 30, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_backup_status_${uid}`, 30, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -5167,8 +6894,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_backup_status_${clientIp}`, 60, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_backup_status_${clientIp}`, 60, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -5187,18 +6922,23 @@ export default {
         const nextEligibleTimeMs = getNextIstMidnightMs(nowMs);
         const remainingCooldownMs = Math.max(0, nextEligibleTimeMs - nowMs);
 
-        // Parallel fetch of backup status doc and today's quota claim
-        const [doc, todayClaimDoc] = await Promise.all([
+        // Parallel fetch of backup status doc, today's backup quota claim, and today's restore quota claim
+        const [doc, todayClaimDoc, todayRestoreClaimDoc] = await Promise.all([
           getFirestoreBackupStatus(uid, env),
-          getFirestoreDocument(`daily_quota_claims/${uid}_${todayIstDate}_BACKUP`, env)
+          getFirestoreDocument(`daily_quota_claims/${uid}_${todayIstDate}_BACKUP`, env),
+          getFirestoreDocument(`daily_quota_claims/${uid}_${todayIstDate}_RESTORE`, env)
         ]);
 
         const parsed = parseBackupStatusDoc(doc);
         const parsedClaim = parseQuotaClaimDoc(todayClaimDoc);
+        const parsedRestoreClaim = parseQuotaClaimDoc(todayRestoreClaimDoc);
 
         const lastBackupTimeMs = parsed.lastBackupTimeMs || parsedClaim.committedAtMs || 0;
         const backedUpToday = parsedClaim.status === "COMPLETED" || (parsed.status === "SUCCESS" && parsed.lastBackupDate === todayIstDate);
-        const isRestricted = backedUpToday || (parsed.status === "SUCCESS" && lastBackupTimeMs > 0 && (nowMs < lastBackupTimeMs + BACKUP_COOLDOWN_MS));
+        const isRestricted = backedUpToday;
+
+        const restoredToday = parsedRestoreClaim.status === "ACKNOWLEDGED";
+        const canRestoreNow = !restoredToday && parsedRestoreClaim.status !== "DISPATCHED" && parsedRestoreClaim.status !== "EXHAUSTED_ATTEMPTS";
 
         return jsonResponse({
           success: true,
@@ -5213,7 +6953,10 @@ export default {
           serverTimeMs: nowMs,
           serverDate: todayIstDate,
           istDate: todayIstDate,
-          activeBackupId: parsed.activeBackupId || parsedClaim.backupId || null
+          activeBackupId: parsed.activeBackupId || parsedClaim.backupId || null,
+          restoredToday,
+          canRestoreNow,
+          isRestoreRestricted: restoredToday
         }, 200, request);
       }
 
@@ -5226,8 +6969,16 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_backup_${uid}`, 10, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_backup_${uid}`, 10, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -5236,8 +6987,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_backup_${clientIp}`, 30, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_backup_${clientIp}`, 30, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -5261,7 +7020,7 @@ export default {
         }
         const requestId = rawRequestId;
 
-        const rawDailyRecords = Array.isArray(body.dailyRecords) ? body.dailyRecords : [];
+        const rawDailyRecords = Array.isArray(body.dailyRecords) ? body.dailyRecords : (Array.isArray(body.records) ? body.records : []);
         if (rawDailyRecords.length > 365) {
           return jsonResponse({ success: false, error: "dailyRecords exceeds maximum allowed limit of 365 days." }, 400, request);
         }
@@ -5316,7 +7075,7 @@ export default {
         // 6. Same-day completion check
         const lastBackupTimeMs = parsed.lastBackupTimeMs || todayClaim.committedAtMs || 0;
         const isRestrictedToday = todayClaim.status === "COMPLETED" ||
-          (parsed.status === "SUCCESS" && (parsed.lastBackupDate === todayIstDate || (lastBackupTimeMs > 0 && nowMs < lastBackupTimeMs + BACKUP_COOLDOWN_MS)));
+          (parsed.status === "SUCCESS" && parsed.lastBackupDate === todayIstDate);
 
         if (isRestrictedToday) {
           // Idempotent retry with matching requestId
@@ -5347,6 +7106,26 @@ export default {
             nextEligibleTimeMs,
             remainingCooldownMs,
             serverTimeMs: nowMs
+          }, 409, request);
+        }
+
+        // Anti-Data-Loss Safety Gate:
+        // Prevent an empty local database or default values from ever overwriting a non-empty remote backup
+        const incomingRecordCount = dailyRecords.length;
+        let incomingTotalReels = 0;
+        for (const rec of dailyRecords) {
+          const c = Number(rec?.totalReelsCount ?? rec?.count ?? 0);
+          if (!isNaN(c) && c > 0) incomingTotalReels += c;
+        }
+
+        const existingRecordCount = parsed.recordCount || 0;
+        const hasExistingBackup = (parsed.status === "SUCCESS" || Boolean(parsed.activeBackupId)) || existingRecordCount > 0;
+        if (hasExistingBackup && (incomingRecordCount === 0 || incomingTotalReels === 0)) {
+          console.warn(`Blocked destructive empty backup overwrite attempt: incomingRecords=${incomingRecordCount}, existingRecords=${existingRecordCount}`);
+          return jsonResponse({
+            success: false,
+            code: "DESTRUCTIVE_EMPTY_BACKUP_REJECTED",
+            error: "Cannot overwrite existing remote backup with empty or zero local records. Please restore your remote data first."
           }, 409, request);
         }
 
@@ -5419,9 +7198,40 @@ export default {
         if (request.method !== "POST") {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
-        const uidRateCheck = checkRateLimit(`uid_backup_init_${uid}`, 10, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_backup_init_${uid}`, 10, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
-          return jsonResponse({ success: false, error: "Too many requests. Please try again later." }, 429, request);
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_backup_init_${clientIp}`, 30, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
         }
 
         const entitlement = await verifyUserSubscriptionEntitlement(uid, env);
@@ -5438,15 +7248,56 @@ export default {
 
         const nowMs = Date.now();
         const todayIstDate = getIstDateString(nowMs);
-        const todayClaimDoc = await getFirestoreDocument(`daily_quota_claims/${uid}_${todayIstDate}_BACKUP`, env);
+        const [todayClaimDoc, currentDoc] = await Promise.all([
+          getFirestoreDocument(`daily_quota_claims/${uid}_${todayIstDate}_BACKUP`, env),
+          getFirestoreBackupStatus(uid, env)
+        ]);
         const todayClaim = parseQuotaClaimDoc(todayClaimDoc);
+        const parsedStatus = parseBackupStatusDoc(currentDoc);
 
-        if (todayClaim.status === "COMPLETED") {
+        // Anti-Data-Loss Safety Gate:
+        const requestedRecordCount = typeof body.totalRecords === "number" ? body.totalRecords : (typeof body.recordCount === "number" ? body.recordCount : -1);
+        const hasExistingBackupInit = (parsedStatus.status === "SUCCESS" || Boolean(parsedStatus.activeBackupId)) || parsedStatus.recordCount > 0;
+        if (hasExistingBackupInit && requestedRecordCount === 0) {
+          return jsonResponse({
+            success: false,
+            code: "DESTRUCTIVE_EMPTY_BACKUP_REJECTED",
+            error: "Cannot overwrite existing remote backup with empty or zero records. Please restore your remote data first."
+          }, 409, request);
+        }
+
+        if (todayClaim.status === "COMPLETED" || (parsedStatus.status === "SUCCESS" && parsedStatus.lastBackupDate === todayIstDate)) {
+          const nextEligibleTimeMs = getNextIstMidnightMs(nowMs);
           return jsonResponse({
             success: false,
             code: "BACKUP_RESTRICTED_24_HOURS",
-            error: "You can back up your data once every 24 hours."
+            error: "You can back up your data once every 24 hours.",
+            nextEligibleTimeMs
           }, 409, request);
+        }
+
+        // Concurrency / In-Progress Reservation Check
+        if (todayClaim.status === "IN_PROGRESS") {
+          // Idempotent retry with matching requestId
+          if (todayClaim.idempotencyKey === rawRequestId && todayClaim.backupId) {
+            return jsonResponse({
+              success: true,
+              idempotent: true,
+              backupId: todayClaim.backupId,
+              fencingToken: todayClaim.fencingToken || 1,
+              chunkSize: 200,
+              istDate: todayIstDate
+            }, 200, request);
+          }
+          const claimAgeMs = nowMs - (todayClaim.claimTimeMs || 0);
+          if (claimAgeMs < 60000) {
+            return jsonResponse({
+              success: false,
+              error: "A backup is currently in progress for this account.",
+              code: "BACKUP_IN_PROGRESS",
+              serverTimeMs: nowMs
+            }, 409, request);
+          }
         }
 
         const fencingToken = (todayClaim.fencingToken || 0) + 1;
@@ -5458,6 +7309,7 @@ export default {
             update: {
               name: `projects/${env.FIREBASE_PROJECT_ID || "refocus-504119"}/databases/(default)/documents/daily_quota_claims/${uid}_${todayIstDate}_BACKUP`,
               fields: {
+                uid: { stringValue: uid },
                 status: { stringValue: "IN_PROGRESS" },
                 fencingToken: { integerValue: fencingToken.toString() },
                 backupId: { stringValue: backupId },
@@ -5467,7 +7319,10 @@ export default {
                 expiresAtMs: { integerValue: (nowMs + 60000).toString() },
                 updatedAtMs: { integerValue: nowMs.toString() }
               }
-            }
+            },
+            currentDocument: todayClaimDoc && todayClaimDoc.exists && todayClaimDoc.updateTime
+              ? { updateTime: todayClaimDoc.updateTime }
+              : { exists: false }
           },
           {
             update: {
@@ -5488,6 +7343,16 @@ export default {
                 updatedAt: { timestampValue: new Date(nowMs).toISOString() }
               }
             }
+          },
+          {
+            update: {
+              name: `projects/${env.FIREBASE_PROJECT_ID || "refocus-504119"}/databases/(default)/documents/users/${uid}/backup_snapshots/${backupId}`,
+              fields: {
+                backupId: { stringValue: backupId },
+                status: { stringValue: "UPLOADING" },
+                uploadInitiatedAtMs: { integerValue: nowMs.toString() }
+              }
+            }
           }
         ];
 
@@ -5501,6 +7366,13 @@ export default {
             istDate: todayIstDate
           }, 200, request);
         } catch (err) {
+          if (err?.status === 412 || err?.status === 409) {
+            return jsonResponse({
+              success: false,
+              error: "Another backup operation is already being processed for this account.",
+              code: "BACKUP_CONCURRENT_CONFLICT"
+            }, 409, request);
+          }
           return jsonResponse({ success: false, error: "Failed to initialize chunked backup", details: err?.message }, 500, request);
         }
       }
@@ -5512,10 +7384,47 @@ export default {
         if (request.method !== "POST") {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
+
+        const uidRateCheck = await checkRateLimit(`uid_backup_chunk_${uid}`, 60, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_backup_chunk_${clientIp}`, 120, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
         const body = await request.json().catch(() => ({}));
         const backupId = typeof body.backupId === "string" ? body.backupId.trim() : null;
         const chunkIndex = typeof body.chunkIndex === "number" ? body.chunkIndex : 0;
-        const dailyRecords = Array.isArray(body.dailyRecords) ? body.dailyRecords : [];
+        const rawRecords = Array.isArray(body.dailyRecords) ? body.dailyRecords : (Array.isArray(body.records) ? body.records : []);
+        const dailyRecords = rawRecords;
 
         if (!backupId || dailyRecords.length === 0) {
           return jsonResponse({ success: false, error: "Missing backupId or dailyRecords" }, 400, request);
@@ -5534,16 +7443,30 @@ export default {
         // Child records writes
         for (const rec of dailyRecords) {
           if (!rec || !rec.dateString) continue;
+          const totalVal = rec.totalReelsCount !== undefined && rec.totalReelsCount !== null ? Number(rec.totalReelsCount) : null;
+          const countValRaw = rec.count !== undefined && rec.count !== null ? Number(rec.count) : null;
+          let resolvedCount = 0;
+          if (totalVal !== null && !isNaN(totalVal) && totalVal > 0) {
+            resolvedCount = totalVal;
+          } else if (countValRaw !== null && !isNaN(countValRaw) && countValRaw > 0) {
+            resolvedCount = countValRaw;
+          } else if (totalVal === 0 || countValRaw === 0) {
+            resolvedCount = 0;
+          }
+          const countVal = Math.max(0, Math.min(100000, resolvedCount));
           writes.push({
             update: {
               name: `projects/${projectId}/databases/(default)/documents/users/${uid}/backup_snapshots/${backupId}/daily_data/${rec.dateString}`,
               fields: {
                 dateString: { stringValue: rec.dateString },
-                totalReelsCount: { integerValue: (Math.max(0, Math.min(100000, Number(rec.totalReelsCount) || 0))).toString() },
+                totalReelsCount: { integerValue: countVal.toString() },
+                count: { integerValue: countVal.toString() },
                 dailyGoal: { integerValue: (Math.max(0, Math.min(100000, Number(rec.dailyGoal) || 0))).toString() },
-                isStrictModeOn: { booleanValue: Boolean(rec.isStrictModeOn) },
+                isSkullDay: { booleanValue: Boolean(rec.isSkullDay) },
+                isStrictModeOn: rec.isStrictModeOn !== undefined ? { booleanValue: Boolean(rec.isStrictModeOn) } : { booleanValue: true },
                 isStrictModeLocked: { booleanValue: Boolean(rec.isStrictModeLocked) },
-                isLimitLocked: { booleanValue: Boolean(rec.isLimitLocked) }
+                isLimitLocked: { booleanValue: Boolean(rec.isLimitLocked) },
+                totalTimeSpentMillis: { integerValue: (Math.max(0, Number(rec.totalTimeSpentMillis) || 0)).toString() }
               }
             }
           });
@@ -5577,6 +7500,43 @@ export default {
         if (request.method !== "POST") {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
+
+        const uidRateCheck = await checkRateLimit(`uid_backup_finalize_${uid}`, 10, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_backup_finalize_${clientIp}`, 30, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+
         const body = await request.json().catch(() => ({}));
         const backupId = typeof body.backupId === "string" ? body.backupId.trim() : null;
         const requestId = typeof body.requestId === "string" ? body.requestId.trim() : null;
@@ -5588,7 +7548,37 @@ export default {
 
         const manifestDoc = await getFirestoreDocument(`users/${uid}/backup_manifests/${backupId}`, env);
         const parsedManifest = parseManifestDoc(manifestDoc);
-        if (!parsedManifest.exists || parsedManifest.status !== "UPLOADING") {
+        if (!parsedManifest.exists) {
+          return jsonResponse({ success: false, error: "Manifest not found or not in UPLOADING state" }, 409, request);
+        }
+
+        // Anti-Data-Loss Safety Gate:
+        const existingStatus = await getFirestoreBackupStatus(uid, env);
+        const parsedStatus = parseBackupStatusDoc(existingStatus);
+        const manifestRecordCount = parsedManifest.recordCount || 0;
+        if (parsedStatus.recordCount > 0 && manifestRecordCount === 0) {
+          return jsonResponse({
+            success: false,
+            code: "DESTRUCTIVE_EMPTY_BACKUP_REJECTED",
+            error: "Cannot finalize empty backup that would overwrite existing remote backup. Please restore first."
+          }, 409, request);
+        }
+
+        if (parsedManifest.status === "COMMITTED") {
+          const committedTime = parsedManifest.committedAtMs || Date.now();
+          const nextEligibleTimeMs = getNextIstMidnightMs(committedTime);
+          return jsonResponse({
+            success: true,
+            idempotent: true,
+            backupId,
+            message: "Backup already finalized successfully",
+            lastBackupTimeMs: committedTime,
+            nextEligibleTimeMs,
+            serverTimeMs: Date.now()
+          }, 200, request);
+        }
+
+        if (parsedManifest.status !== "UPLOADING") {
           return jsonResponse({ success: false, error: "Manifest not found or not in UPLOADING state" }, 409, request);
         }
 
@@ -5626,9 +7616,21 @@ export default {
             update: {
               name: `projects/${projectId}/databases/(default)/documents/daily_quota_claims/${uid}_${todayIstDate}_BACKUP`,
               fields: {
+                uid: { stringValue: uid },
                 status: { stringValue: "COMPLETED" },
                 committedAtMs: { integerValue: nowMs.toString() },
                 updatedAtMs: { integerValue: nowMs.toString() }
+              }
+            }
+          },
+          {
+            update: {
+              name: `projects/${projectId}/databases/(default)/documents/users/${uid}/backup_snapshots/${backupId}`,
+              fields: {
+                backupId: { stringValue: backupId },
+                status: { stringValue: "COMMITTED" },
+                recordCount: { integerValue: (Number(parsedManifest.recordCount) || 0).toString() },
+                committedAtMs: { integerValue: nowMs.toString() }
               }
             }
           }
@@ -5636,11 +7638,85 @@ export default {
 
         try {
           await commitFirestoreBatch(writes, env);
-          return jsonResponse({ success: true, backupId, message: "Backup finalized successfully" }, 200, request);
+          const nextEligibleTimeMs = getNextIstMidnightMs(nowMs);
+          return jsonResponse({
+            success: true,
+            backupId,
+            message: "Backup finalized successfully",
+            lastBackupTimeMs: nowMs,
+            nextEligibleTimeMs,
+            serverTimeMs: nowMs
+          }, 200, request);
         } catch (err) {
+          if (err?.status === 412 || err?.status === 409) {
+            const refreshedManifestDoc = await getFirestoreDocument(`users/${uid}/backup_manifests/${backupId}`, env);
+            const refreshedManifest = parseManifestDoc(refreshedManifestDoc);
+            if (refreshedManifest.exists && refreshedManifest.status === "COMMITTED") {
+              const committedTime = refreshedManifest.committedAtMs || Date.now();
+              return jsonResponse({
+                success: true,
+                idempotent: true,
+                backupId,
+                message: "Backup already finalized successfully",
+                lastBackupTimeMs: committedTime,
+                nextEligibleTimeMs: getNextIstMidnightMs(committedTime),
+                serverTimeMs: Date.now()
+              }, 200, request);
+            }
+          }
           const status = err?.status === 412 || err?.status === 409 ? 412 : 500;
           return jsonResponse({ success: false, error: "Finalize commit failed", details: err?.message }, status, request);
         }
+      }
+
+      // ---------------------------------------------------------------------
+      // Multi-Part Chunked Backup Protocol: POST /api/backup/abort
+      // ---------------------------------------------------------------------
+      if (path === "/api/backup/abort") {
+        if (request.method !== "POST") {
+          return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
+        }
+
+        const uidRateCheck = await checkRateLimit(`uid_backup_abort_${uid}`, 20, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_backup_abort_${clientIp}`, 60, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+        const body = await request.json().catch(() => ({}));
+        const nowMs = Date.now();
+        const todayIstDate = getIstDateString(nowMs);
+        await releaseBackupSlotOnError(uid, body.reason || "CLIENT_ABORT", env, todayIstDate);
+        return jsonResponse({ success: true, aborted: true }, 200, request);
       }
 
       // ---------------------------------------------------------------------
@@ -5652,8 +7728,16 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
-        const uidRateCheck = checkRateLimit(`uid_restore_${uid}`, 10, 60000);
+        const uidRateCheck = await checkRateLimit(`uid_restore_${uid}`, 10, 60000, { failClosed: true }, env);
         if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
             429,
@@ -5662,8 +7746,16 @@ export default {
           );
         }
 
-        const ipRateCheck = checkRateLimit(`ip_restore_${clientIp}`, 30, 3600000);
+        const ipRateCheck = await checkRateLimit(`ip_restore_${clientIp}`, 30, 3600000, { failClosed: true }, env);
         if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
           return jsonResponse(
             { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
             429,
@@ -5871,6 +7963,11 @@ export default {
               if (manifestDoc && manifestDoc.fields) {
                 const parsedManifest = parseManifestDoc(manifestDoc);
                 limit = parsedManifest.defaultDailyLimit || 0;
+              } else {
+                const prefDoc = await getFirestoreDocument(`users/${uid}/settings/preferences`, env);
+                if (prefDoc && prefDoc.fields) {
+                  limit = Number(prefDoc.fields.defaultDailyLimit?.integerValue || prefDoc.fields.dailyLimit?.integerValue || 0);
+                }
               }
               return jsonResponse({
                 success: true,
@@ -5921,16 +8018,30 @@ export default {
             }
 
             const newAttempt = currentAttempt + 1;
-            const targetBackupId = (typeof body.backupId === "string" && body.backupId.trim()) ||
-                                   todayClaim.pinnedSnapshotId || parsedStatus.activeBackupId;
-            if (!targetBackupId) {
-              return jsonResponse({ success: false, code: "NO_BACKUP_FOUND", error: "No cloud backup found" }, 404, request);
-            }
+            let targetBackupId = (typeof body.backupId === "string" && body.backupId.trim()) ||
+                                 todayClaim.pinnedSnapshotId || parsedStatus.activeBackupId;
 
-            const manifestDoc = await getFirestoreDocument(`users/${uid}/backup_manifests/${targetBackupId}`, env);
-            const parsedManifest = parseManifestDoc(manifestDoc);
-            if (!parsedManifest.exists || parsedManifest.status !== "COMMITTED") {
-              return jsonResponse({ success: false, code: "SNAPSHOT_NOT_COMMITTED", error: "Backup snapshot not found or not committed" }, 404, request);
+            let manifestDoc = targetBackupId ? await getFirestoreDocument(`users/${uid}/backup_manifests/${targetBackupId}`, env) : null;
+            let parsedManifest = parseManifestDoc(manifestDoc);
+            let isLegacy = false;
+            let legacyRecords = [];
+            let legacyLimit = 0;
+
+            if (!targetBackupId || !parsedManifest.exists || parsedManifest.status !== "COMMITTED") {
+              legacyRecords = await fetchSnapshotRecords(uid, "legacy", env);
+              if (legacyRecords && legacyRecords.length > 0) {
+                isLegacy = true;
+                targetBackupId = targetBackupId || `legacy_backup_${uid}`;
+                const legacyPrefDoc = await getFirestoreDocument(`users/${uid}/settings/preferences`, env);
+                if (legacyPrefDoc && legacyPrefDoc.fields) {
+                  legacyLimit = Number(legacyPrefDoc.fields.defaultDailyLimit?.integerValue || legacyPrefDoc.fields.dailyLimit?.integerValue || 0);
+                }
+              } else {
+                if (!targetBackupId) {
+                  return jsonResponse({ success: false, code: "NO_BACKUP_FOUND", error: "No cloud backup found" }, 404, request);
+                }
+                return jsonResponse({ success: false, code: "SNAPSHOT_NOT_COMMITTED", error: "Backup snapshot not found or not committed" }, 404, request);
+              }
             }
 
             const retryWrites = [
@@ -5938,6 +8049,7 @@ export default {
                 update: {
                   name: `projects/${projectId}/databases/(default)/documents/daily_quota_claims/${uid}_${todayIstDate}_RESTORE`,
                   fields: {
+                    uid: { stringValue: uid },
                     status: { stringValue: "DISPATCHED" },
                     pinStatus: { stringValue: "PINNED" },
                     attemptCount: { integerValue: newAttempt.toString() },
@@ -5950,8 +8062,11 @@ export default {
                   }
                 },
                 currentDocument: { updateTime: todayClaim.updateTime }
-              },
-              {
+              }
+            ];
+
+            if (!isLegacy && manifestDoc) {
+              retryWrites.push({
                 update: {
                   name: `projects/${projectId}/databases/(default)/documents/users/${uid}/backup_manifests/${targetBackupId}`,
                   fields: {
@@ -5961,19 +8076,27 @@ export default {
                   }
                 },
                 currentDocument: { updateTime: manifestDoc.updateTime }
-              }
-            ];
+              });
+            }
 
             try {
               await commitFirestoreBatch(retryWrites, env);
-              const records = await fetchSnapshotRecords(uid, targetBackupId, env);
+              const records = isLegacy ? legacyRecords : await fetchSnapshotRecords(uid, targetBackupId, env);
+              const defaultDailyLimit = isLegacy ? legacyLimit : parsedManifest.defaultDailyLimit;
+              const totalRecords = records.length;
+              const chunkSize = 200;
+              const totalChunks = Math.ceil(totalRecords / chunkSize) || 1;
               return jsonResponse({
                 success: true,
                 resumedUnderAttempt: newAttempt,
                 backupId: targetBackupId,
                 istDate: todayIstDate,
                 dailyRecords: records,
-                defaultDailyLimit: parsedManifest.defaultDailyLimit,
+                records: records,
+                totalRecords,
+                totalChunks,
+                chunkSize,
+                defaultDailyLimit,
                 pinStatus: "PINNED",
                 pinLeaseExpiresAtMs: nowMs + 15 * 60 * 1000
               }, 200, request);
@@ -5991,15 +8114,35 @@ export default {
         }
 
         // 7. UNCLAIMED: Initial restore reservation of the day
-        const targetBackupId = (typeof body.backupId === "string" && body.backupId.trim()) || parsedStatus.activeBackupId;
-        if (!targetBackupId) {
-          return jsonResponse({ success: false, code: "NO_BACKUP_FOUND", error: "No cloud backup was found for this account." }, 404, request);
-        }
+        const explicitBackupRequested = typeof body.backupId === "string" && body.backupId.trim().length > 0;
+        let targetBackupId = (explicitBackupRequested ? body.backupId.trim() : null) || parsedStatus.activeBackupId;
+        let manifestDoc = targetBackupId ? await getFirestoreDocument(`users/${uid}/backup_manifests/${targetBackupId}`, env) : null;
+        let parsedManifest = parseManifestDoc(manifestDoc);
+        let isLegacy = false;
+        let legacyRecords = [];
+        let legacyLimit = 0;
 
-        const manifestDoc = await getFirestoreDocument(`users/${uid}/backup_manifests/${targetBackupId}`, env);
-        const parsedManifest = parseManifestDoc(manifestDoc);
-        if (!parsedManifest.exists || parsedManifest.status !== "COMMITTED") {
-          return jsonResponse({ success: false, code: "SNAPSHOT_NOT_FOUND_OR_COMMITTED", error: "Cloud backup is not committed or not found." }, 404, request);
+        if (!targetBackupId || !parsedManifest.exists || parsedManifest.status !== "COMMITTED") {
+          // Fallback to legacy root daily_data ONLY if no specific snapshot was requested
+          // and account has no valid committed snapshot manifest (legacy pre-manifest accounts)
+          if (!explicitBackupRequested && (!targetBackupId || targetBackupId === "legacy" || targetBackupId.startsWith("legacy_"))) {
+            legacyRecords = await fetchSnapshotRecords(uid, "legacy", env);
+            if (legacyRecords && legacyRecords.length > 0) {
+              isLegacy = true;
+              targetBackupId = targetBackupId || `legacy_backup_${uid}`;
+              const legacyPrefDoc = await getFirestoreDocument(`users/${uid}/settings/preferences`, env);
+              if (legacyPrefDoc && legacyPrefDoc.fields) {
+                legacyLimit = Number(legacyPrefDoc.fields.defaultDailyLimit?.integerValue || legacyPrefDoc.fields.dailyLimit?.integerValue || 0);
+              }
+            } else {
+              return jsonResponse({ success: false, code: "NO_BACKUP_FOUND", error: "No cloud backup was found for this account." }, 404, request);
+            }
+          } else {
+            if (!targetBackupId) {
+              return jsonResponse({ success: false, code: "NO_BACKUP_FOUND", error: "No cloud backup was found for this account." }, 404, request);
+            }
+            return jsonResponse({ success: false, code: "SNAPSHOT_NOT_FOUND_OR_COMMITTED", error: "Cloud backup is not committed or not found." }, 404, request);
+          }
         }
 
         const initialWrites = [
@@ -6007,6 +8150,7 @@ export default {
             update: {
               name: `projects/${projectId}/databases/(default)/documents/daily_quota_claims/${uid}_${todayIstDate}_RESTORE`,
               fields: {
+                uid: { stringValue: uid },
                 status: { stringValue: "DISPATCHED" },
                 idempotencyKey: { stringValue: idempotencyKey },
                 pinnedSnapshotId: { stringValue: targetBackupId },
@@ -6019,8 +8163,11 @@ export default {
               }
             },
             currentDocument: { exists: false }
-          },
-          {
+          }
+        ];
+
+        if (!isLegacy && manifestDoc) {
+          initialWrites.push({
             update: {
               name: `projects/${projectId}/databases/(default)/documents/users/${uid}/backup_manifests/${targetBackupId}`,
               fields: {
@@ -6030,12 +8177,16 @@ export default {
               }
             },
             currentDocument: { updateTime: manifestDoc.updateTime }
-          }
-        ];
+          });
+        }
 
         try {
           await commitFirestoreBatch(initialWrites, env);
-          const records = await fetchSnapshotRecords(uid, targetBackupId, env);
+          const records = isLegacy ? legacyRecords : await fetchSnapshotRecords(uid, targetBackupId, env);
+          const defaultDailyLimit = isLegacy ? legacyLimit : parsedManifest.defaultDailyLimit;
+          const totalRecords = records.length;
+          const chunkSize = 200;
+          const totalChunks = Math.ceil(totalRecords / chunkSize) || 1;
           return jsonResponse({
             success: true,
             dispatched: true,
@@ -6043,7 +8194,11 @@ export default {
             istDate: todayIstDate,
             attemptCount: 1,
             dailyRecords: records,
-            defaultDailyLimit: parsedManifest.defaultDailyLimit,
+            records: records,
+            totalRecords,
+            totalChunks,
+            chunkSize,
+            defaultDailyLimit,
             pinStatus: "PINNED",
             pinLeaseExpiresAtMs: nowMs + 15 * 60 * 1000
           }, 200, request);
@@ -6060,12 +8215,19 @@ export default {
                 const parsedManifest = parseManifestDoc(manifestDoc);
                 limit = parsedManifest.defaultDailyLimit || 0;
               }
+              const totalRecords = records.length;
+              const chunkSize = 200;
+              const totalChunks = Math.ceil(totalRecords / chunkSize) || 1;
               return jsonResponse({
                 success: true,
                 idempotent: true,
                 backupId: recheck.pinnedSnapshotId,
                 istDate: todayIstDate,
                 dailyRecords: records,
+                records: records,
+                totalRecords,
+                totalChunks,
+                chunkSize,
                 defaultDailyLimit: limit,
                 pinStatus: "PINNED",
                 pinLeaseExpiresAtMs: recheck.pinLeaseExpiresAtMs
@@ -6087,6 +8249,42 @@ export default {
       if (path === "/api/restore/ack") {
         if (request.method !== "POST") {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
+        }
+
+        const uidRateCheck = await checkRateLimit(`uid_restore_ack_${uid}`, 20, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_restore_ack_${clientIp}`, 60, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
         }
 
         const body = await request.json().catch(() => ({}));
@@ -6205,6 +8403,42 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
+        const uidRateCheck = await checkRateLimit(`uid_restore_abort_${uid}`, 20, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_restore_abort_${clientIp}`, 60, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+
         const body = await request.json().catch(() => ({}));
         const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : null;
         if (!idempotencyKey) {
@@ -6306,6 +8540,42 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use POST." }, 405, request);
         }
 
+        const uidRateCheck = await checkRateLimit(`uid_restore_hb_${uid}`, 60, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_restore_hb_${clientIp}`, 120, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+
         const body = await request.json().catch(() => ({}));
         const idempotencyKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey.trim() : null;
         if (!idempotencyKey) {
@@ -6373,6 +8643,42 @@ export default {
           return jsonResponse({ success: false, error: "Method Not Allowed. Use GET." }, 405, request);
         }
 
+        const uidRateCheck = await checkRateLimit(`uid_restore_chunk_${uid}`, 60, 60000, { failClosed: true }, env);
+        if (!uidRateCheck.allowed) {
+          if (uidRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (uidRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests. Please try again later.", retryAfter: uidRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": uidRateCheck.retryAfterSec.toString() }
+          );
+        }
+
+        const ipRateCheck = await checkRateLimit(`ip_restore_chunk_${clientIp}`, 120, 3600000, { failClosed: true }, env);
+        if (!ipRateCheck.allowed) {
+          if (ipRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (ipRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
+          return jsonResponse(
+            { success: false, error: "Too many requests from this IP. Please try again later.", retryAfter: ipRateCheck.retryAfterSec },
+            429,
+            request,
+            { "Retry-After": ipRateCheck.retryAfterSec.toString() }
+          );
+        }
+
         const urlObj = new URL(request.url);
         const idempotencyKey = urlObj.searchParams.get("idempotencyKey");
         const backupId = urlObj.searchParams.get("backupId");
@@ -6431,19 +8737,33 @@ export default {
         // Slice 200 records per chunk
         const start = chunkIndex * 200;
         const chunkRecords = records.slice(start, start + 200);
+        const totalRecords = records.length;
+        const totalChunks = Math.ceil(totalRecords / 200) || 1;
 
         return jsonResponse({
           success: true,
           chunkIndex,
           records: chunkRecords,
-          totalRecords: records.length,
+          dailyRecords: chunkRecords,
+          totalRecords,
+          totalChunks,
+          chunkSize: 200,
+          isLastChunk: start + chunkRecords.length >= totalRecords,
           pinLeaseExpiresAtMs
         }, 200, request);
       }
 
       // Rate limit unknown paths to prevent automated endpoint fuzzing / scanning (30 req / 60s per IP)
-      const notFoundRateCheck = checkRateLimit(`ip_404_${clientIp}`, 30, 60000);
+      const notFoundRateCheck = await checkRateLimit(`ip_404_${clientIp}`, 30, 60000, { failClosed: true }, env);
       if (!notFoundRateCheck.allowed) {
+          if (notFoundRateCheck.unavailable) {
+            return jsonResponse(
+              { error: "Rate limit service temporarily unavailable. Please try again later.", code: "RATE_LIMITER_UNAVAILABLE" },
+              503,
+              request,
+              { "Retry-After": (notFoundRateCheck.retryAfterSec || 60).toString() }
+            );
+          }
         return jsonResponse(
           { error: "Too many requests. Please try again later.", retryAfter: notFoundRateCheck.retryAfterSec },
           429,
@@ -6477,6 +8797,8 @@ export default {
 };
 
 export {
+  checkRateLimit,
+  rateLimitStore,
   claimSubscriptionCreationLockAtomic,
   finalizeSubscriptionCreationLock,
   releaseSubscriptionCreationLockOnError,
@@ -6514,5 +8836,14 @@ export {
   reconcileExpiredPins,
   auditSnapshotPinConsistency,
   pruneHistoricalCommittedBackups,
-  cleanupAbandonedUploads
+  cleanupAbandonedUploads,
+  validateRazorpayCredentials,
+  validateRazorpayPlanId,
+  findSubscriptionsByUid,
+  findDailyQuotaClaimsByUid,
+  fetchAndVerifyRazorpaySubscription,
+  reconcileSubscriptionActivation,
+  reconcileSubscriptionCancelled,
+  EXPECTED_PLAN_AMOUNT_PAISE,
+  EXPECTED_PLAN_CURRENCY
 };

@@ -2,7 +2,6 @@ package com.reeltrak.app.data.local.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
-import androidx.room.PrimaryKey
 
 /**
  * Authoritative local restore journal for Phase 2 local-first restore protocol.
@@ -11,9 +10,8 @@ import androidx.room.PrimaryKey
  * The presence of a row in this table is the SOLE authoritative evidence that a restore
  * operation successfully committed locally.
  */
-@Entity(tableName = "local_restore_journal")
+@Entity(tableName = "local_restore_journal", primaryKeys = ["account_scope", "idempotency_key"])
 data class LocalRestoreJournal(
-    @PrimaryKey
     @ColumnInfo(name = "idempotency_key")
     val idempotencyKey: String,
 
@@ -36,7 +34,10 @@ data class LocalRestoreJournal(
     val ackStatus: String, // PENDING_ACK | ACKNOWLEDGED
 
     @ColumnInfo(name = "datastore_synced")
-    val datastoreSynced: Int = 0 // 0 = Pending DataStore catch-up, 1 = Synced
+    val datastoreSynced: Int = 0, // 0 = Pending DataStore catch-up, 1 = Synced
+
+    @ColumnInfo(name = "account_scope")
+    val accountScope: String = ReelCountAccountScope.current
 ) {
     companion object {
         const val STATUS_PENDING_ACK = "PENDING_ACK"

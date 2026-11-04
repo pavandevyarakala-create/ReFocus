@@ -133,8 +133,9 @@ class IncrementPipelineVerificationTest {
             content.contains("if (token == null || !authMgr.verifyToken(token))")
         )
         assertTrue(
-            "DayManager durable acceptance must use the authorization helper",
-            content.contains("if (!isCountAuthorized(token) || isRestoring || !managerScope.isActive)") &&
+            "DayManager durable acceptance must check authorization and active account ownership",
+            content.contains("if (!isCountAuthorized(token) || !isAccountScopeCurrent() || isRestoring || !managerScope.isActive)") &&
+                content.contains("private fun isAccountScopeCurrent()") &&
                 content.contains("return token == null || authMgr.verifyToken(token)")
         )
     }

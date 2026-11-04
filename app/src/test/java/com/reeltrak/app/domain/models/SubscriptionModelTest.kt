@@ -533,6 +533,53 @@ class SubscriptionModelTest {
         assertEquals(AccessState.ACTIVE, domain.accessState)
         assertTrue(domain.isUnlocked)
     }
+
+    @Test
+    fun `SEC-SUB-006 regression - active status with elapsed periodEnd locks app and never grants access when gateway is degraded`() {
+        val now = 1757000000000L
+        // Expired 5 minutes ago (past the 2-minute final sync grace window)
+        val elapsedEnd = now - TimeUnit.MINUTES.toMillis(5)
+
+        // Simulates Firestore status left as ACTIVE and premium=true because Razorpay outage suppressed mutation
+        val dto = CloudSubscriptionDto(
+            subscriptionStatus = "ACTIVE",
+            planId = "plan_monthly",
+            subscriptionId = "sub_outage_123",
+            currentPeriodStart = ts(now - TimeUnit.DAYS.toMillis(30)),
+            currentPeriodEnd = ts(elapsedEnd),
+            cancelAtPeriodEnd = false,
+            premium = true
+        )
+
+        val domain = dto.toDomain(now)
+        // Domain model must evaluate to LOCKED and isUnlocked=false because authoritative now >= currentPeriodEnd
+        assertEquals(AccessState.LOCKED, domain.accessState)
+        assertFalse("App must be locked when currentPeriodEnd is in past even if status is ACTIVE", domain.isUnlocked)
+
+        // When renewal is confirmed (periodEnd updated to future), access is restored immediately
+        val renewedDto = dto.copy(currentPeriodEnd = ts(now + TimeUnit.DAYS.toMillis(30)))
+        val renewedDomain = renewedDto.toDomain(now)
+        assertEquals(AccessState.ACTIVE, renewedDomain.accessState)
+        assertTrue("Restored periodEnd must unlock app immediately", renewedDomain.isUnlocked)
+    }
+
+    @Test
+    fun `SEC-SUB-005 regression - parseTimestamp handles ISO strings numbers and Firestore REST maps robustly`() {
+        val tsFromLongSec = CloudSubscriptionDto.parseTimestamp(1757000000L)
+        assertEquals(1757000000000L, tsFromLongSec?.toDate()?.time)
+
+        val tsFromLongMs = CloudSubscriptionDto.parseTimestamp(1757000000000L)
+        assertEquals(1757000000000L, tsFromLongMs?.toDate()?.time)
+
+        val tsFromIso = CloudSubscriptionDto.parseTimestamp("2026-09-04T12:00:00Z")
+        assertTrue(tsFromIso != null && tsFromIso.toDate().time > 0L)
+
+        val tsNull = CloudSubscriptionDto.parseTimestamp(null)
+        assertEquals(null, tsNull)
+
+        val tsEmpty = CloudSubscriptionDto.parseTimestamp("")
+        assertEquals(null, tsEmpty)
+    }
 }
 
 

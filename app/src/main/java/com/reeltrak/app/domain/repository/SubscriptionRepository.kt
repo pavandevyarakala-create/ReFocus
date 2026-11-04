@@ -58,6 +58,11 @@ interface SubscriptionRepository {
     suspend fun refreshSubscription(forceServer: Boolean): Result<SubscriptionInfo> = refreshSubscription()
 
     /**
+     * Reconciles and restores active recurring subscription from the backend gateway / Razorpay.
+     */
+    suspend fun restoreSubscription(): Result<SubscriptionInfo> = refreshSubscription(forceServer = true)
+
+    /**
      * Cancels the active recurring subscription on the server at billing cycle end.
      */
     suspend fun cancelSubscription(): Result<Unit>

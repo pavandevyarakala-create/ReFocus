@@ -7,10 +7,7 @@ import com.reeltrak.app.data.local.entity.DailyReelData
 import com.reeltrak.app.domain.models.StrictModeDailyState
 import com.reeltrak.app.domain.repository.PreferencesRepository
 import com.reeltrak.app.services.notifications.ReelNotificationManager
-import com.reeltrak.app.services.overlay.OverlayState
-import com.reeltrak.app.services.overlay.OverlayStateManager
 import com.reeltrak.app.services.tracking.DayManager
-import com.reeltrak.app.services.tracking.SessionState
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -30,36 +27,13 @@ import javax.inject.Inject
 class DashboardViewModel @Inject constructor(
     private val preferencesRepository: PreferencesRepository,
     private val dailyReelDataDao: DailyReelDataDao,
-    overlayStateManager: OverlayStateManager,
     private val dayManager: DayManager,
     private val notificationManager: ReelNotificationManager,
     private val subscriptionManager: com.reeltrak.app.domain.managers.SubscriptionManager,
-    private val rewardedAdManager: com.reeltrak.app.core.ads.RewardedAdManager,
     private val appAuthorizationManager: AppAuthorizationManager
 ) : ViewModel() {
 
     val isAppUnlocked: StateFlow<Boolean> = subscriptionManager.isAppUnlocked
-
-    val isAdReady: StateFlow<Boolean> = rewardedAdManager.isAdReady
-    val isAdLoading: StateFlow<Boolean> = rewardedAdManager.isLoading
-
-    fun preloadAd() {
-        rewardedAdManager.preloadAd()
-    }
-
-    fun showRewardedAd(
-        activity: android.app.Activity,
-        onRewardEarned: () -> Unit,
-        onDismissedWithoutReward: () -> Unit = {},
-        onError: (String) -> Unit = {}
-    ): Job {
-        return rewardedAdManager.showRewardedAd(
-            activity = activity,
-            onRewardEarned = onRewardEarned,
-            onDismissedWithoutReward = onDismissedWithoutReward,
-            onError = onError
-        )
-    }
 
     val dailyIntent: StateFlow<Int> = dayManager.currentDayStats
         .map { it?.dailyGoal ?: -1 }
@@ -94,66 +68,24 @@ class DashboardViewModel @Inject constructor(
         dayManager.disableStrictModeForToday()
     }
 
-    fun turnOffStrictModeWithAd(
-        activity: android.app.Activity,
-        onSuccess: () -> Unit,
-        onDismissedWithoutReward: () -> Unit = {},
-        onError: (String) -> Unit = {}
-    ): Job {
-        if (!subscriptionManager.hasActiveEntitlementNow()) {
-            onError("Active Trial or Premium subscription required.")
-            return viewModelScope.launch { /* no-op */ }
-        }
-
-        val hasRewarded = java.util.concurrent.atomic.AtomicBoolean(false)
-
-        return rewardedAdManager.showRewardedAd(
-            activity = activity,
-            onRewardEarned = {
-                if (hasRewarded.compareAndSet(false, true)) {
-                    disableStrictModeForToday()
-                    onSuccess()
-                }
-            },
-            onDismissedWithoutReward = onDismissedWithoutReward,
-            onError = onError
-        )
+    fun reactivateStrictMode() {
+        if (!subscriptionManager.hasActiveEntitlementNow()) return
+        dayManager.reactivateStrictMode()
     }
 
     fun reactivateStrictModeWithAd() {
-        if (!subscriptionManager.hasActiveEntitlementNow()) return
-        dayManager.reactivateStrictModeWithAd()
+        reactivateStrictMode()
     }
 
-    fun turnOnStrictModeWithAd(
-        activity: android.app.Activity,
-        onSuccess: () -> Unit,
-        onDismissedWithoutReward: () -> Unit = {},
-        onError: (String) -> Unit = {}
-    ): Job {
+    fun setStrictMode(enabled: Boolean, onResult: (Boolean) -> Unit = {}) {
         if (!subscriptionManager.hasActiveEntitlementNow()) {
-            onError("Active Trial or Premium subscription required.")
-            return viewModelScope.launch { /* no-op */ }
+            onResult(false)
+            return
         }
-
-        val hasRewarded = java.util.concurrent.atomic.AtomicBoolean(false)
-
-        return rewardedAdManager.showRewardedAd(
-            activity = activity,
-            onRewardEarned = {
-                if (hasRewarded.compareAndSet(false, true)) {
-                    reactivateStrictModeWithAd()
-                    onSuccess()
-                }
-            },
-            onDismissedWithoutReward = onDismissedWithoutReward,
-            onError = onError
-        )
-    }
-
-    fun setStrictMode(enabled: Boolean) {
-        if (!subscriptionManager.hasActiveEntitlementNow()) return
-        dayManager.setStrictMode(enabled)
+        viewModelScope.launch {
+            val success = dayManager.setStrictModeSuspend(enabled)
+            onResult(success)
+        }
     }
 
     val operationalMode: StateFlow<OperationalMode> = combine(
@@ -180,9 +112,15 @@ class DashboardViewModel @Inject constructor(
     val defaultLimit: StateFlow<Int> = preferencesRepository.defaultDailyLimit
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), -1)
 
-    val isLimitChangeRestricted: StateFlow<Boolean> = dayManager.currentDayStats
-        .map { it?.isLimitLocked ?: false }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val isLimitChangeRestricted: StateFlow<Boolean> = combine(
+        dayManager.currentDayStats,
+        preferencesRepository.lastLimitChangeDate
+    ) { stats, lastChangeDate ->
+        val todayEpoch = stats?.dateString?.let {
+            runCatching { LocalDate.parse(it).toEpochDay() }.getOrNull()
+        } ?: LocalDate.now().toEpochDay()
+        (stats?.isLimitLocked == true) || (lastChangeDate == todayEpoch)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     fun setDailyGoal(goal: Int) {
         val mode = appAuthorizationManager.getOperationalMode()
@@ -193,17 +131,21 @@ class DashboardViewModel @Inject constructor(
         dayManager.setDailyGoal(goal)
     }
 
-    fun confirmAndSetDailyGoal(goal: Int) {
+    fun confirmAndSetDailyGoal(goal: Int, onResult: (Boolean) -> Unit = {}) {
         val mode = appAuthorizationManager.getOperationalMode()
         if (!mode.isEntitled) {
             android.util.Log.w("DashboardViewModel", "confirmAndSetDailyGoal rejected: Daily Limit is Trial/Premium-only. Mode: $mode")
+            onResult(false)
             return
         }
         viewModelScope.launch {
-            val currentStats = dayManager.currentDayStats.first()
-            if (currentStats != null && !currentStats.isLimitLocked) {
-                dayManager.setDailyGoal(goal)
+            if (!dayManager.canSetDailyGoalToday()) {
+                android.util.Log.d("DashboardViewModel", "confirmAndSetDailyGoal rejected: limit already locked for today")
+                onResult(false)
+                return@launch
             }
+            val success = dayManager.setDailyGoalSuspend(goal)
+            onResult(success)
         }
     }
 
@@ -232,8 +174,6 @@ class DashboardViewModel @Inject constructor(
         }
     }
 
-    val liveSessionState: StateFlow<OverlayState> = overlayStateManager.state
-
     private val currentDayFlow = dayManager.currentDateString
 
     val reelsScrolledToday: StateFlow<Int> = dayManager.currentDayStats
@@ -252,11 +192,10 @@ class DashboardViewModel @Inject constructor(
         allDailyData,
         currentDayFlow,
         dayManager.currentDayStats,
-        liveSessionState,
         subscriptionManager.hasActiveEntitlement
-    ) { dataList, todayStr, todayStats, live, isEntitled ->
+    ) { dataList, todayStr, todayStats, isEntitled ->
         if (isEntitled) {
-            calculateLifetimeReels(dataList, todayStr, todayStats, live)
+            calculateLifetimeReels(dataList, todayStr, todayStats)
         } else {
             0L
         }
@@ -281,20 +220,8 @@ class DashboardViewModel @Inject constructor(
     .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
     @androidx.compose.runtime.Immutable
-    data class TimeBlock(
-        val startFraction: Float, 
-        val endFraction: Float,
-        val startTimeStamp: Long,
-        val endTimeStamp: Long,
-        val durationMinutes: Int,
-        val reelsCount: Int,
-        val appName: String
-    )
-    
-    @androidx.compose.runtime.Immutable
     data class DailyBlocks(
         val dayLabel: String, 
-        val blocks: List<TimeBlock>,
         val totalReelsScrolled: Int = 0,
         val dailyGoal: Int = 0,
         val dateString: String = "",
@@ -555,20 +482,8 @@ class DashboardViewModel @Inject constructor(
                     -1f
                 }
                 
-                val rawSessions = if (isToday && todayStats != null && todayStats.dateString == todayStr && todayStats.sessions.isNotEmpty()) {
-                    todayStats.sessions
-                } else {
-                    stats?.sessions ?: emptyList()
-                }
-                val blocks = rawSessions.map { session ->
-                    TimeBlock(0f, 0f, session.startTimeStamp, session.endTimeStamp, 
-                              ((session.endTimeStamp - session.startTimeStamp)/60000).toInt(), 
-                              session.reelsScrolled, session.appName)
-                }
-
                 result.add(DailyBlocks(
                     dayLabel = label,
-                    blocks = blocks, 
                     totalReelsScrolled = count,
                     dailyGoal = goal,
                     dateString = dateStr,
@@ -721,20 +636,16 @@ class DashboardViewModel @Inject constructor(
          * Calculates the total lifetime reels count ensuring every reel is counted exactly once.
          *
          * Formula:
-         * Lifetime = (Sum of historical days' reels) + (Today's authoritative reel count) + (Unpersisted live session delta)
+         * Lifetime = (Sum of historical days' reels) + (Today's authoritative reel count)
          *
          * - Historical days (dateString != todayStr): immutable records in Room.
          * - Today's count: maxOf(Room count for today, in-memory DayManager count for today),
          *   which guarantees monotonic, instantaneous updates without double-counting.
-         * - Live session delta: only added if an active session has reels that have not yet been reflected
-         *   in today's count (i.e. live.currentSessionReels > todayCount). In normal operation this delta is 0,
-         *   preventing any double-counting of today's reels.
          */
         fun calculateLifetimeReels(
             dataList: List<DailyReelData>,
             todayStr: String,
-            todayStats: DailyReelData?,
-            live: OverlayState
+            todayStats: DailyReelData?
         ): Long {
             val effectiveTodayStr = if (todayStr.isNotBlank()) todayStr else (todayStats?.dateString ?: "")
 
@@ -758,15 +669,7 @@ class DashboardViewModel @Inject constructor(
             }
             val todayCount = maxOf(roomTodayCount, memoryTodayCount)
 
-            // 3. Genuine unpersisted live session delta (if any)
-            val unpersistedDelta = if ((live.sessionState == SessionState.ACTIVE || live.sessionState == SessionState.ENTERING_REELS) &&
-                live.currentSessionReels.toLong() > todayCount) {
-                live.currentSessionReels.toLong() - todayCount
-            } else {
-                0L
-            }
-
-            return historicalSum + todayCount + unpersistedDelta
+            return historicalSum + todayCount
         }
 
         /**
@@ -815,7 +718,6 @@ class DashboardViewModel @Inject constructor(
                     existing.copy(
                         totalReelsCount = maxOf(existing.totalReelsCount, todayStats.totalReelsCount),
                         dailyGoal = if (todayStats.dailyGoal > 0) todayStats.dailyGoal else existing.dailyGoal,
-                        sessions = if (todayStats.sessions.isNotEmpty()) todayStats.sessions else existing.sessions,
                         isSkullDay = todayStats.isSkullDay || existing.isSkullDay,
                         isStrictModeOn = todayStats.isStrictModeOn,
                         isStrictModeLocked = todayStats.isStrictModeLocked,
@@ -843,17 +745,8 @@ class DashboardViewModel @Inject constructor(
                 val isGraceDay = goal > 0 && count > goal && !isDriftedDay
                 val progress = if (goal > 0) count.toFloat() / goal else -1f
 
-                val blocks = stats.sessions.map { session ->
-                    TimeBlock(
-                        0f, 0f, session.startTimeStamp, session.endTimeStamp,
-                        ((session.endTimeStamp - session.startTimeStamp) / 60000).toInt(),
-                        session.reelsScrolled, session.appName
-                    )
-                }
-
                 DailyBlocks(
                     dayLabel = label,
-                    blocks = blocks,
                     totalReelsScrolled = count,
                     dailyGoal = goal,
                     dateString = stats.dateString,

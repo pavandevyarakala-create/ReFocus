@@ -77,7 +77,7 @@ Re:Focus is an Android digital wellbeing application designed to track and limit
           const val = razorpayKeySecret.value();
           if (val) return val;
       } catch (_) {}
-      return process.env.RAZORPAY_KEY_SECRET || "MvcuJz39QJsQXGf0cPSvfgib";
+      return process.env.RAZORPAY_KEY_SECRET || "[REDACTED]";
   }
   ```
 - **Security Impact & Risk:**
@@ -96,8 +96,8 @@ Re:Focus is an Android digital wellbeing application designed to track and limit
 - **Component / Function:** Environment Configuration
 - **Current Implementation:**
   ```env
-  RAZORPAY_KEY_ID=rzp_test_Tb9rSP1OzJ3Tdi
-  RAZORPAY_KEY_SECRET=MvcuJz39QJsQXGf0cPSvfgib
+  RAZORPAY_KEY_ID=[REDACTED]
+  RAZORPAY_KEY_SECRET=[REDACTED; rotate if still active]
   ```
 - **Security Impact & Risk:**
   The project directory contains a plaintext `.env` holding Razorpay secrets. If `.env` is accidentally tracked, staged, or included in build artifacts, production/test secrets leak to version control or packaging.

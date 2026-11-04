@@ -7,10 +7,11 @@ import android.content.IntentFilter
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.reeltrak.app.data.local.dao.DailyReelDataDao
+import com.reeltrak.app.data.local.dao.ActiveAccountScopeDao
 import com.reeltrak.app.data.local.dao.ReelTransitionWriteStatus
 import com.reeltrak.app.data.local.entity.ReelCountAccountScope
+import com.reeltrak.app.data.local.entity.ActiveAccountScope
 import com.reeltrak.app.data.local.entity.DailyReelData
-import com.reeltrak.app.data.local.entity.SessionData
 import com.reeltrak.app.data.local.entity.strictModeDailyState
 import com.reeltrak.app.domain.models.StrictModeDailyState
 import com.reeltrak.app.domain.repository.PreferencesRepository
@@ -60,12 +61,15 @@ object DefaultDayTimeProvider : DayTimeProvider {
 class DayManager @Inject constructor(
     @ApplicationContext private val context: Context,
     private val dailyReelDataDao: DailyReelDataDao,
+    private val activeAccountScopeDao: ActiveAccountScopeDao,
     private val preferencesRepository: PreferencesRepository,
     private val notificationManager: ReelNotificationManager,
-    private val syncManager: SyncManager,
+    private val syncManager: SyncManager? = null,
     private val appAuthorizationManager: AppAuthorizationManager? = null,
     private val subscriptionManagerLazy: dagger.Lazy<com.reeltrak.app.domain.managers.SubscriptionManager>? = null
 ) {
+    internal var allowUnconfiguredAuthForTesting: Boolean = false
+    internal var isEntitledOverrideForTesting: Boolean? = null
     internal var authorizationManagerOverride: AppAuthorizationManager? = null
     internal val effectiveAuthManager: AppAuthorizationManager?
         get() = authorizationManagerOverride ?: appAuthorizationManager
@@ -175,6 +179,7 @@ class DayManager @Inject constructor(
         } catch (_: Exception) {}
         managerScope.launch {
             actionMutex.withLock {
+                activeAccountScopeDao.getActiveScope()?.let(ReelCountAccountScope::setCurrent)
                 val todayStr = getCurrentDateString()
                 recoverMissedTransitionsAndInitializeLocked(todayStr)
             }
@@ -342,14 +347,21 @@ class DayManager @Inject constructor(
         }
     }
     
-    private suspend fun loadOrCreateDayLocked(dateStr: String) {
+    private suspend fun loadOrCreateDayLocked(
+        dateStr: String,
+        preserveMonotonicCount: Boolean = true
+    ) {
         flushPendingWritesLocked()
         
         var stats = dailyReelDataDao.getDailyDataSync(dateStr)
         if (stats == null) {
             val lastStats = dailyReelDataDao.getLatestHistoricalDataSync(dateStr)
             val defaultLimit = preferencesRepository.defaultDailyLimit.first()
-            val carryOverLimit = if (defaultLimit > 0) defaultLimit else (lastStats?.dailyGoal ?: defaultLimit)
+            val carryOverLimit = when {
+                lastStats != null && lastStats.dailyGoal > 0 -> lastStats.dailyGoal
+                defaultLimit > 0 -> defaultLimit
+                else -> lastStats?.dailyGoal ?: defaultLimit.coerceAtLeast(0)
+            }
             stats = DailyReelData(
                 dateString = dateStr,
                 totalReelsCount = 0,
@@ -361,13 +373,19 @@ class DayManager @Inject constructor(
                 syncStatus = 1
             )
             dailyReelDataDao.insertOrReplace(stats)
-            Log.i("DAY_RESET", "oldDate=${_currentDateString.value} newDate=$dateStr reason=LOCAL_DATE_CHANGED StrictMode=AUTO_ON")
+            preferencesRepository.setDailyLimitLocked(false)
+            preferencesRepository.setStrictModeLocked(false)
+            if (carryOverLimit > 0) {
+                preferencesRepository.setDefaultDailyLimit(carryOverLimit)
+                preferencesRepository.setDailyIntent(carryOverLimit)
+            }
+            Log.i("DAY_RESET", "oldDate=${_currentDateString.value} newDate=$dateStr reason=LOCAL_DATE_CHANGED StrictMode=AUTO_ON LimitLock=UNLOCKED DailyLimit=$carryOverLimit")
         } else {
             // MONOTONIC INVARIANT PROTECTION:
             // For the SAME local date, the count can ONLY increase.
             // Never overwrite memory with a lower count if memory already has a higher count for dateStr.
             val currentMemory = _currentDayStats.value
-            if (currentMemory != null && currentMemory.dateString == dateStr && currentMemory.totalReelsCount > stats.totalReelsCount) {
+            if (preserveMonotonicCount && currentMemory != null && currentMemory.dateString == dateStr && currentMemory.totalReelsCount > stats.totalReelsCount) {
                 Log.w("DAY_STATE_INVARIANT", "Prevented stale DB reload from decreasing count (${currentMemory.totalReelsCount} > ${stats.totalReelsCount})")
                 stats = stats.copy(totalReelsCount = currentMemory.totalReelsCount)
                 dailyReelDataDao.insertOrReplace(stats)
@@ -377,11 +395,42 @@ class DayManager @Inject constructor(
 
             // If existing row has unconfigured limit (<= 0), check if preferences have a restored limit
             if (stats.dailyGoal <= 0) {
+                val lastStats = dailyReelDataDao.getLatestHistoricalDataSync(dateStr)
                 val defaultLimit = preferencesRepository.defaultDailyLimit.first()
-                if (defaultLimit > 0) {
-                    stats = stats.copy(dailyGoal = defaultLimit)
+                val carryOverLimit = when {
+                    lastStats != null && lastStats.dailyGoal > 0 -> lastStats.dailyGoal
+                    defaultLimit > 0 -> defaultLimit
+                    else -> 0
+                }
+                if (carryOverLimit > 0) {
+                    stats = stats.copy(dailyGoal = carryOverLimit)
                     dailyReelDataDao.insertOrReplace(stats)
-                    Log.i("DayManager", "Reconciled existing day row with defaultDailyLimit: $defaultLimit")
+                    preferencesRepository.setDefaultDailyLimit(carryOverLimit)
+                    preferencesRepository.setDailyIntent(carryOverLimit)
+                    Log.i("DayManager", "Reconciled existing day row with carryOverLimit: $carryOverLimit")
+                }
+            }
+
+            // DAILY LIMIT RECONCILIATION:
+            val todayEpoch = try {
+                LocalDate.parse(dateStr, DateTimeFormatter.ISO_LOCAL_DATE).toEpochDay()
+            } catch (_: Exception) {
+                timeProvider.localDate().toEpochDay()
+            }
+            val lastLimitChange = preferencesRepository.lastLimitChangeDate.first()
+            if (lastLimitChange == todayEpoch) {
+                if (!stats.isLimitLocked) {
+                    stats = stats.copy(isLimitLocked = true)
+                    dailyReelDataDao.insertOrReplace(stats)
+                    preferencesRepository.setDailyLimitLocked(true)
+                    Log.i("DayManager", "Reconciled Daily Limit lock for $dateStr based on lastLimitChangeDate")
+                }
+            } else {
+                if (stats.isLimitLocked) {
+                    stats = stats.copy(isLimitLocked = false)
+                    dailyReelDataDao.insertOrReplace(stats)
+                    preferencesRepository.setDailyLimitLocked(false)
+                    Log.i("DAY_RESET", "Reconciled Daily Limit lock for $dateStr to UNLOCKED for new day")
                 }
             }
 
@@ -393,6 +442,7 @@ class DayManager @Inject constructor(
                 if (stats.isStrictModeOn && !stats.isStrictModeLocked) {
                     stats = stats.copy(isStrictModeLocked = true)
                     dailyReelDataDao.insertOrReplace(stats)
+                    preferencesRepository.setStrictModeLocked(true)
                     Log.i("DayManager", "Reconciled Strict Mode lock for $dateStr based on lastStrictModeOffDate")
                 }
             } else {
@@ -401,6 +451,7 @@ class DayManager @Inject constructor(
                 if (!stats.isStrictModeOn || stats.isStrictModeLocked) {
                     stats = stats.copy(isStrictModeOn = true, isStrictModeLocked = false)
                     dailyReelDataDao.insertOrReplace(stats)
+                    preferencesRepository.setStrictModeLocked(false)
                     Log.i("DAY_RESET", "Reconciled Strict Mode for $dateStr to AUTO_ON (interactive)")
                 }
             }
@@ -415,8 +466,64 @@ class DayManager @Inject constructor(
         if (!restoring) {
             Log.d("DayManager", "Restore finished. Refreshing memory from DB.")
             managerScope.launch {
-                loadOrCreateDay(_currentDateString.value)
+                actionMutex.withLock {
+                    // The restore transaction has already reconciled Room, so its row is
+                    // authoritative here. Keep the current StateFlow value published until
+                    // the replacement is ready to avoid a transient null emission to UI consumers.
+                    loadOrCreateDayLocked(_currentDateString.value, preserveMonotonicCount = false)
+                }
             }
+        }
+    }
+
+    private fun isUserEntitled(): Boolean {
+        isEntitledOverrideForTesting?.let { return it }
+        return effectiveAuthManager?.getOperationalMode()?.isEntitled
+            ?: (effectiveSubscriptionManager?.hasActiveEntitlementNow() == true)
+    }
+
+    suspend fun setDailyGoalSuspend(goal: Int, forceUpdate: Boolean = false): Boolean {
+        if (isRestoring) return false
+        if (!isUserEntitled()) {
+            Log.w("DayManager", "setDailyGoal rejected: Daily Limit is a Trial/Premium-only feature. Current mode: ${effectiveAuthManager?.getOperationalMode()}")
+            return false
+        }
+        return actionMutex.withLock {
+            flushPendingWritesLocked()
+            if (_currentDayStats.value == null) {
+                loadOrCreateDayLocked(_currentDateString.value)
+            }
+            val currentStats = _currentDayStats.value ?: return@withLock false
+            val todayEpoch = try {
+                LocalDate.parse(currentStats.dateString, DateTimeFormatter.ISO_LOCAL_DATE).toEpochDay()
+            } catch (_: Exception) {
+                timeProvider.localDate().toEpochDay()
+            }
+            val lastLimitChangeDate = preferencesRepository.lastLimitChangeDate.first()
+            if (!forceUpdate && (currentStats.isLimitLocked || lastLimitChangeDate == todayEpoch)) {
+                Log.d("DayManager", "Limit change rejected. Already locked for today.")
+                return@withLock false
+            }
+
+            // 1. Save to preferences so it becomes the default for future days if needed
+            preferencesRepository.setDailyIntent(goal)
+            preferencesRepository.setDefaultDailyLimit(goal)
+            preferencesRepository.setGoalSetDate(todayEpoch)
+            preferencesRepository.setLastLimitChangeDate(todayEpoch)
+            preferencesRepository.setDailyLimitLocked(true)
+            preferencesRepository.setLastLockEpochDay(todayEpoch)
+            
+            // 2. Update the DB for today and lock the limit
+            val updatedStats = currentStats.copy(
+                dailyGoal = goal, 
+                isLimitLocked = true,
+                updatedAt = timeProvider.currentTimeMillis(),
+                syncStatus = 1
+            )
+            dailyReelDataDao.insertOrReplace(updatedStats)
+            _currentDayStats.value = updatedStats
+            Log.i("DayManager", "Daily limit successfully updated to $goal and locked for today (epoch=$todayEpoch).")
+            true
         }
     }
 
@@ -424,51 +531,33 @@ class DayManager @Inject constructor(
         if (isRestoring) return
         val isEntitled = effectiveAuthManager?.getOperationalMode()?.isEntitled
             ?: (effectiveSubscriptionManager?.hasActiveEntitlementNow() == true)
+            ?: (isEntitledOverrideForTesting == true)
         if (!isEntitled) {
             Log.w("DayManager", "setDailyGoal rejected: Daily Limit is a Trial/Premium-only feature. Current mode: ${effectiveAuthManager?.getOperationalMode()}")
             return
         }
         managerScope.launch {
-            actionMutex.withLock {
-                flushPendingWritesLocked()
-                if (_currentDayStats.value == null) {
-                    loadOrCreateDayLocked(_currentDateString.value)
-                }
-                val currentStats = _currentDayStats.value ?: return@withLock
-                if (!forceUpdate && currentStats.isLimitLocked) {
-                    Log.d("DayManager", "Limit change rejected. Already locked for today.")
-                    return@withLock
-                }
-
-                // 1. Save to preferences so it becomes the default for future days if needed
-                preferencesRepository.setDailyIntent(goal)
-                preferencesRepository.setDefaultDailyLimit(goal)
-                val todayEpoch = timeProvider.localDate().toEpochDay()
-                preferencesRepository.setGoalSetDate(todayEpoch)
-                preferencesRepository.setLastLimitChangeDate(todayEpoch)
-                
-                // 2. Update the DB for today and lock the limit
-                val updatedStats = currentStats.copy(
-                    dailyGoal = goal, 
-                    isLimitLocked = true,
-                    updatedAt = timeProvider.currentTimeMillis(),
-                    syncStatus = 1
-                )
-                dailyReelDataDao.insertOrReplace(updatedStats)
-                _currentDayStats.value = updatedStats
-            }
-            // Strict manual-only policy: Daily goal persists strictly locally.
-            // It is backed up only when the user explicitly triggers "Back Up Data".
+            setDailyGoalSuspend(goal, forceUpdate)
         }
+    }
+
+    suspend fun canSetDailyGoalToday(): Boolean {
+        val currentStats = _currentDayStats.value ?: return false
+        if (!isUserEntitled()) return false
+        val todayEpoch = try {
+            LocalDate.parse(currentStats.dateString, DateTimeFormatter.ISO_LOCAL_DATE).toEpochDay()
+        } catch (_: Exception) {
+            timeProvider.localDate().toEpochDay()
+        }
+        val lastLimitChangeDate = preferencesRepository.lastLimitChangeDate.first()
+        return !currentStats.isLimitLocked && lastLimitChangeDate != todayEpoch
     }
 
     /**
      * Restores an account-level daily limit from cloud into active preferences, today's database row, and memory.
      */
     suspend fun restoreActiveDailyLimit(goal: Int) {
-        val isEntitled = effectiveAuthManager?.getOperationalMode()?.isEntitled
-            ?: (effectiveSubscriptionManager?.hasActiveEntitlementNow() == true)
-        if (!isEntitled) {
+        if (!isUserEntitled()) {
             Log.w("DayManager", "restoreActiveDailyLimit rejected: Daily Limit is a Trial/Premium-only feature. Mode: ${effectiveAuthManager?.getOperationalMode()}")
             return
         }
@@ -514,11 +603,27 @@ class DayManager @Inject constructor(
         }
     }
 
+    /** Flushes the old account before atomically selecting and initializing another local partition. */
+    suspend fun switchAccountScope(uid: String?) {
+        actionMutex.withLock {
+            flushPendingWritesLocked()
+            val newScope = ReelCountAccountScope.fromUid(uid)
+            activeAccountScopeDao.setActiveScope(ActiveAccountScope(accountScope = newScope))
+            ReelCountAccountScope.setCurrent(newScope)
+            _currentDayStats.update { null }
+            isInitialized = false
+            val todayStr = getCurrentDateString()
+            _currentDateString.value = todayStr
+            recoverMissedTransitionsAndInitializeLocked(todayStr)
+            Log.i("DayManager", "Local tracking account scope switched")
+        }
+    }
+
     fun acceptReelTransition(
         fingerprint: SemanticFingerprint,
         token: AuthorizationToken? = null
     ): ReelCountAcceptance {
-        if (!isCountAuthorized(token) || isRestoring || !managerScope.isActive) {
+        if (!isCountAuthorized(token) || !isAccountScopeCurrent() || isRestoring || !managerScope.isActive) {
             return ReelCountAcceptance.REJECTED
         }
 
@@ -527,7 +632,7 @@ class DayManager @Inject constructor(
             // intentional: TransitionLedger must not report acceptance before Room commits.
             kotlinx.coroutines.runBlocking(Dispatchers.IO) {
                 actionMutex.withLock {
-                    if (!isCountAuthorized(token) || isRestoring || !managerScope.isActive) {
+                    if (!isCountAuthorized(token) || !isAccountScopeCurrent() || isRestoring || !managerScope.isActive) {
                         return@withLock ReelCountAcceptance.REJECTED
                     }
 
@@ -587,167 +692,161 @@ class DayManager @Inject constructor(
     }
 
     private fun isCountAuthorized(token: AuthorizationToken?): Boolean {
-        val authMgr = effectiveAuthManager ?: return true
+        val authMgr = effectiveAuthManager ?: run {
+            if (allowUnconfiguredAuthForTesting) return true
+            Log.e("DayManager", "SECURITY GATE REJECTION: Missing AppAuthorizationManager wiring; failing closed.")
+            return false
+        }
         if (authMgr.getOperationalMode() == OperationalMode.LOCKED_OR_EXPIRED) return false
+        if (authMgr != null && token != null) {
+            return authMgr.verifyToken(token)
+        }
         return token == null || authMgr.verifyToken(token)
     }
 
-    fun appendSession(sessionData: SessionData, token: AuthorizationToken? = null) {
-        if (isRestoring) return
-        
-        // PERSISTENCE GATE: Explicit Operational Mode Verification
-        val authMgr = effectiveAuthManager
-        if (authMgr != null && token != null) {
-            val mode = authMgr.getOperationalMode()
-            if (mode == OperationalMode.LOCKED_OR_EXPIRED || !authMgr.verifyToken(token)) {
-                Log.w("DayManager", "PERSISTENCE GATE REJECTION: appendSession dropped due to invalid authorization token or locked mode")
-                return
-            }
-        } else if (authMgr != null) {
-            val mode = authMgr.getOperationalMode()
-            if (mode == OperationalMode.LOCKED_OR_EXPIRED) {
-                Log.w("DayManager", "PERSISTENCE GATE REJECTION: appendSession dropped in LOCKED_OR_EXPIRED mode")
-                return
-            }
+    private fun isAccountScopeCurrent(): Boolean {
+        val authMgr = effectiveAuthManager ?: run {
+            return allowUnconfiguredAuthForTesting && ReelCountAccountScope.current == "local"
         }
-
-        managerScope.launch {
-            actionMutex.withLock {
-                val today = timeProvider.localDate()
-                val todayStr = today.format(DateTimeFormatter.ISO_LOCAL_DATE)
-                val currentStoredStr = _currentDateString.value
-                val currentStoredDate = try {
-                    LocalDate.parse(currentStoredStr, DateTimeFormatter.ISO_LOCAL_DATE)
-                } catch (e: Exception) {
-                    today
-                }
-                
-                if (todayStr != currentStoredStr) {
-                    if (isLegitimateDateTransition(currentStoredDate, today)) {
-                        Log.i("DayManager", "MIDNIGHT SESSION DETECTED: $currentStoredStr to $todayStr")
-                        recoverMissedTransitionsAndInitializeLocked(todayStr)
-                    } else {
-                        Log.w("DayManager", "Ignored illegitimate date difference in appendSession: stored=$currentStoredStr, current=$todayStr")
-                    }
-                }
-                
-                if (_currentDayStats.value == null) {
-                    loadOrCreateDayLocked(todayStr)
-                }
-
-                val now = timeProvider.currentTimeMillis()
-                val currentStats = _currentDayStats.value ?: return@withLock
-                
-                val updatedSessions = currentStats.sessions.toMutableList()
-                updatedSessions.add(sessionData)
-                val addedTime = sessionData.endTimeStamp - sessionData.startTimeStamp
-                
-                val updated = currentStats.copy(
-                    sessions = updatedSessions,
-                    totalTimeSpentMillis = currentStats.totalTimeSpentMillis + addedTime,
-                    updatedAt = now,
-                    syncStatus = 1
-                )
-                
-                _currentDayStats.value = updated
-                updateConfirmationAnchors(today, timeProvider.localTime())
-                // AppendSession represents a session boundary: flush immediately
-                flushPendingWritesLocked()
-                dailyReelDataDao.insertOrReplace(updated)
-            }
-        }
+        val currentUid = authMgr.currentUidProvider()
+        return ReelCountAccountScope.current == ReelCountAccountScope.fromUid(currentUid)
     }
+
+    internal fun isCountAuthorizedForTesting(token: AuthorizationToken?): Boolean = isCountAuthorized(token)
+    internal fun isAccountScopeCurrentForTesting(): Boolean = isAccountScopeCurrent()
 
     /**
      * Disables Strict Mode for today (user's one-time privilege).
      * Rejected if user lacks active entitlement (Premium or Trial)
      * or if Strict Mode is already locked for today.
      */
+    suspend fun disableStrictModeForTodaySuspend(): Boolean {
+        if (isRestoring) return false
+        if (!isUserEntitled()) {
+            Log.w("DayManager", "disableStrictModeForToday rejected: User does not have active Premium or Trial entitlement.")
+            return false
+        }
+        
+        return actionMutex.withLock {
+            flushPendingWritesLocked()
+            if (_currentDayStats.value == null) {
+                loadOrCreateDayLocked(_currentDateString.value)
+            }
+            val currentStats = _currentDayStats.value ?: return@withLock false
+            
+            if (currentStats.isStrictModeLocked) {
+                Log.d("DayManager", "Strict Mode disable rejected. Already locked for today.")
+                return@withLock false
+            }
+
+            val todayStr = currentStats.dateString
+            val lastOffDate = preferencesRepository.lastStrictModeOffDate.first()
+            if (lastOffDate == todayStr) {
+                Log.d("DayManager", "Strict Mode disable rejected. Already turned OFF once today ($todayStr).")
+                return@withLock false
+            }
+
+            val updated = currentStats.copy(
+                isStrictModeOn = false,
+                isStrictModeLocked = false,
+                updatedAt = timeProvider.currentTimeMillis(),
+                syncStatus = 1
+            )
+            
+            preferencesRepository.setLastStrictModeOffDate(todayStr)
+            preferencesRepository.setStrictModeLocked(false)
+            _currentDayStats.value = updated
+            dailyReelDataDao.insertOrReplace(updated)
+            Log.i("DayManager", "Strict Mode disabled for today by user ($todayStr).")
+            true
+        }
+    }
+
     fun disableStrictModeForToday() {
         if (isRestoring) return
-        if (effectiveSubscriptionManager?.hasActiveEntitlementNow() != true) {
+        if (!isUserEntitled()) {
             Log.w("DayManager", "disableStrictModeForToday rejected: User does not have active Premium or Trial entitlement.")
             return
         }
-        
         managerScope.launch {
-            actionMutex.withLock {
-                flushPendingWritesLocked()
-                if (_currentDayStats.value == null) {
-                    loadOrCreateDayLocked(_currentDateString.value)
-                }
-                val currentStats = _currentDayStats.value ?: return@withLock
-                
-                if (currentStats.isStrictModeLocked) {
-                    Log.d("DayManager", "Strict Mode disable rejected. Already locked for today.")
-                    return@withLock
-                }
-
-                val todayStr = currentStats.dateString
-                val lastOffDate = preferencesRepository.lastStrictModeOffDate.first()
-                if (lastOffDate == todayStr) {
-                    Log.d("DayManager", "Strict Mode disable rejected. Already turned OFF once today ($todayStr).")
-                    return@withLock
-                }
-
-                val updated = currentStats.copy(
-                    isStrictModeOn = false,
-                    isStrictModeLocked = false,
-                    updatedAt = timeProvider.currentTimeMillis(),
-                    syncStatus = 1
-                )
-                
-                preferencesRepository.setLastStrictModeOffDate(todayStr)
-                _currentDayStats.value = updated
-                dailyReelDataDao.insertOrReplace(updated)
-                Log.i("DayManager", "Strict Mode disabled for today by user ($todayStr).")
-            }
+            disableStrictModeForTodaySuspend()
         }
     }
 
     /**
-     * Reactivates Strict Mode after successful completion of a rewarded ad.
+     * Reactivates Strict Mode.
      * Enforcement becomes active and LOCKED for the remainder of today.
      * Rejected if user lacks active entitlement (Premium or Trial).
      */
-    fun reactivateStrictModeWithAd() {
-        if (isRestoring) return
-        if (effectiveSubscriptionManager?.hasActiveEntitlementNow() != true) {
-            Log.w("DayManager", "reactivateStrictModeWithAd rejected: User does not have active Premium or Trial entitlement.")
-            return
+    suspend fun reactivateStrictModeSuspend(): Boolean {
+        if (isRestoring) return false
+        if (!isUserEntitled()) {
+            Log.w("DayManager", "reactivateStrictMode rejected: User does not have active Premium or Trial entitlement.")
+            return false
         }
 
-        managerScope.launch {
-            actionMutex.withLock {
-                flushPendingWritesLocked()
-                if (_currentDayStats.value == null) {
-                    loadOrCreateDayLocked(_currentDateString.value)
-                }
-                val currentStats = _currentDayStats.value ?: return@withLock
-
-                val updated = currentStats.copy(
-                    isStrictModeOn = true,
-                    isStrictModeLocked = true,
-                    updatedAt = timeProvider.currentTimeMillis(),
-                    syncStatus = 1
-                )
-
-                _currentDayStats.value = updated
-                dailyReelDataDao.insertOrReplace(updated)
-                Log.i("DayManager", "Strict Mode reactivated and locked for today after rewarded ad.")
+        return actionMutex.withLock {
+            flushPendingWritesLocked()
+            if (_currentDayStats.value == null) {
+                loadOrCreateDayLocked(_currentDateString.value)
             }
+            val currentStats = _currentDayStats.value ?: return@withLock false
+
+            val updated = currentStats.copy(
+                isStrictModeOn = true,
+                isStrictModeLocked = true,
+                updatedAt = timeProvider.currentTimeMillis(),
+                syncStatus = 1
+            )
+
+            preferencesRepository.setStrictModeLocked(true)
+            _currentDayStats.value = updated
+            dailyReelDataDao.insertOrReplace(updated)
+            Log.i("DayManager", "Strict Mode reactivated and locked for today.")
+            true
+        }
+    }
+
+    fun reactivateStrictMode() {
+        if (isRestoring) return
+        if (!isUserEntitled()) {
+            Log.w("DayManager", "reactivateStrictMode rejected: User does not have active Premium or Trial entitlement.")
+            return
+        }
+        managerScope.launch {
+            reactivateStrictModeSuspend()
+        }
+    }
+
+    fun reactivateStrictModeWithAd() {
+        reactivateStrictMode()
+    }
+
+    suspend fun setStrictModeSuspend(enabled: Boolean): Boolean {
+        if (!isUserEntitled()) {
+            Log.w("DayManager", "setStrictMode rejected: User does not have active Premium or Trial entitlement.")
+            return false
+        }
+        return if (enabled) {
+            val current = _currentDayStats.value
+            if (current != null && current.isStrictModeOn && !current.isStrictModeLocked) {
+                // Already ON and interactive; remain active without locking
+                true
+            } else {
+                reactivateStrictModeSuspend()
+            }
+        } else {
+            disableStrictModeForTodaySuspend()
         }
     }
 
     fun setStrictMode(enabled: Boolean) {
-        if (effectiveSubscriptionManager?.hasActiveEntitlementNow() != true) {
+        if (!isUserEntitled()) {
             Log.w("DayManager", "setStrictMode rejected: User does not have active Premium or Trial entitlement.")
             return
         }
-        if (enabled) {
-            reactivateStrictModeWithAd()
-        } else {
-            disableStrictModeForToday()
+        managerScope.launch {
+            setStrictModeSuspend(enabled)
         }
     }
 
@@ -756,7 +855,7 @@ class DayManager @Inject constructor(
      * AND enabled for the current active tracking day.
      */
     fun isStrictModeAuthorizedAndActiveNow(): Boolean {
-        val hasEntitlement = effectiveSubscriptionManager?.hasActiveEntitlementNow() == true
+        val hasEntitlement = isUserEntitled()
         val isEnabledOnCurrentDay = _currentDayStats.value?.isStrictModeOn == true
         return hasEntitlement && isEnabledOnCurrentDay
     }
@@ -767,7 +866,7 @@ class DayManager @Inject constructor(
      */
     suspend fun canDisableStrictModeToday(): Boolean {
         val currentStats = _currentDayStats.value ?: return false
-        val hasEntitlement = effectiveSubscriptionManager?.hasActiveEntitlementNow() == true
+        val hasEntitlement = isUserEntitled()
         val lastOffDate = preferencesRepository.lastStrictModeOffDate.first()
         return hasEntitlement && currentStats.isStrictModeOn && !currentStats.isStrictModeLocked && lastOffDate != currentStats.dateString
     }

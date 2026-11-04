@@ -249,7 +249,13 @@ class DirectionStateManager(
 
         // Signal 2: DeltaY & Recoil filtering (BUG-A02)
         if (directionDecision == ScrollDirection.UNKNOWN) {
-            if (scrollDeltaY <= -MIN_BACKWARD_DELTA_PX) {
+            val isSnapRecoil = (_currentDirection == ScrollDirection.FORWARD || inForwardGesture) &&
+                scrollDeltaY < 0 && scrollDeltaY > -150
+
+            if (isSnapRecoil) {
+                // Filter out snap recoil: maintain FORWARD if we were already in a forward gesture
+                directionDecision = ScrollDirection.FORWARD
+            } else if (scrollDeltaY <= -MIN_BACKWARD_DELTA_PX) {
                 // Definite, significant backward movement
                 directionDecision = ScrollDirection.BACKWARD
                 cumulativeScrollDelta = scrollDeltaY
@@ -258,6 +264,7 @@ class DirectionStateManager(
                 // Definite, significant forward movement
                 directionDecision = ScrollDirection.FORWARD
                 cumulativeScrollDelta = scrollDeltaY
+                inForwardGesture = true
             } else if (scrollDeltaY > 0) {
                 // Forward movement below threshold
                 directionDecision = ScrollDirection.FORWARD
@@ -265,7 +272,7 @@ class DirectionStateManager(
             } else if (scrollDeltaY < 0) {
                 // Small negative movement (|scrollDeltaY| < MIN_BACKWARD_DELTA_PX, e.g. -15px recoil)
                 // Filter out snap recoil: if we were already FORWARD, maintain FORWARD
-                directionDecision = if (_currentDirection == ScrollDirection.FORWARD) {
+                directionDecision = if (_currentDirection == ScrollDirection.FORWARD || inForwardGesture) {
                     ScrollDirection.FORWARD
                 } else {
                     ScrollDirection.UNKNOWN

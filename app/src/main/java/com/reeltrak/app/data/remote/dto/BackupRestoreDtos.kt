@@ -21,6 +21,20 @@ data class CloudSnapshotRecordDto(
 }
 
 /**
+ * Normalizes reel counts when parsing records that may contain both 'count' and 'totalReelsCount'.
+ * Positive values always take precedence over stale zeroes. Legitimate zero counts are preserved.
+ */
+fun normalizeReelCount(rawTotal: Int?, rawCount: Int?): Int {
+    return when {
+        rawTotal != null && rawTotal > 0 -> rawTotal
+        rawCount != null && rawCount > 0 -> rawCount
+        rawTotal != null && rawTotal == 0 -> 0
+        rawCount != null && rawCount == 0 -> 0
+        else -> 0
+    }.coerceAtLeast(0)
+}
+
+/**
  * Server response from GET /api/backup/status
  */
 data class BackupStatusResponse(
@@ -34,7 +48,13 @@ data class BackupStatusResponse(
     val activeBackupId: String? = null,
     val totalRecords: Int = 0,
     val error: String? = null
-)
+) {
+    val hasBackup: Boolean
+        get() = !activeBackupId.isNullOrBlank() || lastBackupTimeMs > 0L || totalRecords > 0
+
+    val recordCount: Int
+        get() = totalRecords
+}
 
 /**
  * Domain outcome for Backup operations

@@ -8,6 +8,7 @@ import com.google.firebase.ktx.Firebase
 import com.reeltrak.app.core.di.IoDispatcher
 import com.reeltrak.app.core.network.NetworkConstants
 import com.reeltrak.app.data.local.dao.DailyReelDataDao
+import com.reeltrak.app.data.local.entity.ReelCountAccountScope
 import com.reeltrak.app.data.remote.dto.BackupResult
 import com.reeltrak.app.data.remote.dto.BackupStatusResponse
 import com.reeltrak.app.domain.managers.SubscriptionManager
@@ -32,6 +33,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -52,6 +55,31 @@ class LocalBackupRepositoryImpl @Inject constructor(
         private const val TAG = "LocalBackupRepo"
         const val BACKUP_COOLDOWN_MS = 24 * 60 * 60 * 1000L
         const val CHUNK_SIZE = 200
+        private val IST_ZONE = ZoneId.of("Asia/Kolkata")
+    }
+
+    private fun getNextIstMidnightMs(nowMs: Long = System.currentTimeMillis()): Long {
+        val istDate = Instant.ofEpochMilli(nowMs).atZone(IST_ZONE).toLocalDate()
+        return istDate.plusDays(1).atStartOfDay(IST_ZONE).toInstant().toEpochMilli()
+    }
+
+    private suspend fun abortPendingBackup(backupId: String?, reason: String) {
+        try {
+            val user = Firebase.auth.currentUser ?: return
+            val token = user.getIdToken(false).await().token ?: return
+            val payload = JSONObject().apply {
+                put("backupId", backupId ?: "")
+                put("reason", reason)
+            }
+            val request = Request.Builder()
+                .url("${NetworkConstants.WORKER_BASE_URL}/api/backup/abort")
+                .header("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
+                .build()
+            httpClient.newCall(request).execute().close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to call /api/backup/abort: ${e.message}")
+        }
     }
 
     private val backupMutex = Mutex()
@@ -161,6 +189,10 @@ class LocalBackupRepositoryImpl @Inject constructor(
         }
 
         val uid = user.uid
+        val accountScope = ReelCountAccountScope.fromUid(uid)
+        if (ReelCountAccountScope.current != accountScope) {
+            return@withContext BackupResult.Ineligible("Local account data is still switching. Please retry after sign-in completes.")
+        }
         if (!subscriptionManagerLazy.get().hasActiveEntitlementNow()) {
             Log.w(TAG, "Backup aborted: No active subscription or trial.")
             return@withContext BackupResult.Ineligible("Cloud Backup requires an active Trial or Premium subscription.")
@@ -174,6 +206,24 @@ class LocalBackupRepositoryImpl @Inject constructor(
 
         val allRecords = dailyReelDataDao.getAllDailyDataSync()
         val defaultDailyLimit = preferencesRepository.defaultDailyLimit.first()
+        if (ReelCountAccountScope.current != accountScope || allRecords.any { it.accountScope != accountScope }) {
+            return@withContext BackupResult.Ineligible("Local account data changed during backup. Please retry.")
+        }
+
+        // Anti-Data-Loss Safety Gate:
+        // Prevent an empty local database or default values from ever overwriting a non-empty remote backup
+        if (allRecords.isEmpty() || allRecords.all { it.totalReelsCount == 0 }) {
+            val serverStatus = try {
+                checkServerBackupStatus(force = true)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to check server backup status for empty local data check", e)
+                null
+            }
+            if (serverStatus != null && (serverStatus.hasBackup || serverStatus.recordCount > 0 || serverStatus.lastBackupTimeMs > 0)) {
+                Log.w(TAG, "Prevented destructive backup: Local records are empty/zero but remote backup exists (${serverStatus.recordCount} records).")
+                return@withContext BackupResult.Ineligible("Cannot overwrite existing remote backup with empty local data. Please restore your data first.")
+            }
+        }
 
         // Reuse existing in-flight requestId for retry, or generate a fresh one
         var requestId = preferencesRepository.currentBackupRequestId.first()
@@ -202,6 +252,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
                 recordsArray.put(JSONObject().apply {
                     put("dateString", rec.dateString)
                     put("count", rec.totalReelsCount.coerceIn(0, 100000))
+                    put("totalReelsCount", rec.totalReelsCount.coerceIn(0, 100000))
                     put("dailyGoal", rec.dailyGoal.coerceIn(0, 100000))
                     put("isSkullDay", rec.isSkullDay)
                     put("isStrictModeOn", rec.isStrictModeOn)
@@ -215,6 +266,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
                 put("requestId", requestId)
                 put("defaultDailyLimit", defaultDailyLimit.coerceAtLeast(0))
                 put("dailyRecords", recordsArray)
+                put("records", recordsArray)
             }
 
             val request = Request.Builder()
@@ -233,7 +285,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
                         val json = try { JSONObject(body) } catch (_: Exception) { JSONObject() }
                         val backupId = json.optString("backupId", "")
                         val serverTimeMs = json.optLong("lastBackupTimeMs", System.currentTimeMillis())
-                        val nextEligible = json.optLong("nextEligibleTimeMs", serverTimeMs + BACKUP_COOLDOWN_MS)
+                        val nextEligible = json.optLong("nextEligibleTimeMs", getNextIstMidnightMs(serverTimeMs))
 
                         // Clear pending requestId on success
                         preferencesRepository.setCurrentBackupRequestId(null)
@@ -332,6 +384,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
                         sliceArray.put(JSONObject().apply {
                             put("dateString", rec.dateString)
                             put("count", rec.totalReelsCount.coerceIn(0, 100000))
+                            put("totalReelsCount", rec.totalReelsCount.coerceIn(0, 100000))
                             put("dailyGoal", rec.dailyGoal.coerceIn(0, 100000))
                             put("isSkullDay", rec.isSkullDay)
                             put("isStrictModeOn", rec.isStrictModeOn)
@@ -344,6 +397,8 @@ class LocalBackupRepositoryImpl @Inject constructor(
                     val chunkPayload = JSONObject().apply {
                         put("backupId", backupId)
                         put("chunkIndex", idx)
+                        put("totalChunks", chunks.size)
+                        put("dailyRecords", sliceArray)
                         put("records", sliceArray)
                     }
 
@@ -355,6 +410,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
 
                     val chunkRes = httpClient.newCall(chunkReq).execute()
                     if (!chunkRes.isSuccessful) {
+                        abortPendingBackup(backupId, "CHUNK_${idx}_FAILED_${chunkRes.code}")
                         return@withContext BackupResult.Error("Chunk $idx upload failed (HTTP ${chunkRes.code})")
                     }
                 }
@@ -364,6 +420,7 @@ class LocalBackupRepositoryImpl @Inject constructor(
                     put("backupId", backupId)
                     put("requestId", requestId)
                     put("totalRecords", allRecords.size)
+                    put("defaultDailyLimit", defaultDailyLimit.coerceAtLeast(0))
                 }
 
                 val finReq = Request.Builder()
@@ -374,12 +431,13 @@ class LocalBackupRepositoryImpl @Inject constructor(
 
                 val finRes = httpClient.newCall(finReq).execute()
                 if (!finRes.isSuccessful) {
+                    abortPendingBackup(backupId, "FINALIZE_FAILED_${finRes.code}")
                     return@withContext BackupResult.Error("Backup finalization failed (HTTP ${finRes.code})")
                 }
 
                 val finJson = JSONObject(finRes.body?.string() ?: "{}")
                 val serverTimeMs = finJson.optLong("lastBackupTimeMs", System.currentTimeMillis())
-                val nextEligible = finJson.optLong("nextEligibleTimeMs", serverTimeMs + BACKUP_COOLDOWN_MS)
+                val nextEligible = finJson.optLong("nextEligibleTimeMs", getNextIstMidnightMs(serverTimeMs))
 
                 preferencesRepository.setCurrentBackupRequestId(null)
                 preferencesRepository.setLastBackupTime(serverTimeMs)

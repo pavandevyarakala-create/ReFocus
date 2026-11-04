@@ -323,10 +323,8 @@ class StrictModeDailyLifecycleTest {
             content.contains("fun disableStrictModeForToday()"))
         assertTrue("DashboardViewModel provides reactivateStrictModeWithAd",
             content.contains("fun reactivateStrictModeWithAd()"))
-        assertTrue("DashboardViewModel provides turnOnStrictModeWithAd",
-            content.contains("fun turnOnStrictModeWithAd("))
-        assertTrue("DashboardViewModel provides turnOffStrictModeWithAd",
-            content.contains("fun turnOffStrictModeWithAd("))
+        assertTrue("DashboardViewModel provides setStrictMode",
+            content.contains("fun setStrictMode("))
     }
 
     @Test

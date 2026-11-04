@@ -41,11 +41,13 @@ fun RestoreSettingItem(
 ) {
     val colors = ReFocusTheme.colors
     val isRestoring = restoreState is RestoreUiState.InProgress
+    val isLimitReached = restoreState is RestoreUiState.LimitExceeded
 
     val subtitleText = when {
         !isEntitled -> "Trial & Premium feature • Restore history from cloud"
         restoreState is RestoreUiState.InProgress -> "Restoring habit history from cloud..."
         restoreState is RestoreUiState.Success -> restoreState.message
+        restoreState is RestoreUiState.LimitExceeded -> restoreState.message
         restoreState is RestoreUiState.Error -> restoreState.message
         else -> "Restore habits, limits & history from cloud"
     }
@@ -54,7 +56,7 @@ fun RestoreSettingItem(
         title = "Restore Data",
         subtitle = subtitleText,
         icon = Icons.Outlined.CloudDownload,
-        onClick = if (enabled && !isRestoring) onRestoreClick else null,
+        onClick = if (enabled && !isRestoring && !isLimitReached) onRestoreClick else null,
         showDivider = showDivider,
         modifier = modifier,
         trailing = {
@@ -90,6 +92,22 @@ fun RestoreSettingItem(
                             ) {
                                 Text(
                                     text = "✓ Restored",
+                                    style = ReFocusTheme.Typography.Metadata.copy(
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 12.sp
+                                    ),
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                        is RestoreUiState.LimitExceeded -> {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (colors.isDark) colors.surfaceFloating else colors.surfaceSoft,
+                                contentColor = colors.inkSecondary
+                            ) {
+                                Text(
+                                    text = "Restored",
                                     style = ReFocusTheme.Typography.Metadata.copy(
                                         fontWeight = FontWeight.SemiBold,
                                         fontSize = 12.sp

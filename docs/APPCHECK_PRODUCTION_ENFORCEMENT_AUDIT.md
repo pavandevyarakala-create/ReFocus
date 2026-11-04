@@ -234,3 +234,17 @@ If legitimate users report 401 errors post-deployment:
 The Re:Focus Cloudflare Worker and Android client are **fully prepared and cryptographically sound** for App Check enforcement. 
 
 Following the Pre-Launch Checklist will ensure zero downtime or lockout for legitimate Android users when the production switch is activated.
+
+## Controlled Remediation Status (2026-10-29)
+
+The repository configuration currently sets `APP_CHECK_ENFORCEMENT_MODE` to `audit` for both production and staging. Android release builds install the Play Integrity provider, and the Worker test suite covers missing, invalid, expired, and valid tokens in enforced mode. These repository checks do not prove that Firebase Console and Google Play are configured for the deployed apps.
+
+Keep both Worker environments in audit mode until the operator verifies each environment independently:
+
+1. Confirm the production and staging Firebase Android app registrations use the package IDs and Firebase project IDs built into their respective variants.
+2. Register the production Google Play App Signing SHA-256 fingerprint with production Firebase App Check / Play Integrity, and the staging signing identity with the staging project if staging builds are expected to pass enforcement.
+3. Confirm Play Integrity is enabled and App Check issues valid tokens for installed production and staging builds; register debug tokens only in the intended development project.
+4. Deploy each signed build to its intended environment, observe audit logs for missing or rejected tokens across login, pre-login `/api/time`, subscription, account, and backup flows, and confirm no legitimate traffic is failing verification.
+5. Only then change and deploy enforcement separately per Worker environment, beginning with staging, and run the documented smoke tests before production.
+
+The repository does not contain evidence of these Firebase Console / Play Console registrations or live audit observations. Enforcement is therefore **not enabled** by this remediation.

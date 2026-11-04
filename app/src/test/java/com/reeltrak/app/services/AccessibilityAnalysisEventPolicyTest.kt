@@ -183,6 +183,70 @@ class AccessibilityAnalysisEventPolicyTest {
     }
 
     @Test
+    fun `self event package resolves to active tracked window package when root is present`() {
+        val policy = AccessibilityAnalysisEventPolicy()
+        var released = 0
+        val resolved = policy.resolveWindowStatePackage(
+            eventPackage = "com.reeltrak.app",
+            isTrackedPackage = { it == "com.instagram.android" },
+            isSelfPackage = { it == "com.reeltrak.app" },
+            rootProvider = { "activeInstagramRoot" },
+            packageFromRoot = { "com.instagram.android" },
+            releaseRoot = { released++ }
+        )
+
+        assertEquals("com.instagram.android", resolved)
+        assertEquals(1, released)
+    }
+
+    @Test
+    fun `self event package resolves to self when active window is the application itself`() {
+        val policy = AccessibilityAnalysisEventPolicy()
+        var released = 0
+        val resolved = policy.resolveWindowStatePackage(
+            eventPackage = "com.reeltrak.app",
+            isTrackedPackage = { it == "com.instagram.android" },
+            isSelfPackage = { it == "com.reeltrak.app" },
+            rootProvider = { "mainActivityRoot" },
+            packageFromRoot = { "com.reeltrak.app" },
+            releaseRoot = { released++ }
+        )
+
+        assertEquals("com.reeltrak.app", resolved)
+        assertEquals(1, released)
+    }
+
+    @Test
+    fun `self event package resolves to null when active root is missing to prevent false departure`() {
+        val policy = AccessibilityAnalysisEventPolicy()
+        val resolved = policy.resolveWindowStatePackage(
+            eventPackage = "com.reeltrak.app",
+            isTrackedPackage = { it == "com.instagram.android" },
+            isSelfPackage = { it == "com.reeltrak.app" },
+            rootProvider = { null },
+            packageFromRoot = { error("must not read missing root") },
+            releaseRoot = { error("must not release missing root") }
+        )
+
+        assertEquals(null, resolved)
+    }
+
+    @Test
+    fun `self event package resolves to null when active root throws to prevent false departure`() {
+        val policy = AccessibilityAnalysisEventPolicy()
+        val resolved = policy.resolveWindowStatePackage(
+            eventPackage = "com.reeltrak.app",
+            isTrackedPackage = { it == "com.instagram.android" },
+            isSelfPackage = { it == "com.reeltrak.app" },
+            rootProvider = { throw SecurityException("transient IPC issue") },
+            packageFromRoot = { error("must not read missing root") },
+            releaseRoot = { error("must not release missing root") }
+        )
+
+        assertEquals(null, resolved)
+    }
+
+    @Test
     fun `service binds detector token and increment direction to the queued request`() {
         val service = serviceSource()
         assertTrue(service.contains("copy(feedTransitionToken = request.direction.feedTransitionToken)"))

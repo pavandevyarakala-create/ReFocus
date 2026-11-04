@@ -8,8 +8,8 @@
     <link rel="stylesheet" href="styles.css">
     <script>
         const CONFIG = {
-            PLAY_STORE_URL: "#",
-            DOWNLOAD_APK_URL: "https://github.com/pavandevyarakala-create/Inventory/releases/download/v0.5.0/ReFocus.apk",
+            PLAY_STORE_URL: "https://play.google.com/store/apps/details?id=com.reeltrak.app",
+            DOWNLOAD_APK_URL: "https://play.google.com/store/apps/details?id=com.reeltrak.app",
             SUPPORT_EMAIL: "support.refocus@gmail.com"
         };
     </script>
@@ -106,7 +106,7 @@
                     <tr>
                         <td><strong>Daily Aggregated Summaries</strong></td>
                         <td>On-Device Room DB &amp; Google Cloud Firestore</td>
-                        <td><strong>YES.</strong> Synced to your private user document (<code>/users/{uid}/days/{date}</code>) for authenticated accounts with active Trial or Premium status.</td>
+                        <td><strong>YES.</strong> Synced on-demand to your private user document (<code>/users/{uid}/daily_data/{date}</code>) for authenticated accounts with active Trial or Premium status.</td>
                     </tr>
                     <tr>
                         <td><strong>User Profile &amp; Preferences</strong></td>
@@ -154,7 +154,6 @@
                 <li><strong>Google Play Integrity &amp; Firebase App Check:</strong> Validates app authenticity and device integrity.</li>
                 <li><strong>Cloudflare Workers:</strong> Serverless edge API infrastructure managing server-authoritative time, lease signing, subscription verification, and account deletion workflows. (<a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">Cloudflare Privacy Policy</a>)</li>
                 <li><strong>Razorpay Software Private Limited:</strong> Secure payment gateway facilitating ₹79/month recurring autopay subscriptions via UPI autopay mandates and cards in India. Re:Focus NEVER collects, processes, or stores your credit/debit card numbers, UPI PINs, or net banking passwords. All payment transactions are handled directly on Razorpay's secure PCI-DSS Level 1 compliant servers. (<a href="https://razorpay.com/privacy/" target="_blank" rel="noopener">Razorpay Privacy Policy</a>)</li>
-                <li><strong>Google AdMob (Google Mobile Ads SDK):</strong> Serves user-initiated rewarded video advertisements (e.g., when adjusting a locked daily limit or toggling Strict Mode). AdMob may process device identifiers including the Google Advertising ID (AD_ID) and diagnostic data for ad delivery and fraud prevention, governed by Google's Privacy Policy. AdMob SDK has no access to your video viewing metrics or accessibility service data. (<a href="https://policies.google.com/technologies/ads" target="_blank" rel="noopener">Google Ads Privacy</a>)</li>
             </ul>
             <p><em>Note: Re:Focus does NOT integrate Firebase Analytics, Google Analytics, or Crashlytics SDKs. We do not track cross-app browsing activity.</em></p>
 

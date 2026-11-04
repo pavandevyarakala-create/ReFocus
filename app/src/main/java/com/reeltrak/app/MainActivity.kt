@@ -42,9 +42,6 @@ class MainActivity : ComponentActivity(), PaymentResultWithDataListener {
     lateinit var razorpayPurchaseService: com.reeltrak.app.data.services.RazorpaySubscriptionPurchaseServiceImpl
 
     @Inject
-    lateinit var rewardedAdManager: Lazy<com.reeltrak.app.core.ads.RewardedAdManager>
-
-    @Inject
     lateinit var inAppUpdateManager: com.reeltrak.app.core.update.InAppUpdateManager
 
     @Inject
@@ -115,7 +112,13 @@ class MainActivity : ComponentActivity(), PaymentResultWithDataListener {
             if (currentStatus == com.reeltrak.app.domain.models.SubscriptionStatus.NONE) {
                 subscriptionManager.get().ensureSubscription()
             }
-            subscriptionManager.get().syncIfStale()
+            // Validate locally during normal app use; eliminate routine 30s polling on resume.
+            // Only request/refresh cryptographic lease when missing or expired.
+            val activeToken = subscriptionManager.get().getActiveAuthorizationToken()
+            val authManager = subscriptionManager.get().getAppAuthorizationManager()
+            if (activeToken == null || (authManager != null && !authManager.verifyToken(activeToken))) {
+                subscriptionManager.get().refreshAuthorizationLease()
+            }
         }
     }
 
@@ -172,9 +175,6 @@ class MainActivity : ComponentActivity(), PaymentResultWithDataListener {
                     shouldWarmUpApp = true
                     kotlinx.coroutines.delay(80) // ~1000ms mark
                     razorpayPurchaseService.preload(this@MainActivity)
-                    rewardedAdManager.get().initialize()
-                } else {
-                    rewardedAdManager.get().initialize()
                 }
             }
 

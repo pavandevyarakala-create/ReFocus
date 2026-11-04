@@ -65,31 +65,32 @@ class LatestStateAnalysisQueueTest {
     }
 
     @Test
-    fun `inconclusive detector result is retried without another accessibility event`() = runBlocking {
+    fun `inconclusive retry remains inconclusive without another accessibility event`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val calls = AtomicInteger()
-        val confirmedDeparture = CompletableDeferred<Unit>()
+        val exhausted = CompletableDeferred<Unit>()
         val gate = InconclusiveSnapshotGate()
         val inconclusive = DetectionSnapshot(
             timestamp = 50L,
             classification = SnapshotClassification.INCONCLUSIVE,
             platform = "Instagram"
         )
-        val queue = LatestStateAnalysisQueue<Long>(scope, retryDelayMs = 10L) { eventTime ->
+        val queue = LatestStateAnalysisQueue<Long>(
+            scope = scope,
+            retryDelayMs = 10L,
+            onFailure = { failure -> if (failure == null) exhausted.complete(Unit) }
+        ) { eventTime ->
             calls.incrementAndGet()
-            val resolved = gate.resolve(inconclusive, eventTime)
-            if (resolved == null) false else {
-                assertEquals(SnapshotClassification.DISCARDED, resolved.classification)
-                confirmedDeparture.complete(Unit)
-                true
-            }
+            assertEquals(null, gate.resolve(inconclusive, eventTime))
+            false
         }
 
         try {
             queue.start()
             assertTrue(queue.request(50L))
-            withTimeout(2_000L) { confirmedDeparture.await() }
-            assertEquals("One request must trigger the bounded fresh analysis", 2, calls.get())
+            withTimeout(2_000L) { exhausted.await() }
+            assertEquals("One request must trigger one bounded fresh analysis", 2, calls.get())
+            assertTrue("Repeated inconclusive data must remain pending", gate.hasPendingRecovery())
         } finally {
             queue.close()
             scope.cancel()

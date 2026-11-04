@@ -21,9 +21,10 @@ service cloud.firestore {
 
     // Validates that the user has an active, trial, or pending/cancelled subscription within valid period before permitting cloud sync.
     // Rejects missing subscription documents, expired trials, expired paid periods, and non-paying accounts.
+    // Optimizes document reads by validating subscription presence and period validity before evaluating account status.
     function hasActiveSubscription(userId) {
       let subDoc = /databases/$(database)/documents/users/$(userId)/subscription/status;
-      return isAccountActive(userId) && exists(subDoc) && (
+      return exists(subDoc) && (
         (
           get(subDoc).data.subscriptionStatus in ['ACTIVE', 'PENDING', 'CANCELLED'] &&
           request.time < get(subDoc).data.currentPeriodEnd
@@ -32,7 +33,7 @@ service cloud.firestore {
           get(subDoc).data.subscriptionStatus == 'TRIAL' &&
           request.time < get(subDoc).data.trialEnd
         )
-      );
+      ) && isAccountActive(userId);
     }
 
     // Sensitive administrative collections (Backend Cloudflare Worker / Admin SDK only)

@@ -25,9 +25,14 @@ class Phase4ClientReleaseSecurityTest {
         assertNotNull("Canonical Worker URL must not be null", canonicalUrl)
         assertTrue("Canonical Worker URL must use HTTPS", canonicalUrl.startsWith("https://"))
         assertTrue("Canonical Worker URL must target workers.dev", canonicalUrl.contains("workers.dev"))
+        val expected = if (com.reeltrak.app.BuildConfig.ENVIRONMENT == "staging") {
+            "https://refocus-razorpay-worker-staging.refocus-razorpay-worker.workers.dev"
+        } else {
+            "https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev"
+        }
         assertEquals(
             "Canonical Worker URL must match the deployed project name",
-            "https://refocus-razorpay-worker.refocus-razorpay-worker.workers.dev",
+            expected,
             canonicalUrl
         )
     }

@@ -15,7 +15,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.first
 import dagger.Lazy
 import com.reeltrak.app.services.tracking.DayManager
+import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.UUID
@@ -43,6 +45,16 @@ import com.reeltrak.app.data.remote.dto.BackupResult
 import com.reeltrak.app.data.remote.dto.RestoreResult
 import com.reeltrak.app.core.sync.RestoreReconciler
 import android.os.SystemClock
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.shareIn
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -50,6 +62,32 @@ class BackupAlreadyCompletedException(
     message: String = "You can back up your data once every 24 hours."
 ) : Exception(message)
 
+class RestoreLimitExceededException(
+    message: String = "You can restore your data once per day."
+) : Exception(message)
+
+sealed class FirstLaunchRecoveryState {
+    object Idle : FirstLaunchRecoveryState()
+    object Evaluating : FirstLaunchRecoveryState()
+    data class RemoteBackupFound(val recordCount: Int, val lastBackupTimeMs: Long) : FirstLaunchRecoveryState()
+    object Restoring : FirstLaunchRecoveryState()
+    object Completed : FirstLaunchRecoveryState()
+    data class RestoreFailed(val message: String) : FirstLaunchRecoveryState()
+    object NoRemoteData : FirstLaunchRecoveryState()
+}
+
+data class CloudBackupStatus(
+    val status: String? = null,
+    val lastBackupServerTimeMs: Long = 0L,
+    val nextEligibleBackupTimeMs: Long = 0L,
+    val isRestricted: Boolean = false
+) {
+    companion object {
+        val DEFAULT = CloudBackupStatus()
+    }
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
 @Singleton
 class SyncManager @Inject constructor(
     private val firestore: FirebaseFirestore,
@@ -67,18 +105,34 @@ class SyncManager @Inject constructor(
 ) {
     companion object {
         const val BACKUP_COOLDOWN_MS = 24 * 60 * 60 * 1000L // 24 hours
+        private val IST_ZONE = ZoneId.of("Asia/Kolkata")
+    }
+
+    private fun getTodayIstDateString(nowMs: Long = System.currentTimeMillis()): String {
+        return Instant.ofEpochMilli(nowMs).atZone(IST_ZONE).toLocalDate().format(DateTimeFormatter.ISO_LOCAL_DATE)
+    }
+
+    private fun getNextIstMidnightMs(nowMs: Long = System.currentTimeMillis()): Long {
+        val istDate = Instant.ofEpochMilli(nowMs).atZone(IST_ZONE).toLocalDate()
+        return istDate.plusDays(1).atStartOfDay(IST_ZONE).toInstant().toEpochMilli()
     }
 
     private var lastRestoredUid: String? = null
     private val restoreMutex = Mutex()
     private val backupMutex = Mutex()
+    private val recoveryMutex = Mutex()
     private val workerBaseUrl = com.reeltrak.app.core.network.NetworkConstants.WORKER_BASE_URL
-    private var backupStatusRegistration: ListenerRegistration? = null
     private val savedEmailCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private var lastServerStatusCheckElapsedRealtime = 0L
 
+    private val _firstLaunchRecoveryState = MutableStateFlow<FirstLaunchRecoveryState>(FirstLaunchRecoveryState.Idle)
+    val firstLaunchRecoveryState: StateFlow<FirstLaunchRecoveryState> = _firstLaunchRecoveryState.asStateFlow()
+
     private val _isBackupRestricted = MutableStateFlow(false)
     val isBackupRestricted: StateFlow<Boolean> = _isBackupRestricted.asStateFlow()
+
+    private val _isRestoreRestricted = MutableStateFlow(false)
+    val isRestoreRestricted: StateFlow<Boolean> = _isRestoreRestricted.asStateFlow()
 
     private val _lastBackupServerTimeMs = MutableStateFlow(0L)
     val lastBackupServerTimeMs: StateFlow<Long> = _lastBackupServerTimeMs.asStateFlow()
@@ -106,6 +160,101 @@ class SyncManager @Inject constructor(
         }
     }
 
+    private val authUidFlow: Flow<String?> = callbackFlow {
+        val auth = Firebase.auth
+        val listener = com.google.firebase.auth.FirebaseAuth.AuthStateListener { firebaseAuth ->
+            trySend(firebaseAuth.currentUser?.uid)
+        }
+        auth.addAuthStateListener(listener)
+        trySend(auth.currentUser?.uid)
+        awaitClose { auth.removeAuthStateListener(listener) }
+    }.distinctUntilChanged()
+
+    private val activeEntitledUidFlow: Flow<String?> = authUidFlow.flatMapLatest { uid ->
+        if (uid.isNullOrBlank()) {
+            flowOf(null)
+        } else {
+            subscriptionManagerLazy.get().accessState.map { state ->
+                val isEntitled = state == AccessState.TRIAL || state == AccessState.ACTIVE
+                if (isEntitled) uid else null
+            }
+        }
+    }.distinctUntilChanged()
+
+    /**
+     * Shared cloud backup status Flow using WhileSubscribed(stopTimeoutMillis = 5000, replayExpirationMillis = 0).
+     * Connects the real-time Firestore listener at /users/{uid}/backup/status only when Settings or active UI subscribes,
+     * and automatically tears down the listener 5 seconds after unsubscription to conserve Firestore read quotas.
+     */
+    val cloudBackupStatusFlow: Flow<CloudBackupStatus> = activeEntitledUidFlow.flatMapLatest { uid ->
+        if (uid.isNullOrBlank()) {
+            flowOf(CloudBackupStatus.DEFAULT)
+        } else {
+            callbackFlow<CloudBackupStatus> {
+                val docRef = firestore.collection("users")
+                    .document(uid)
+                    .collection("backup")
+                    .document("status")
+
+                val registration = docRef.addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        Log.w("FirestoreSync", "Backup status snapshot listener error for $uid: ${error.message}")
+                        return@addSnapshotListener
+                    }
+                    if (snapshot != null && snapshot.exists()) {
+                        val status = snapshot.getString("status")
+                        val lastBackupTimeMs = snapshot.getLong("lastBackupTimeMs") ?: 0L
+                        val lastBackupDate = snapshot.getString("lastBackupDate")
+                        val nextEligibleFromDoc = snapshot.getLong("nextEligibleTimeMs")
+                        if (lastBackupTimeMs > 0L) {
+                            _lastBackupServerTimeMs.value = lastBackupTimeMs
+                            val currentEstimatedServerTime = getEstimatedServerTimeMs()
+                            val todayIst = getTodayIstDateString(currentEstimatedServerTime)
+                            val nextEligible = if (nextEligibleFromDoc != null && nextEligibleFromDoc > 0L) {
+                                nextEligibleFromDoc
+                            } else {
+                                getNextIstMidnightMs(currentEstimatedServerTime)
+                            }
+                            _nextEligibleBackupTimeMs.value = nextEligible
+                            val isRestricted = status == "SUCCESS" && (lastBackupDate == todayIst)
+                            _isBackupRestricted.value = isRestricted
+                            applicationScope.launch(ioDispatcher) {
+                                try {
+                                    preferencesRepository.setLastBackupTime(lastBackupTimeMs)
+                                } catch (_: Exception) {}
+                            }
+                            Log.d("FirestoreSync", "Observed cloud backup status for $uid: status=$status, lastTime=$lastBackupTimeMs, nextEligible=$nextEligible, restricted=$isRestricted")
+                            trySend(
+                                CloudBackupStatus(
+                                    status = status,
+                                    lastBackupServerTimeMs = lastBackupTimeMs,
+                                    nextEligibleBackupTimeMs = nextEligible,
+                                    isRestricted = isRestricted
+                                )
+                            )
+                        } else {
+                            _lastBackupServerTimeMs.value = 0L
+                            _nextEligibleBackupTimeMs.value = 0L
+                            _isBackupRestricted.value = false
+                            trySend(CloudBackupStatus.DEFAULT)
+                        }
+                    } else {
+                        _lastBackupServerTimeMs.value = 0L
+                        _nextEligibleBackupTimeMs.value = 0L
+                        _isBackupRestricted.value = false
+                        trySend(CloudBackupStatus.DEFAULT)
+                    }
+                }
+                awaitClose { registration.remove() }
+            }
+        }
+    }.distinctUntilChanged()
+    .shareIn(
+        scope = applicationScope,
+        started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5000, replayExpirationMillis = 0),
+        replay = 1
+    )
+
     init {
         applicationScope.launch(ioDispatcher) {
             restoreReconciler.reconcilePendingLocalRestores()
@@ -126,78 +275,22 @@ class SyncManager @Inject constructor(
             }
         }
         applicationScope.launch(ioDispatcher) {
-            val subManager = subscriptionManagerLazy.get()
-            subManager.accessState.collect { accessState ->
-                val isEntitled = accessState == AccessState.TRIAL || accessState == AccessState.ACTIVE
-                val currentUser = Firebase.auth.currentUser
-                val currentUid = currentUser?.uid
-                if (isEntitled && currentUid != null) {
-                    if (lastRestoredUid != null && lastRestoredUid != currentUid) {
-                        savedEmailCache.clear()
-                        lastServerStatusCheckElapsedRealtime = 0L
-                    }
-                    // Strict manual-only policy: No automatic cloud restore on subscription or startup events.
-                    // Data remains local until the user explicitly selects "Restore Data" in Settings.
-                    // Attach real-time listener for server-authoritative backup status (cooldown & UI state)
-                    attachBackupStatusListener(currentUid)
-                } else if (!isEntitled || currentUid == null) {
+            activeEntitledUidFlow.collect { entitledUid ->
+                if (entitledUid == null) {
                     lastRestoredUid = null
                     savedEmailCache.clear()
                     lastServerStatusCheckElapsedRealtime = 0L
-                    detachBackupStatusListener()
+                    _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Idle
+                    _isBackupRestricted.value = false
+                    _lastBackupServerTimeMs.value = 0L
+                    _nextEligibleBackupTimeMs.value = 0L
+                } else if (lastRestoredUid != null && lastRestoredUid != entitledUid) {
+                    savedEmailCache.clear()
+                    lastServerStatusCheckElapsedRealtime = 0L
+                    _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Idle
                 }
             }
         }
-    }
-
-    private fun attachBackupStatusListener(uid: String) {
-        backupStatusRegistration?.remove()
-        backupStatusRegistration = firestore.collection("users")
-            .document(uid)
-            .collection("backup")
-            .document("status")
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    Log.w("FirestoreSync", "Backup status snapshot listener error for $uid: ${error.message}")
-                    return@addSnapshotListener
-                }
-                if (snapshot != null && snapshot.exists()) {
-                    val status = snapshot.getString("status")
-                    val lastBackupTimeMs = snapshot.getLong("lastBackupTimeMs") ?: 0L
-                    if (lastBackupTimeMs > 0L) {
-                        _lastBackupServerTimeMs.value = lastBackupTimeMs
-                        val nextEligible = lastBackupTimeMs + BACKUP_COOLDOWN_MS
-                        _nextEligibleBackupTimeMs.value = nextEligible
-                        val currentEstimatedServerTime = getEstimatedServerTimeMs()
-                        val isRestricted = status == "SUCCESS" && (currentEstimatedServerTime < nextEligible)
-                        _isBackupRestricted.value = isRestricted
-                        applicationScope.launch(ioDispatcher) {
-                            try {
-                                preferencesRepository.setLastBackupTime(lastBackupTimeMs)
-                            } catch (_: Exception) {}
-                        }
-                        Log.d("FirestoreSync", "Observed cloud backup status for $uid: status=$status, lastTime=$lastBackupTimeMs, nextEligible=$nextEligible, restricted=$isRestricted")
-                    } else {
-                        _lastBackupServerTimeMs.value = 0L
-                        _nextEligibleBackupTimeMs.value = 0L
-                        _isBackupRestricted.value = false
-                    }
-                } else {
-                    _lastBackupServerTimeMs.value = 0L
-                    _nextEligibleBackupTimeMs.value = 0L
-                    _isBackupRestricted.value = false
-                }
-            }
-    }
-
-    private fun detachBackupStatusListener() {
-        backupStatusRegistration?.remove()
-        backupStatusRegistration = null
-        _isBackupRestricted.value = false
-        _lastBackupServerTimeMs.value = 0L
-        _nextEligibleBackupTimeMs.value = 0L
-        savedEmailCache.clear()
-        lastServerStatusCheckElapsedRealtime = 0L
     }
 
     /**
@@ -277,8 +370,9 @@ class SyncManager @Inject constructor(
                 val body = response.body?.string() ?: ""
                 val json = org.json.JSONObject(body)
                 val isRestricted = json.optBoolean("isRestricted", json.optBoolean("backedUpToday", false))
+                val isRestoreRestricted = json.optBoolean("isRestoreRestricted", json.optBoolean("restoredToday", false))
                 val lastTime = json.optLong("lastBackupTimeMs", 0L)
-                val nextEligible = json.optLong("nextEligibleTimeMs", if (lastTime > 0L) lastTime + BACKUP_COOLDOWN_MS else 0L)
+                val nextEligible = json.optLong("nextEligibleTimeMs", if (lastTime > 0L) getNextIstMidnightMs(lastTime) else 0L)
                 val serverTime = json.optLong("serverTimeMs", 0L)
                 if (serverTime > 0L) {
                     _serverTimeAnchorMs.value = serverTime
@@ -290,6 +384,7 @@ class SyncManager @Inject constructor(
                 }
                 _nextEligibleBackupTimeMs.value = nextEligible
                 _isBackupRestricted.value = isRestricted
+                _isRestoreRestricted.value = isRestoreRestricted
                 isRestricted
             } else {
                 _isBackupRestricted.value
@@ -364,8 +459,101 @@ class SyncManager @Inject constructor(
      * 7. Records last backup epoch timestamp in preferences.
      * 8. Never backs up sensitive credentials, tokens, or subscription secrets.
      */
+    /**
+     * Safe first-launch recovery flow:
+     * 1. Detects whether the authenticated user has an existing remote server backup before allowing manual backup or destructive sync.
+     * 2. If valid remote data exists and local state is empty (e.g. after reinstall), restores it safely before enabling normal backup.
+     * 3. If no remote data exists (genuinely new user), initializes local state safely without corrupting server state.
+     * 4. If restore fails, preserves server data, presents a recoverable error state, and allows clear retry.
+     */
+    suspend fun evaluateAndRecoverFreshInstall(): Result<Boolean> = withContext(ioDispatcher) {
+        recoveryMutex.withLock {
+            val user = Firebase.auth.currentUser ?: return@withContext Result.success(false)
+            val uid = user.uid
+
+            // Short-circuit if already completed or restoring in another concurrent job
+            val currentState = _firstLaunchRecoveryState.value
+            if (currentState is FirstLaunchRecoveryState.Completed) {
+                return@withContext Result.success(false)
+            }
+
+            // 1. Check local tracking database state
+            val localRecords = try {
+                dailyReelDataDao.getAllDailyDataSync()
+            } catch (e: Exception) {
+                Log.w("FirestoreSync", "Failed reading local records for fresh-install check", e)
+                emptyList()
+            }
+
+            // If local records exist and contain tracked reels, local state is already populated
+            if (localRecords.isNotEmpty() && localRecords.any { it.totalReelsCount > 0 }) {
+                _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Completed
+                return@withContext Result.success(false)
+            }
+
+            // 2. Evaluate remote server backup availability
+            _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Evaluating
+            _isBackupRestricted.value = true // Block destructive manual backup/sync while evaluation is pending!
+
+            val status = try {
+                localBackupRepository.checkServerBackupStatus(force = true)
+            } catch (e: Exception) {
+                Log.w("FirestoreSync", "Failed checking server backup status during fresh-install evaluation", e)
+                null
+            }
+
+            if (status != null && status.hasBackup && status.recordCount > 0) {
+                Log.i("FirestoreSync", "Fresh install detected with existing remote backup: ${status.recordCount} records, lastBackup=${status.lastBackupTimeMs}")
+                _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.RemoteBackupFound(status.recordCount, status.lastBackupTimeMs)
+                _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Restoring
+
+                val restoreResult = restoreFromCloud()
+                if (restoreResult.isSuccess) {
+                    Log.i("FirestoreSync", "Fresh install restore completed successfully.")
+                    _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Completed
+                    preferencesRepository.setHasMigratedToServer(true)
+                    Result.success(true)
+                } else {
+                    val err = restoreResult.exceptionOrNull()?.message ?: "Initial cloud restore failed"
+                    Log.e("FirestoreSync", "Fresh install restore failed: $err")
+                    _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.RestoreFailed(err)
+                    _isBackupRestricted.value = true // Keep backup restricted to preserve server data!
+                    Result.failure(Exception(err))
+                }
+            } else {
+                // Genuinely new user with no remote backup -> safe clean initialization
+                Log.i("FirestoreSync", "No remote backup found for user $uid. Initializing as new user.")
+                _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.NoRemoteData
+                Result.success(false)
+            }
+        }
+    }
+
+    suspend fun retryFirstLaunchRestore(): Result<Unit> = withContext(ioDispatcher) {
+        _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Restoring
+        _isBackupRestricted.value = true
+        val result = restoreFromCloud()
+        if (result.isSuccess) {
+            _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.Completed
+            preferencesRepository.setHasMigratedToServer(true)
+            Result.success(Unit)
+        } else {
+            val err = result.exceptionOrNull()?.message ?: "Retry restore failed"
+            _firstLaunchRecoveryState.value = FirstLaunchRecoveryState.RestoreFailed(err)
+            _isBackupRestricted.value = true
+            Result.failure(Exception(err))
+        }
+    }
+
     suspend fun performFullBackup(): Result<Unit> = withContext(ioDispatcher) {
         backupMutex.withLock {
+            val recoveryState = _firstLaunchRecoveryState.value
+            if (recoveryState is FirstLaunchRecoveryState.Evaluating ||
+                recoveryState is FirstLaunchRecoveryState.Restoring ||
+                recoveryState is FirstLaunchRecoveryState.RemoteBackupFound ||
+                recoveryState is FirstLaunchRecoveryState.RestoreFailed) {
+                return@withContext Result.failure(IllegalStateException("Cannot back up while remote data restore is pending or failed. Please restore your remote data first."))
+            }
             dayManagerLazy.get().flushPendingWritesSuspend()
             when (val result = localBackupRepository.performBackup()) {
                 is BackupResult.Success -> {
@@ -398,11 +586,18 @@ class SyncManager @Inject constructor(
                 when (val result = localRestoreRepository.performRestore(targetBackupId)) {
                     is RestoreResult.Success -> {
                         preferencesRepository.setHasMigratedToServer(true)
+                        _isRestoreRestricted.value = true
                         Result.success(Unit)
                     }
                     is RestoreResult.InProgress -> Result.failure(Exception(result.message))
-                    is RestoreResult.LimitExceeded -> Result.failure(Exception(result.message))
-                    is RestoreResult.AttemptsExhausted -> Result.failure(Exception(result.message))
+                    is RestoreResult.LimitExceeded -> {
+                        _isRestoreRestricted.value = true
+                        Result.failure(RestoreLimitExceededException(result.message))
+                    }
+                    is RestoreResult.AttemptsExhausted -> {
+                        _isRestoreRestricted.value = true
+                        Result.failure(RestoreLimitExceededException(result.message))
+                    }
                     is RestoreResult.NotFound -> Result.failure(Exception(result.message))
                     is RestoreResult.Ineligible -> Result.failure(SecurityException(result.reason))
                     is RestoreResult.Error -> Result.failure(result.throwable ?: Exception(result.message))

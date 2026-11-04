@@ -40,7 +40,6 @@ class StreakGoalLogicTest {
 
         return DailyBlocks(
             dayLabel = dateStr,
-            blocks = emptyList(),
             totalReelsScrolled = count,
             dailyGoal = goal,
             dateString = dateStr,

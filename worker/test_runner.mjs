@@ -1,6 +1,6 @@
 /**
  * Complete Node.js Test Suite for Cloudflare Worker Recurring Autopay Migration
- * 
+ *
  * Verifies all 19 critical security, business logic, and lifecycle requirements:
  * 1. create-subscription: rejects unauthenticated requests (401)
  * 2. create-subscription: rejects missing/empty RAZORPAY_PLAN_ID configuration (500)
@@ -25,6 +25,7 @@
 
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import worker, {
   claimSubscriptionCreationLockAtomic,
   finalizeSubscriptionCreationLock,
@@ -48,6 +49,8 @@ import worker, {
   IST_OFFSET_MS,
   getIstDateString,
   getNextIstMidnightMs,
+  validateRazorpayCredentials,
+  validateRazorpayPlanId,
   getFirestoreDocument,
   listFirestoreDocuments,
   deleteFirestoreDocument,
@@ -63,7 +66,9 @@ import worker, {
   reconcileExpiredPins,
   auditSnapshotPinConsistency,
   pruneHistoricalCommittedBackups,
-  cleanupAbandonedUploads
+  cleanupAbandonedUploads,
+  reconcileSubscriptionActivation,
+  reconcileSubscriptionCancelled
 } from "./src/index.js";
 
 // Helper to create HMAC-SHA256 hex string
@@ -152,6 +157,7 @@ const mockLeasePrivateKeyPkcs8Base64 = testLeasePrivateKey.toString("base64");
 
 // Environment Configuration Mock
 const mockEnv = {
+  ENVIRONMENT: "test",
   FIREBASE_PROJECT_ID: "refocus-504119",
   FIREBASE_PROJECT_NUMBER: "524118238647",
   APP_CHECK_ENFORCEMENT_MODE: "disabled",
@@ -166,8 +172,8 @@ const mockEnv = {
 
 // In-memory mock databases
 const mockFirestore = new Map();
-const mockProcessedEvents = new Set();
 const mockRazorpaySubscriptions = new Map();
+const mockRazorpayPayments = new Map();
 
 const mockDocUpdateTimes = new Map();
 let mockFirestoreFaultInjector = null;
@@ -197,7 +203,7 @@ globalThis.fetch = async (url, options = {}) => {
   // 3. Firestore REST API
   if (urlStr.includes("firestore.googleapis.com")) {
     if (mockFirestoreFaultInjector) {
-      const faultResult = mockFirestoreFaultInjector(urlStr, options);
+      const faultResult = await mockFirestoreFaultInjector(urlStr, options);
       if (faultResult !== undefined) {
         return faultResult;
       }
@@ -278,13 +284,15 @@ globalThis.fetch = async (url, options = {}) => {
         }), { status: 400 });
       }
 
-      const checkFieldFilter = (f, fields) => {
+      const checkFieldFilter = (f, fields, key) => {
         if (!f) return true;
         const fieldPath = f.field?.fieldPath;
         const op = f.op;
         const expectedVal = f.value?.stringValue;
         const actualVal = fields[fieldPath]?.stringValue;
         if (op === "EQUAL") {
+          if (actualVal !== undefined) return actualVal === expectedVal;
+          if (fieldPath === "uid" && key && key.startsWith(`daily_quota_claims/${expectedVal}_`)) return true;
           return actualVal === expectedVal;
         }
         return true;
@@ -295,10 +303,10 @@ globalThis.fetch = async (url, options = {}) => {
         if (collectionId && (key.startsWith(`${collectionId}/`) || key.includes(`/${collectionId}/`))) {
           let matches = true;
           if (whereFilter) {
-            matches = checkFieldFilter(whereFilter, fields);
+            matches = checkFieldFilter(whereFilter, fields, key);
           } else if (compositeFilter && compositeFilter.filters) {
             for (const flt of compositeFilter.filters) {
-              if (flt.fieldFilter && !checkFieldFilter(flt.fieldFilter, fields)) {
+              if (flt.fieldFilter && !checkFieldFilter(flt.fieldFilter, fields, key)) {
                 matches = false;
                 break;
               }
@@ -339,18 +347,6 @@ globalThis.fetch = async (url, options = {}) => {
 
     const docPath = parsedUrl.pathname.split("/documents/")[1];
 
-    // Handle razorpay_events idempotency collection
-    if (docPath && docPath.startsWith("razorpay_events/")) {
-      const eventId = docPath.replace("razorpay_events/", "");
-      if (parsedUrl.searchParams.get("currentDocument.exists") === "false") {
-        if (mockProcessedEvents.has(eventId)) {
-          return new Response(JSON.stringify({ error: "Document already exists" }), { status: 412 });
-        }
-        mockProcessedEvents.add(eventId);
-        return new Response(JSON.stringify({ name: docPath }), { status: 200 });
-      }
-    }
-
     if (reqMethod === "GET") {
       if (docPath && mockFirestore.has(docPath)) {
         return new Response(JSON.stringify({
@@ -362,6 +358,15 @@ globalThis.fetch = async (url, options = {}) => {
 
       // Support listing child documents in a subcollection
       if (docPath) {
+        // Enforce Firestore rule: if parent document of backup_snapshots/.../daily_data does not exist, return 404
+        const snapshotDailyMatch = docPath.match(/^(users\/[^/]+\/backup_snapshots\/[^/]+)\/daily_data$/);
+        if (snapshotDailyMatch) {
+          const parentDocPath = snapshotDailyMatch[1];
+          if (!mockFirestore.has(parentDocPath)) {
+            return new Response(JSON.stringify({ error: "Not Found: parent document does not exist" }), { status: 404 });
+          }
+        }
+
         const prefix = `${docPath}/`;
         const matchingDocs = [];
         for (const [key, fields] of mockFirestore.entries()) {
@@ -378,7 +383,16 @@ globalThis.fetch = async (url, options = {}) => {
           }
         }
         if (matchingDocs.length > 0) {
-          return new Response(JSON.stringify({ documents: matchingDocs }), { status: 200 });
+          const pageSize = parseInt(parsedUrl.searchParams.get("pageSize") || "300", 10);
+          const pageToken = parsedUrl.searchParams.get("pageToken");
+          const startIndex = pageToken ? parseInt(pageToken, 10) : 0;
+          const pagedDocs = matchingDocs.slice(startIndex, startIndex + pageSize);
+          const nextIndex = startIndex + pageSize;
+          const responseBody = { documents: pagedDocs };
+          if (nextIndex < matchingDocs.length) {
+            responseBody.nextPageToken = nextIndex.toString();
+          }
+          return new Response(JSON.stringify(responseBody), { status: 200 });
         }
       }
 
@@ -435,7 +449,9 @@ globalThis.fetch = async (url, options = {}) => {
       const existing = mockRazorpaySubscriptions.get(subId) || { id: subId, status: "active", plan_id: "plan_TdtgehXIhzQ8U9" };
       existing.status = "cancelled";
       existing.cancel_at_cycle_end = 1;
-      existing.current_end = Math.floor(Date.now() / 1000) + 20 * 86400;
+      if (!existing.current_end) {
+        existing.current_end = Math.floor(Date.now() / 1000) + 20 * 86400;
+      }
       mockRazorpaySubscriptions.set(subId, existing);
       return new Response(JSON.stringify(existing), { status: 200 });
     }
@@ -471,11 +487,16 @@ globalThis.fetch = async (url, options = {}) => {
   // 5. Razorpay Payments API: GET /v1/payments/{id}
   if (urlStr.startsWith("https://api.razorpay.com/v1/payments/")) {
     const payId = urlStr.split("/payments/")[1];
+    if (mockRazorpayPayments.has(payId)) {
+      return new Response(JSON.stringify(mockRazorpayPayments.get(payId)), { status: 200 });
+    }
+    const status = payId.includes("mandate_auth") ? "authorized" : "captured";
     return new Response(JSON.stringify({
       id: payId,
-      status: "captured",
-      amount: 9900,
-      currency: "INR"
+      status: status,
+      amount: 7900,
+      currency: "INR",
+      created_at: Math.floor(Date.now() / 1000)
     }), { status: 200 });
   }
 
@@ -519,13 +540,25 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // 1. Authentication & Health Tests
   // -------------------------------------------------------------------------
-  await test("GET /health returns healthy status and recurring model", async () => {
+  await test("GET /health returns healthy status and recurring model without disclosing secrets or configuration", async () => {
     const req = new Request("https://refocus.workers.dev/health", { method: "GET" });
     const res = await worker.fetch(req, mockEnv, {});
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.status, "healthy");
     assert.equal(body.model, "recurring_autopay_v2");
+    assert.equal(body.secretsReady, undefined);
+    assert.equal(body.configurationReady, undefined);
+    assert.equal(body.serviceAccount, undefined);
+    assert.equal(body.trialSecret, undefined);
+    assert.equal(body.razorpayKeyId, undefined);
+    assert.equal(body.razorpayKeySecret, undefined);
+    assert.equal(body.razorpayWebhookSecret, undefined);
+
+    const allowedKeys = new Set(["status", "service", "model"]);
+    for (const key of Object.keys(body)) {
+      assert.ok(allowedKeys.has(key), `Unexpected key '${key}' disclosed in public /health response`);
+    }
   });
 
   // -------------------------------------------------------------------------
@@ -652,6 +685,43 @@ async function runTests() {
     assert.ok(body.serverTime >= before && body.serverTime <= after);
     assert.ok(typeof body.iso === "string");
     assert.equal(body.clientEcho, null);
+  });
+
+  await test("Global request hardening rejects streamed POST bodies over 256KB without Content-Length", async () => {
+    const chunks = [new Uint8Array(200 * 1024), new Uint8Array(56 * 1024 + 1)];
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      }
+    });
+    const req = new Request("https://refocus.workers.dev/api/unknown", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: stream,
+      duplex: "half"
+    });
+    assert.equal(req.headers.get("Content-Length"), null);
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 413);
+  });
+
+  await test("Global request hardening accepts a streamed body at the 256KB limit without Content-Length", async () => {
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(256 * 1024));
+        controller.close();
+      }
+    });
+    const req = new Request("https://refocus.workers.dev/api/unknown", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: stream,
+      duplex: "half"
+    });
+    assert.equal(req.headers.get("Content-Length"), null);
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 404);
   });
 
   await test("GET /api/time echoes X-Client-Timestamp header without modification", async () => {
@@ -1455,6 +1525,78 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // 3. verify-subscription Endpoint Tests
   // -------------------------------------------------------------------------
+  async function callVerifySubscription(uid, subId, paymentId) {
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${createMockFirebaseIdToken(uid)}`
+      },
+      body: JSON.stringify({ subscription_id: subId, payment_id: paymentId, signature })
+    });
+    return worker.fetch(req, mockEnv, {});
+  }
+
+  await test("POST /api/verify-subscription preserves upstream 429 as retryable and grants no entitlement", async () => {
+    const uid = "user_verify_upstream_429";
+    const subId = "sub_verify_upstream_429";
+    mockRazorpayFaultInjector = (url) => url.endsWith(`/subscriptions/${subId}`)
+      ? new Response(JSON.stringify({ error: "rate limited" }), { status: 429, headers: { "Retry-After": "12" } })
+      : undefined;
+    try {
+      const response = await callVerifySubscription(uid, subId, "pay_verify_upstream_429");
+      assert.equal(response.status, 429);
+      assert.equal(response.headers.get("Retry-After"), "12");
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
+  await test("POST /api/verify-subscription maps upstream 5xx and malformed JSON to retryable 503", async () => {
+    const uid = "user_verify_upstream_5xx";
+    const subId = "sub_verify_upstream_5xx";
+    mockRazorpayFaultInjector = (url) => url.endsWith(`/subscriptions/${subId}`)
+      ? new Response(JSON.stringify({ error: "gateway unavailable" }), { status: 502 })
+      : undefined;
+    try {
+      const response = await callVerifySubscription(uid, subId, "pay_verify_upstream_5xx");
+      assert.equal(response.status, 503);
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+
+    const malformedUid = "user_verify_malformed_gateway";
+    const malformedSubId = "sub_verify_malformed_gateway";
+    mockRazorpayFaultInjector = (url) => url.endsWith(`/subscriptions/${malformedSubId}`)
+      ? new Response("not-json", { status: 200 })
+      : undefined;
+    try {
+      const response = await callVerifySubscription(malformedUid, malformedSubId, "pay_verify_malformed_gateway");
+      assert.equal(response.status, 503);
+      assert.equal(mockFirestore.get(`users/${malformedUid}/subscription/status`), undefined);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
+  await test("POST /api/verify-subscription keeps upstream not-found as a permanent client error", async () => {
+    const uid = "user_verify_upstream_404";
+    const subId = "sub_verify_upstream_404";
+    mockRazorpayFaultInjector = (url) => url.endsWith(`/subscriptions/${subId}`)
+      ? new Response(JSON.stringify({ error: "not found" }), { status: 404 })
+      : undefined;
+    try {
+      const response = await callVerifySubscription(uid, subId, "pay_verify_upstream_404");
+      assert.equal(response.status, 400);
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
   await test("POST /api/verify-subscription rejects invalid signature (400)", async () => {
     const uid = "user_valid_2";
     const token = createMockFirebaseIdToken(uid);
@@ -1560,6 +1702,66 @@ async function runTests() {
     assert.equal(subDoc.subscriptionId.stringValue, subId);
     assert.equal(subDoc.premium.booleanValue, true);
     assert.equal(subDoc.latestPaymentId.stringValue, paymentId);
+  });
+
+  await test("POST /api/verify-subscription rejects missing billing dates without manufacturing entitlement", async () => {
+    const uid = "user_missing_period_dates";
+    const subId = "sub_missing_period_dates";
+    const paymentId = "pay_missing_period_dates";
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid }
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${createMockFirebaseIdToken(uid)}`
+      },
+      body: JSON.stringify({ subscription_id: subId, payment_id: paymentId, signature })
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).success, false);
+    assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+  });
+
+  await test("POST /api/verify-subscription preserves an unexpired verified period when dates are omitted", async () => {
+    const uid = "user_existing_period_preserved";
+    const subId = "sub_existing_period_preserved";
+    const paymentId = "pay_existing_period_preserved";
+    const existingEnd = new Date(Date.now() + 5 * 86400 * 1000).toISOString();
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid }
+    });
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      currentPeriodStart: { timestampValue: new Date(Date.now() - 86400 * 1000).toISOString() },
+      currentPeriodEnd: { timestampValue: existingEnd },
+      premium: { booleanValue: true }
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${createMockFirebaseIdToken(uid)}`
+      },
+      body: JSON.stringify({ subscription_id: subId, payment_id: paymentId, signature })
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).status, "ACTIVE");
+    assert.equal(mockFirestore.get(`users/${uid}/subscription/status`).currentPeriodEnd.timestampValue, existingEnd);
   });
 
   await test("POST /api/verify-subscription rejects subscription with no verifiable owner in notes or server map (403)", async () => {
@@ -1682,7 +1884,9 @@ async function runTests() {
       id: subId,
       status: "authenticated",
       plan_id: "plan_TdtgehXIhzQ8U9",
-      notes: { firebase_uid: uid }
+      notes: { firebase_uid: uid },
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400
     });
 
     const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
@@ -1714,6 +1918,430 @@ async function runTests() {
     assert.notEqual(subDoc.subscriptionStatus?.stringValue, "ACTIVE", "Must not set subscriptionStatus = ACTIVE for mandate-only");
     assert.notEqual(subDoc.premium?.booleanValue, true, "Must not set premium = true for mandate-only");
     assert.equal(subDoc.currentPeriodEnd, undefined, "Must not manufacture fake currentPeriodEnd");
+  });
+
+  await test("POST /api/verify-subscription activates immediately when subscription is authenticated and payment is captured (200)", async () => {
+    const uid = "user_captured_verify";
+    const subId = "sub_captured_checkout_789";
+    const paymentId = "pay_checkout_captured_789";
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid },
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        subscription_id: subId,
+        payment_id: paymentId,
+        signature: `  ${signature.toUpperCase()}  ` // Test trimming and case-insensitivity
+      })
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.status, "ACTIVE");
+
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.ok(subDoc);
+    assert.equal(subDoc.subscriptionStatus?.stringValue, "ACTIVE");
+    assert.equal(subDoc.premium?.booleanValue, true);
+    assert.equal(subDoc.subscriptionId?.stringValue, subId);
+    assert.equal(subDoc.latestPaymentId?.stringValue, paymentId);
+    assert.ok(subDoc.currentPeriodEnd?.timestampValue, "Must have valid authoritative currentPeriodEnd");
+    const endMs = new Date(subDoc.currentPeriodEnd.timestampValue).getTime();
+    assert.ok(endMs > Date.now(), "currentPeriodEnd must be in the future");
+  });
+
+  // -------------------------------------------------------------------------
+  // RZP-PLAN-001: Plan Consistency, Amount, Currency & Billing Interval Tests
+  // -------------------------------------------------------------------------
+  await test("Plan Consistency: POST /api/verify-subscription rejects payment with incorrect amount (400)", async () => {
+    const uid = "user_wrong_amount_test";
+    const subId = "sub_wrong_amount_123";
+    const paymentId = "pay_wrong_amount_123";
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid },
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400
+    });
+
+    mockRazorpayPayments.set(paymentId, {
+      id: paymentId,
+      status: "captured",
+      amount: 100,
+      currency: "INR",
+      notes: { firebase_uid: uid }
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        subscription_id: subId,
+        payment_id: paymentId,
+        signature: signature
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.success, false);
+    assert.match(body.error, /Payment amount does not match/);
+
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(subDoc, undefined, "Must not grant subscription status for incorrect payment amount");
+  });
+
+  await test("Plan Consistency: POST /api/verify-subscription rejects payment with incorrect currency (400)", async () => {
+    const uid = "user_wrong_currency_test";
+    const subId = "sub_wrong_currency_123";
+    const paymentId = "pay_wrong_currency_123";
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid },
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400
+    });
+
+    mockRazorpayPayments.set(paymentId, {
+      id: paymentId,
+      status: "captured",
+      amount: 7900,
+      currency: "USD",
+      notes: { firebase_uid: uid }
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        subscription_id: subId,
+        payment_id: paymentId,
+        signature: signature
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.success, false);
+    assert.match(body.error, /Payment currency does not match/);
+
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(subDoc, undefined, "Must not grant subscription status for incorrect currency");
+  });
+
+  await test("Plan Consistency: POST /api/verify-subscription rejects inverted billing period order (400)", async () => {
+    const uid = "user_inverted_period_test";
+    const subId = "sub_inverted_period_123";
+    const paymentId = "pay_inverted_period_123";
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid },
+      current_start: nowSec + 30 * 86400,
+      current_end: nowSec
+    });
+
+    mockRazorpayPayments.set(paymentId, {
+      id: paymentId,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uid }
+    });
+
+    const signature = computeHmacHex(`${paymentId}|${subId}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        subscription_id: subId,
+        payment_id: paymentId,
+        signature: signature
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.success, false);
+    assert.match(body.error, /Invalid billing period/);
+  });
+
+  await test("Plan Consistency: POST /api/verify-subscription rejects non-monthly intervals (daily, weekly, yearly) (400)", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // 1. Daily plan (1 day)
+    const uidDaily = "user_daily_interval_test";
+    const subIdDaily = "sub_daily_interval_123";
+    const payIdDaily = "pay_daily_interval_123";
+    mockRazorpayPayments.set(payIdDaily, {
+      id: payIdDaily,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uidDaily }
+    });
+    mockRazorpaySubscriptions.set(subIdDaily, {
+      id: subIdDaily,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uidDaily },
+      current_start: nowSec,
+      current_end: nowSec + 1 * 86400
+    });
+    const sigDaily = computeHmacHex(`${payIdDaily}|${subIdDaily}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const tokenDaily = createMockFirebaseIdToken(uidDaily);
+    const reqDaily = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${tokenDaily}`,
+        "CF-Connecting-IP": "198.51.100.201"
+      },
+      body: JSON.stringify({ subscription_id: subIdDaily, payment_id: payIdDaily, signature: sigDaily })
+    });
+    const resDaily = await worker.fetch(reqDaily, mockEnv, {});
+    assert.equal(resDaily.status, 400);
+    assert.match((await resDaily.json()).error, /not a valid monthly interval/);
+
+    // 2. Weekly plan (7 days)
+    const uidWeekly = "user_weekly_interval_test";
+    const subIdWeekly = "sub_weekly_interval_123";
+    const payIdWeekly = "pay_weekly_interval_123";
+    mockRazorpayPayments.set(payIdWeekly, {
+      id: payIdWeekly,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uidWeekly }
+    });
+    mockRazorpaySubscriptions.set(subIdWeekly, {
+      id: subIdWeekly,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uidWeekly },
+      current_start: nowSec,
+      current_end: nowSec + 7 * 86400
+    });
+    const sigWeekly = computeHmacHex(`${payIdWeekly}|${subIdWeekly}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const tokenWeekly = createMockFirebaseIdToken(uidWeekly);
+    const reqWeekly = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${tokenWeekly}`,
+        "CF-Connecting-IP": "198.51.100.202"
+      },
+      body: JSON.stringify({ subscription_id: subIdWeekly, payment_id: payIdWeekly, signature: sigWeekly })
+    });
+    const resWeekly = await worker.fetch(reqWeekly, mockEnv, {});
+    assert.equal(resWeekly.status, 400);
+    assert.match((await resWeekly.json()).error, /not a valid monthly interval/);
+
+    // 3. Yearly plan (365 days)
+    const uidYearly = "user_yearly_interval_test";
+    const subIdYearly = "sub_yearly_interval_123";
+    const payIdYearly = "pay_yearly_interval_123";
+    mockRazorpayPayments.set(payIdYearly, {
+      id: payIdYearly,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uidYearly }
+    });
+    mockRazorpaySubscriptions.set(subIdYearly, {
+      id: subIdYearly,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uidYearly },
+      current_start: nowSec,
+      current_end: nowSec + 365 * 86400
+    });
+    const sigYearly = computeHmacHex(`${payIdYearly}|${subIdYearly}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const tokenYearly = createMockFirebaseIdToken(uidYearly);
+    const reqYearly = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${tokenYearly}`,
+        "CF-Connecting-IP": "198.51.100.203"
+      },
+      body: JSON.stringify({ subscription_id: subIdYearly, payment_id: payIdYearly, signature: sigYearly })
+    });
+    const resYearly = await worker.fetch(reqYearly, mockEnv, {});
+    assert.equal(resYearly.status, 400);
+    assert.match((await resYearly.json()).error, /not a valid monthly interval/);
+  });
+
+  await test("Plan Consistency: POST /api/verify-subscription accepts valid monthly calendar variations (28-day and 31-day) (200)", async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // 28-day month (February)
+    const uid28 = "user_calendar_28_test";
+    const subId28 = "sub_calendar_28_123";
+    const payId28 = "pay_calendar_28_123";
+    mockRazorpayPayments.set(payId28, {
+      id: payId28,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uid28 }
+    });
+    mockRazorpaySubscriptions.set(subId28, {
+      id: subId28,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid28 },
+      current_start: nowSec,
+      current_end: nowSec + 28 * 86400
+    });
+    const sig28 = computeHmacHex(`${payId28}|${subId28}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token28 = createMockFirebaseIdToken(uid28);
+    const req28 = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token28}`,
+        "CF-Connecting-IP": "198.51.100.204"
+      },
+      body: JSON.stringify({ subscription_id: subId28, payment_id: payId28, signature: sig28 })
+    });
+    const res28 = await worker.fetch(req28, mockEnv, {});
+    assert.equal(res28.status, 200);
+    assert.equal((await res28.json()).status, "ACTIVE");
+
+    // 31-day month (e.g. January, March, July)
+    const uid31 = "user_calendar_31_test";
+    const subId31 = "sub_calendar_31_123";
+    const payId31 = "pay_calendar_31_123";
+    mockRazorpayPayments.set(payId31, {
+      id: payId31,
+      status: "captured",
+      amount: 7900,
+      currency: "INR",
+      notes: { firebase_uid: uid31 }
+    });
+    mockRazorpaySubscriptions.set(subId31, {
+      id: subId31,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid31 },
+      current_start: nowSec,
+      current_end: nowSec + 31 * 86400
+    });
+    const sig31 = computeHmacHex(`${payId31}|${subId31}`, mockEnv.RAZORPAY_KEY_SECRET);
+    const token31 = createMockFirebaseIdToken(uid31);
+    const req31 = new Request("https://refocus.workers.dev/api/verify-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token31}`,
+        "CF-Connecting-IP": "198.51.100.205"
+      },
+      body: JSON.stringify({ subscription_id: subId31, payment_id: payId31, signature: sig31 })
+    });
+    const res31 = await worker.fetch(req31, mockEnv, {});
+    assert.equal(res31.status, 200);
+    assert.equal((await res31.json()).status, "ACTIVE");
+  });
+
+  await test("Plan Consistency: Webhook subscription.charged ignores payment with wrong amount or currency", async () => {
+    const uid = "user_webhook_amount_currency_test";
+    const subId = "sub_webhook_amount_currency_123";
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_TdtgehXIhzQ8U9" }
+    });
+
+    // 1. Wrong amount in payment entity (100 paise)
+    const resWrongAmount = await sendWebhook({
+      event: "subscription.charged",
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            plan_id: "plan_TdtgehXIhzQ8U9",
+            current_start: nowSec,
+            current_end: nowSec + 30 * 86400
+          }
+        },
+        payment: {
+          entity: {
+            id: "pay_wrong_amt",
+            amount: 100, // ₹1 instead of ₹79
+            currency: "INR"
+          }
+        }
+      }
+    }, "evt_webhook_wrong_amount");
+    assert.equal(resWrongAmount.status, 200);
+    assert.equal((await resWrongAmount.json()).status, "ignored_amount_mismatch");
+
+    // 2. Wrong currency in payment entity ("USD")
+    const resWrongCurrency = await sendWebhook({
+      event: "subscription.charged",
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            plan_id: "plan_TdtgehXIhzQ8U9",
+            current_start: nowSec,
+            current_end: nowSec + 30 * 86400
+          }
+        },
+        payment: {
+          entity: {
+            id: "pay_wrong_curr",
+            amount: 7900,
+            currency: "USD"
+          }
+        }
+      }
+    }, "evt_webhook_wrong_currency");
+    assert.equal(resWrongCurrency.status, 200);
+    assert.equal((await resWrongCurrency.json()).status, "ignored_currency_mismatch");
   });
 
   // -------------------------------------------------------------------------
@@ -1760,15 +2388,22 @@ async function runTests() {
   // -------------------------------------------------------------------------
   // 5. Razorpay Webhook Lifecycle Tests
   // -------------------------------------------------------------------------
-  async function sendWebhook(eventPayload, eventId = `evt_${Date.now()}_${Math.random()}`) {
-    const payloadStr = JSON.stringify({ ...eventPayload, event_id: eventId });
+  async function sendWebhook(eventPayload, eventId = `evt_${Date.now()}_${Math.random()}`, options = {}) {
+    const payloadObj = { ...eventPayload };
+    if (options.includeBodyId) {
+      payloadObj.event_id = eventId;
+    }
+    const payloadStr = JSON.stringify(payloadObj);
     const signature = computeHmacHex(payloadStr, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Razorpay-Signature": signature,
+      ...(options.omitHeaderId ? {} : { "x-razorpay-event-id": eventId }),
+      ...(options.headers || {})
+    };
     const req = new Request("https://refocus.workers.dev/api/razorpay-webhook", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Razorpay-Signature": signature
-      },
+      headers,
       body: payloadStr
     });
     return await worker.fetch(req, mockEnv, {});
@@ -1804,6 +2439,388 @@ async function runTests() {
     assert.equal(res2.status, 200);
     const body2 = await res2.json();
     assert.equal(body2.status, "already_processed");
+    const event = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.equal(event.processingStatus.stringValue, "COMPLETED");
+    assert.equal(event.attemptCount.integerValue, "1");
+  });
+
+  await test("RZP-001: Webhook successfully processes documented header-only x-razorpay-event-id without body ID", async () => {
+    const eventId = "evt_header_only_rzp001";
+    const payload = {
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_header_only_1" } } }
+    };
+
+    // Body does NOT contain event_id or id at the top level
+    assert.equal(payload.event_id, undefined);
+    assert.equal(payload.id, undefined);
+
+    const res = await sendWebhook(payload, eventId);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, "processed_payment_failed");
+
+    const eventDoc = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.ok(eventDoc, "Event record must exist in Firestore under the header event ID");
+    assert.equal(eventDoc.processingStatus.stringValue, "COMPLETED");
+    assert.equal(eventDoc.eventId.stringValue, eventId);
+  });
+
+  await test("RZP-001: Duplicate delivery with header-only x-razorpay-event-id is safely deduplicated", async () => {
+    const eventId = "evt_dup_header_rzp001";
+    const payload = {
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_dup_header_1" } } }
+    };
+
+    const res1 = await sendWebhook(payload, eventId);
+    assert.equal(res1.status, 200);
+    assert.equal((await res1.json()).status, "processed_payment_failed");
+
+    const res2 = await sendWebhook(payload, eventId);
+    assert.equal(res2.status, 200);
+    const body2 = await res2.json();
+    assert.equal(body2.status, "already_processed");
+    assert.equal(body2.event_id, eventId);
+
+    const eventDoc = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.equal(eventDoc.attemptCount.integerValue, "1");
+  });
+
+  await test("RZP-001: Missing event identifier in both header and body returns 400", async () => {
+    const payload = {
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_missing_id_1" } } }
+    };
+    const payloadStr = JSON.stringify(payload);
+    const signature = computeHmacHex(payloadStr, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+    // Omit x-razorpay-event-id header and omit body event ID
+    const req = new Request("https://refocus.workers.dev/api/razorpay-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Razorpay-Signature": signature
+      },
+      body: payloadStr
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const resBody = await res.json();
+    assert.equal(resBody.error, "Missing event identifier or event type");
+  });
+
+  await test("RZP-001: Whitespace-only header event ID without body event ID returns 400", async () => {
+    const payload = {
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_whitespace_id_1" } } }
+    };
+    const payloadStr = JSON.stringify(payload);
+    const signature = computeHmacHex(payloadStr, mockEnv.RAZORPAY_WEBHOOK_SECRET);
+
+    const req = new Request("https://refocus.workers.dev/api/razorpay-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Razorpay-Signature": signature,
+        "x-razorpay-event-id": "   "
+      },
+      body: payloadStr
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const resBody = await res.json();
+    assert.equal(resBody.error, "Missing event identifier or event type");
+  });
+
+  await test("RZP-001: Backward compatibility: body-only event_id is accepted when header is omitted", async () => {
+    const eventId = "evt_body_compat_event_id";
+    const payload = {
+      event: "payment.failed",
+      event_id: eventId,
+      payload: { payment: { entity: { id: "pay_compat_1" } } }
+    };
+
+    const res = await sendWebhook(payload, eventId, { omitHeaderId: true });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, "processed_payment_failed");
+
+    const eventDoc = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.ok(eventDoc);
+    assert.equal(eventDoc.processingStatus.stringValue, "COMPLETED");
+  });
+
+  await test("RZP-001: Backward compatibility: body-only id field is accepted when header is omitted", async () => {
+    const eventId = "evt_body_compat_id";
+    const payload = {
+      event: "payment.failed",
+      id: eventId,
+      payload: { payment: { entity: { id: "pay_compat_2" } } }
+    };
+
+    const res = await sendWebhook(payload, eventId, { omitHeaderId: true });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, "processed_payment_failed");
+
+    const eventDoc = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.ok(eventDoc);
+    assert.equal(eventDoc.processingStatus.stringValue, "COMPLETED");
+  });
+
+  await test("RZP-001: Header x-razorpay-event-id takes precedence over body event_id", async () => {
+    const headerEventId = "evt_header_wins_rzp001";
+    const bodyEventId = "evt_body_loses_rzp001";
+    const payload = {
+      event: "payment.failed",
+      event_id: bodyEventId,
+      payload: { payment: { entity: { id: "pay_precedence_1" } } }
+    };
+
+    // Header has headerEventId, body has bodyEventId
+    const res = await sendWebhook(payload, headerEventId);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.status, "processed_payment_failed");
+
+    // Must be claimed under headerEventId
+    const headerDoc = mockFirestore.get(`razorpay_events/${headerEventId}`);
+    assert.ok(headerDoc, "Firestore record must be keyed by header event ID");
+    assert.equal(headerDoc.processingStatus.stringValue, "COMPLETED");
+
+    // Must NOT be claimed under bodyEventId
+    const bodyDoc = mockFirestore.get(`razorpay_events/${bodyEventId}`);
+    assert.equal(bodyDoc, undefined, "Firestore record must NOT be keyed by body event ID when header is present");
+  });
+
+  await test("RZP-001: Signature authenticity check cannot be bypassed with valid header event ID", async () => {
+    const eventId = "evt_tampered_sig_rzp001";
+    const payloadStr = JSON.stringify({
+      event: "subscription.charged",
+      payload: { subscription: { entity: { id: "sub_tampered_1" } } }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/razorpay-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Razorpay-Signature": "invalid_hmac_tampered_signature",
+        "x-razorpay-event-id": eventId
+      },
+      body: payloadStr
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, "Invalid webhook signature");
+
+    // Ensure no claim was written to Firestore
+    const eventDoc = mockFirestore.get(`razorpay_events/${eventId}`);
+    assert.equal(eventDoc, undefined, "No event record should be created when signature is invalid");
+  });
+
+  await test("RZP-001: Rejects invalid event ID format (contains slash or exceeds length)", async () => {
+    const payload = {
+      event: "payment.failed",
+      payload: { payment: { entity: { id: "pay_invalid_id_1" } } }
+    };
+
+    // Slash in event ID
+    const resSlash = await sendWebhook(payload, "evt/with/slash");
+    assert.equal(resSlash.status, 400);
+    assert.equal((await resSlash.json()).error, "Invalid event identifier");
+
+    // Excessively long event ID (> 255 chars)
+    const longId = "evt_" + "a".repeat(300);
+    const resLong = await sendWebhook(payload, longId);
+    assert.equal(resLong.status, 400);
+    assert.equal((await resLong.json()).error, "Invalid event identifier");
+  });
+
+  await test("Webhook resolves subscription owner from a successful subscription-map read", async () => {
+    const uid = "user_webhook_map_lookup_success";
+    const subId = "sub_webhook_map_lookup_success";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`subscription_map/${subId}`, { firebaseUid: { stringValue: uid } });
+
+    const response = await sendWebhook({
+      event: "subscription.activated",
+      payload: { subscription: { entity: {
+        id: subId,
+        plan_id: mockEnv.RAZORPAY_PLAN_ID,
+        status: "active",
+        current_start: nowSec,
+        current_end: nowSec + 30 * 86400
+      } } }
+    }, "evt_webhook_map_lookup_success");
+
+    assert.equal(response.status, 200);
+    assert.equal(mockFirestore.get(`users/${uid}/subscription/status`).premium.booleanValue, true);
+  });
+
+  await test("Webhook acknowledges a genuinely missing subscription owner without granting entitlement", async () => {
+    const subId = "sub_webhook_owner_confirmed_missing";
+    const response = await sendWebhook({
+      event: "subscription.activated",
+      payload: { subscription: { entity: { id: subId, plan_id: mockEnv.RAZORPAY_PLAN_ID, status: "active" } } }
+    }, "evt_webhook_owner_confirmed_missing");
+
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).status, "ignored_missing_uid");
+    assert.equal(mockFirestore.get("razorpay_events/evt_webhook_owner_confirmed_missing").processingStatus.stringValue, "COMPLETED");
+  });
+
+  await test("Webhook retries the same event after subscription owner lookup infrastructure failure", async () => {
+    const uid = "user_webhook_owner_lookup_retry";
+    const subId = "sub_webhook_owner_lookup_retry";
+    const eventId = "evt_webhook_owner_lookup_retry";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`subscription_map/${subId}`, { firebaseUid: { stringValue: uid } });
+    let failOwnerRead = true;
+    mockFirestoreFaultInjector = (url, options) => {
+      if (failOwnerRead && options.method === "GET" && url.includes(`/documents/subscription_map/${subId}`)) {
+        failOwnerRead = false;
+        return new Response(JSON.stringify({ error: "temporary Firestore failure" }), { status: 503 });
+      }
+      return undefined;
+    };
+
+    const payload = {
+      event: "subscription.activated",
+      payload: { subscription: { entity: {
+        id: subId,
+        plan_id: mockEnv.RAZORPAY_PLAN_ID,
+        status: "active",
+        current_start: nowSec,
+        current_end: nowSec + 30 * 86400
+      } } }
+    };
+    try {
+      const failedAttempt = await sendWebhook(payload, eventId);
+      assert.equal(failedAttempt.status, 500);
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`), undefined);
+
+      const retry = await sendWebhook(payload, eventId);
+      assert.equal(retry.status, 200);
+      assert.equal((await retry.json()).status, "processed");
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`).premium.booleanValue, true);
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`).attemptCount.integerValue, "1");
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("Webhook retries the same event after a post-claim Firestore reconciliation failure", async () => {
+    const uid = "user_webhook_retry_after_failure";
+    const subId = "sub_webhook_retry_after_failure";
+    const eventId = "evt_webhook_retry_after_failure";
+    const nowSec = Math.floor(Date.now() / 1000);
+    let failSubscriptionWrite = true;
+
+    mockFirestoreFaultInjector = (url, options) => {
+      if (failSubscriptionWrite && options.method === "PATCH" && url.includes(`/documents/users/${uid}/subscription/status`)) {
+        failSubscriptionWrite = false;
+        return new Response(JSON.stringify({ error: "injected Firestore failure" }), { status: 503 });
+      }
+      return undefined;
+    };
+
+    const payload = {
+      event: "subscription.activated",
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            plan_id: mockEnv.RAZORPAY_PLAN_ID,
+            status: "active",
+            current_start: nowSec,
+            current_end: nowSec + 30 * 86400,
+            updated_at: nowSec,
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    };
+
+    try {
+      const failedAttempt = await sendWebhook(payload, eventId);
+      assert.equal(failedAttempt.status, 500);
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`).processingStatus.stringValue, "FAILED");
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+
+      const retry = await sendWebhook(payload, eventId);
+      assert.equal(retry.status, 200);
+      assert.equal((await retry.json()).status, "processed");
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`).processingStatus.stringValue, "COMPLETED");
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`).attemptCount.integerValue, "2");
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`).subscriptionStatus.stringValue, "ACTIVE");
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("Webhook concurrent duplicate delivery receives retryable response until the owner completes", async () => {
+    const uid = "user_webhook_concurrent_duplicate";
+    const subId = "sub_webhook_concurrent_duplicate";
+    const eventId = "evt_webhook_concurrent_duplicate";
+    const nowSec = Math.floor(Date.now() / 1000);
+    let releaseReconciliation;
+    let signalReconciliationStarted;
+    const reconciliationStarted = new Promise(resolve => { signalReconciliationStarted = resolve; });
+    const reconciliationGate = new Promise(resolve => { releaseReconciliation = resolve; });
+    let held = false;
+    const payload = {
+      event: "subscription.activated",
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            plan_id: mockEnv.RAZORPAY_PLAN_ID,
+            status: "active",
+            current_start: nowSec,
+            current_end: nowSec + 30 * 86400,
+            updated_at: nowSec,
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    };
+
+    mockFirestoreFaultInjector = async (url, options) => {
+      if (!held && options.method === "PATCH" && url.includes(`/documents/users/${uid}/subscription/status`)) {
+        held = true;
+        signalReconciliationStarted();
+        await reconciliationGate;
+      }
+      return undefined;
+    };
+
+    try {
+      const firstAttemptPromise = sendWebhook(payload, eventId);
+      await reconciliationStarted;
+
+      const concurrentDuplicate = await sendWebhook(payload, eventId);
+      assert.equal(concurrentDuplicate.status, 503);
+      assert.equal(concurrentDuplicate.headers.get("Retry-After"), "5");
+      assert.equal((await concurrentDuplicate.json()).status, "processing");
+
+      releaseReconciliation();
+      const firstAttempt = await firstAttemptPromise;
+      assert.equal(firstAttempt.status, 200);
+      assert.equal(mockFirestore.get(`razorpay_events/${eventId}`).processingStatus.stringValue, "COMPLETED");
+
+      const completedDuplicate = await sendWebhook(payload, eventId);
+      assert.equal(completedDuplicate.status, 200);
+      assert.equal((await completedDuplicate.json()).status, "already_processed");
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`).subscriptionStatus.stringValue, "ACTIVE");
+    } finally {
+      releaseReconciliation();
+      mockFirestoreFaultInjector = null;
+    }
   });
 
   await test("Webhook: subscription.charged renews cycle and extends currentPeriodEnd", async () => {
@@ -1913,6 +2930,71 @@ async function runTests() {
     assert.equal(doc.premium.booleanValue, false);
   });
 
+  await test("Webhook: refund.created and refund.failed preserve an active subscription", async () => {
+    const uid = "user_refund_pending_no_revoke";
+    const subId = "sub_refund_pending_no_revoke";
+    const paymentId = "pay_refund_pending_no_revoke";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: paymentId },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    for (const [event, eventId] of [["refund.created", "evt_refund_created_pending"], ["refund.failed", "evt_refund_failed_pending"]]) {
+      const response = await sendWebhook({
+        event,
+        created_at: nowSec,
+        payload: {
+          payment: { entity: { id: paymentId, subscription_id: subId, notes: { firebase_uid: uid } } },
+          refund: { entity: { id: `rfnd_${eventId}`, payment_id: paymentId, created_at: nowSec } }
+        }
+      }, eventId);
+      assert.equal(response.status, 200);
+    }
+
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundedAt, undefined);
+  });
+
+  await test("Webhook: delayed refund.created or refund.failed cannot undo a processed refund", async () => {
+    const uid = "user_refund_event_reordering";
+    const subId = "sub_refund_event_reordering";
+    const paymentId = "pay_refund_event_reordering";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: paymentId },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const eventPayload = (event, createdAt) => ({
+      event,
+      created_at: createdAt,
+      payload: {
+        payment: { entity: { id: paymentId, subscription_id: subId, notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_event_reordering", payment_id: paymentId, created_at: createdAt } }
+      }
+    });
+    const processed = await sendWebhook(eventPayload("refund.processed", nowSec), "evt_refund_reordering_processed");
+    assert.equal(processed.status, 200);
+    for (const [event, eventId] of [["refund.created", "evt_refund_reordering_created"], ["refund.failed", "evt_refund_reordering_failed"]]) {
+      const response = await sendWebhook(eventPayload(event, nowSec - 10), eventId);
+      assert.equal(response.status, 200);
+    }
+
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+    assert.ok(doc.refundedAt);
+  });
+
   await test("Webhook: refund.processed revokes access and marks CANCELLED", async () => {
     const uid = "user_refund_test";
     const subId = "sub_refund_1";
@@ -1942,6 +3024,182 @@ async function runTests() {
     assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
     assert.equal(doc.premium.booleanValue, false);
     assert.ok(doc.refundedAt);
+  });
+
+  await test("Webhook: refund-only payload resolves account from authenticated Razorpay payment and server map", async () => {
+    const uid = "user_refund_only_payload";
+    const subId = "sub_refund_only_payload";
+    const paymentId = "pay_refund_only_payload";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`subscription_map/${subId}`, { firebaseUid: { stringValue: uid } });
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: paymentId },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+    mockRazorpayPayments.set(paymentId, {
+      id: paymentId,
+      status: "captured",
+      subscription_id: subId,
+      notes: { firebase_uid: uid }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        refund: { entity: { id: "rfnd_only_payload", payment_id: paymentId, created_at: nowSec } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+    assert.equal(doc.refundId.stringValue, "rfnd_only_payload");
+  });
+
+  await test("Webhook: refund ownership conflict between payment notes and server map grants no revocation", async () => {
+    const uid = "user_refund_map_owner";
+    const conflictingUid = "user_refund_note_owner";
+    const subId = "sub_refund_owner_conflict";
+    const paymentId = "pay_refund_owner_conflict";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`subscription_map/${subId}`, { firebaseUid: { stringValue: uid } });
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: paymentId },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        payment: { entity: { id: paymentId, subscription_id: subId, notes: { firebase_uid: conflictingUid } } },
+        refund: { entity: { id: "rfnd_owner_conflict", payment_id: paymentId, created_at: nowSec } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundId, undefined);
+  });
+
+  await test("Webhook: refund for an older payment cannot revoke the current billing period", async () => {
+    const uid = "user_old_payment_refund";
+    const subId = "sub_old_payment_refund";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: "pay_current_cycle" },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        payment: { entity: { id: "pay_old_cycle", subscription_id: subId, notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_old_cycle", payment_id: "pay_old_cycle", created_at: nowSec } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundId, undefined);
+  });
+
+  await test("Webhook: refund tied to a different subscription cannot revoke the account's current subscription", async () => {
+    const uid = "user_different_subscription_refund";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_current_owner" },
+      latestPaymentId: { stringValue: "pay_other_sub" },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        payment: { entity: { id: "pay_other_sub", subscription_id: "sub_other_owner", notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_other_sub", payment_id: "pay_other_sub", created_at: nowSec } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundId, undefined);
+  });
+
+  await test("Webhook: stale refund event cannot revoke a newer subscription state", async () => {
+    const uid = "user_stale_refund_event";
+    const subId = "sub_stale_refund_event";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      latestPaymentId: { stringValue: "pay_stale_refund" },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 5) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec - 10,
+      payload: {
+        payment: { entity: { id: "pay_stale_refund", subscription_id: subId, notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_stale", payment_id: "pay_stale_refund", created_at: nowSec - 10 } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundId, undefined);
+  });
+
+  await test("Webhook: refund without a verifiable subscription link cannot revoke access", async () => {
+    const uid = "user_refund_missing_subscription_link";
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_refund_link_required" },
+      latestPaymentId: { stringValue: "pay_refund_link_required" },
+      premium: { booleanValue: true },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        payment: { entity: { id: "pay_refund_link_required", notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_missing_sub_link", payment_id: "pay_refund_link_required", created_at: nowSec } }
+      }
+    });
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.refundId, undefined);
   });
 
   await test("Webhook: rejects stale activation after refund/cancellation", async () => {
@@ -2584,10 +3842,8 @@ async function runTests() {
       }
     }, "evt_test_p_missing_start");
 
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.result.success, false);
-    assert.match(body.result.message, /Missing authoritative billing period/);
+    assert.equal(res.status, 500, "Incomplete activation must remain retryable rather than being acknowledged");
+    assert.equal(mockFirestore.get("razorpay_events/evt_test_p_missing_start").processingStatus.stringValue, "FAILED");
     // Document must not exist with a manufactured start date
     assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
   });
@@ -2615,10 +3871,8 @@ async function runTests() {
       }
     }, "evt_test_q_missing_end");
 
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.result.success, false);
-    assert.match(body.result.message, /Missing authoritative billing period/);
+    assert.equal(res.status, 500, "Incomplete activation must remain retryable rather than being acknowledged");
+    assert.equal(mockFirestore.get("razorpay_events/evt_test_q_missing_end").processingStatus.stringValue, "FAILED");
     assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
   });
 
@@ -2875,6 +4129,24 @@ async function runTests() {
     assert.ok(blockedRes.headers.get("Retry-After"));
     const body = await blockedRes.json();
     assert.match(body.error, /Too many requests/);
+  });
+
+  await test("Rate Limit: concurrent /api/time requests enforce the same per-isolate threshold", async () => {
+    const ip = "192.168.1.103";
+    const requests = Array.from({ length: 40 }, () => worker.fetch(
+      new Request("https://refocus.workers.dev/api/time", {
+        method: "GET",
+        headers: { "CF-Connecting-IP": ip }
+      }),
+      mockEnv,
+      {}
+    ));
+    const responses = await Promise.all(requests);
+    assert.equal(responses.filter(response => response.status === 200).length, 30);
+    assert.equal(responses.filter(response => response.status === 429).length, 10);
+    for (const response of responses.filter(item => item.status === 429)) {
+      assert.ok(response.headers.get("Retry-After"));
+    }
   });
 
   await test("Rate Limit: /api/subscription/lease throttles on UID limit (60 req/min)", async () => {
@@ -3237,6 +4509,150 @@ async function runTests() {
     });
     const res = await worker.fetch(req, mockEnv, {});
     assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.accessMode, null);
+  });
+
+  await test("Subscription Lease: Validates lease validity matches authoritative subscription expiry for active paid 30-day plan", async () => {
+    const uid = "user_lease_30day_expiry";
+    const token = createMockFirebaseIdToken(uid);
+    const futurePeriodEndMs = Date.now() + 30 * 86400000;
+    const futurePeriodEndDate = new Date(futurePeriodEndMs).toISOString();
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: futurePeriodEndDate },
+      premium: { booleanValue: true }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "192.0.2.16"
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.uid, uid);
+    assert.equal(body.accessMode, "ACTIVE");
+    assert.equal(body.expiresAtMs, new Date(futurePeriodEndDate).getTime());
+    assert.equal(body.leaseValidUntilMs, body.expiresAtMs, "Lease validity must match authoritative subscription expiry");
+    assert.ok(body.signature);
+  });
+
+  await test("Subscription Lease: Validates lease validity matches authoritative trial expiry for active trial", async () => {
+    const uid = "user_lease_trial_expiry";
+    const token = createMockFirebaseIdToken(uid);
+    const futureTrialEndMs = Date.now() + 6 * 86400000;
+    const futureTrialEndDate = new Date(futureTrialEndMs).toISOString();
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "TRIAL" },
+      trialEnd: { timestampValue: futureTrialEndDate },
+      premium: { booleanValue: false }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "192.0.2.17"
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.uid, uid);
+    assert.equal(body.accessMode, "TRIAL");
+    assert.equal(body.expiresAtMs, new Date(futureTrialEndDate).getTime());
+    assert.equal(body.leaseValidUntilMs, body.expiresAtMs, "Lease validity must match authoritative trial expiry");
+    assert.ok(body.signature);
+  });
+
+  await test("Subscription Lease: Cancellation-at-period-end grants ACTIVE access until currentPeriodEnd", async () => {
+    const uid = "user_lease_cancelled_active_cycle";
+    const token = createMockFirebaseIdToken(uid);
+    const futurePeriodEndMs = Date.now() + 15 * 86400000;
+    const futurePeriodEndDate = new Date(futurePeriodEndMs).toISOString();
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "CANCELLED" },
+      cancelAtPeriodEnd: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: futurePeriodEndDate },
+      premium: { booleanValue: true }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "192.0.2.18"
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.uid, uid);
+    assert.equal(body.accessMode, "ACTIVE");
+    assert.equal(body.expiresAtMs, new Date(futurePeriodEndDate).getTime());
+    assert.equal(body.leaseValidUntilMs, body.expiresAtMs, "Cancelled user within active cycle must receive lease valid until cycle end");
+    assert.ok(body.signature);
+
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus?.stringValue, "CANCELLED");
+  });
+
+  await test("Subscription Lease: Cancellation fails closed with 403 once currentPeriodEnd has elapsed", async () => {
+    const uid = "user_lease_cancelled_elapsed";
+    const token = createMockFirebaseIdToken(uid);
+    const pastPeriodEndDate = new Date(Date.now() - 3600000).toISOString();
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "CANCELLED" },
+      cancelAtPeriodEnd: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: pastPeriodEndDate },
+      premium: { booleanValue: false }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "192.0.2.19"
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 403);
+    const body = await res.json();
+    assert.equal(body.accessMode, null);
+  });
+
+  await test("Subscription Lease: Halted subscription (retries exhausted) immediately fails closed with 403", async () => {
+    const uid = "user_lease_halted";
+    const token = createMockFirebaseIdToken(uid);
+    const futurePeriodEndDate = new Date(Date.now() + 10 * 86400000).toISOString();
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "HALTED" },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: futurePeriodEndDate },
+      premium: { booleanValue: false }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "192.0.2.20"
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 403, "HALTED subscription must fail closed immediately even if currentPeriodEnd is in the future");
     const body = await res.json();
     assert.equal(body.accessMode, null);
   });
@@ -4341,6 +5757,265 @@ async function runTests() {
       assert.equal(purgeRes.purgeState, "PENDING_RETRY");
       assert.equal(purgeRes.finalPersistenceSuccess, false);
       assert.ok(purgeRes.errors.includes("Failed updating final account tombstone"));
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("Account Deletion: purgeAccountData cleanly purges all backup_manifests and backup_snapshots daily_data records", async () => {
+    const uid = "user_purge_backup_data_clean";
+    const backupId1 = "bk_purge_1";
+    const backupId2 = "bk_purge_2";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`users/${uid}/daily_data/2026-10-10`, { count: { integerValue: "5" } });
+    mockFirestore.set(`users/${uid}/settings/preferences`, { dailyLimit: { integerValue: "60" } });
+    mockFirestore.set(`users/${uid}/backup/status`, { activeBackupId: { stringValue: backupId1 } });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId1}`, { backupId: { stringValue: backupId1 }, status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId1}`, { backupId: { stringValue: backupId1 }, status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId1}/daily_data/2026-10-10`, { count: { integerValue: "5" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId1}/daily_data/2026-10-11`, { count: { integerValue: "10" } });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId2}`, { backupId: { stringValue: backupId2 }, status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId2}`, { backupId: { stringValue: backupId2 }, status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId2}/daily_data/2026-10-12`, { count: { integerValue: "15" } });
+
+    const purgeRes = await purgeAccountData(uid, mockEnv);
+    assert.equal(purgeRes.success, true);
+    assert.equal(purgeRes.purgeState, "COMPLETED");
+
+    assert.equal(mockFirestore.has(`users/${uid}/backup_manifests/${backupId1}`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId1}`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId1}/daily_data/2026-10-10`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId1}/daily_data/2026-10-11`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_manifests/${backupId2}`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId2}`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId2}/daily_data/2026-10-12`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/daily_data/2026-10-10`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/settings/preferences`), false);
+    assert.equal(mockFirestore.has(`users/${uid}/backup/status`), false);
+  });
+
+  await test("SEC-SUB-001 Webhook: subscription.cancelled with cancel_at_cycle_end: 0 revokes access immediately even if current_end is in the future", async () => {
+    const uid = "user_cancel_immediate_webhook";
+    const subId = "sub_cancel_imm_123";
+    const nowSec = Math.floor(Date.now() / 1000);
+    const futureEndSec = nowSec + 25 * 86400;
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      premium: { booleanValue: true },
+      currentPeriodEnd: { timestampValue: new Date(futureEndSec * 1000).toISOString() },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "subscription.cancelled",
+      created_at: nowSec,
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            updated_at: nowSec,
+            cancel_at_cycle_end: 0,
+            current_end: futureEndSec,
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    }, "evt_cancel_imm_001");
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+    assert.equal(doc.cancelAtPeriodEnd.booleanValue, false);
+  });
+
+  await test("SEC-SUB-001 Webhook: subscription.cancelled with cancel_at_cycle_end: 1 preserves access until period end", async () => {
+    const uid = "user_cancel_cycle_end_webhook";
+    const subId = "sub_cancel_cycle_end_456";
+    const nowSec = Math.floor(Date.now() / 1000);
+    const futureEndSec = nowSec + 20 * 86400;
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      premium: { booleanValue: true },
+      currentPeriodEnd: { timestampValue: new Date(futureEndSec * 1000).toISOString() },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 60) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "subscription.cancelled",
+      created_at: nowSec,
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            updated_at: nowSec,
+            cancel_at_cycle_end: 1,
+            current_end: futureEndSec,
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    }, "evt_cancel_cycle_end_002");
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.cancelAtPeriodEnd.booleanValue, true);
+  });
+
+  await test("SEC-SUB-001 Webhook: subscription.cancelled cannot resurrect an already refunded subscription", async () => {
+    const uid = "user_cancel_after_refund";
+    const subId = "sub_cancel_refunded_789";
+    const nowSec = Math.floor(Date.now() / 1000);
+    const futureEndSec = nowSec + 15 * 86400;
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "CANCELLED" },
+      subscriptionId: { stringValue: subId },
+      premium: { booleanValue: false },
+      refundedAt: { timestampValue: new Date((nowSec - 300) * 1000).toISOString() },
+      refundId: { stringValue: "rfnd_prior_123" },
+      currentPeriodEnd: { timestampValue: new Date(futureEndSec * 1000).toISOString() },
+      lastEventTimestamp: { timestampValue: new Date((nowSec - 120) * 1000).toISOString() }
+    });
+
+    const res = await sendWebhook({
+      event: "subscription.cancelled",
+      created_at: nowSec,
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            updated_at: nowSec,
+            cancel_at_cycle_end: 1,
+            current_end: futureEndSec,
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    }, "evt_cancel_after_refund_003");
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+  });
+
+  await test("SEC-SUB-001 Restore: Subscription cancelled with cancel_at_cycle_end: 0 does not grant active entitlement", async () => {
+    const uid = "user_restore_imm_cancelled";
+    const subId = "sub_restore_imm_cancelled_101";
+    const nowSec = Math.floor(Date.now() / 1000);
+    const futureEndSec = nowSec + 25 * 86400;
+
+    mockFirestore.set(`subscription_map/${subId}`, {
+      subscriptionId: { stringValue: subId },
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: mockEnv.RAZORPAY_PLAN_ID }
+    });
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "cancelled",
+      cancel_at_cycle_end: 0,
+      current_end: futureEndSec,
+      plan_id: mockEnv.RAZORPAY_PLAN_ID,
+      notes: { firebase_uid: uid }
+    });
+
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({ subscription_id: subId })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.restored, false);
+    assert.equal(body.status, "CANCELLED");
+
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+    assert.equal(doc.cancelAtPeriodEnd.booleanValue, false);
+  });
+
+  await test("SEC-SUB-001 Restore: Subscription cancelled at cycle end (cancel_at_cycle_end: 1) restores active access until period end", async () => {
+    const uid = "user_restore_cycle_end_cancelled";
+    const subId = "sub_restore_cycle_end_cancelled_202";
+    const nowSec = Math.floor(Date.now() / 1000);
+    const futureEndSec = nowSec + 18 * 86400;
+
+    mockFirestore.set(`subscription_map/${subId}`, {
+      subscriptionId: { stringValue: subId },
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: mockEnv.RAZORPAY_PLAN_ID }
+    });
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "cancelled",
+      cancel_at_cycle_end: 1,
+      current_end: futureEndSec,
+      plan_id: mockEnv.RAZORPAY_PLAN_ID,
+      notes: { firebase_uid: uid }
+    });
+
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      },
+      body: JSON.stringify({ subscription_id: subId })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.restored, true);
+    assert.equal(body.status, "ACTIVE");
+    assert.equal(body.cancelAtPeriodEnd, true);
+
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(doc.premium.booleanValue, true);
+    assert.equal(doc.cancelAtPeriodEnd.booleanValue, true);
+  });
+
+  await test("Account Deletion: Purge failure during backup snapshot deletion sets PENDING_RETRY and fails closed", async () => {
+    const uid = "user_purge_backup_fail";
+    const backupId = "bk_purge_fail";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, { status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}`, { status: { stringValue: "COMMITTED" } });
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-10`, { count: { integerValue: "5" } });
+
+    mockFirestoreFaultInjector = (url, options) => {
+      if (options.method === "DELETE" && url.includes(`/backup_snapshots/${backupId}`)) {
+        return new Response(JSON.stringify({ error: { message: "Simulated delete failure" } }), { status: 500 });
+      }
+    };
+
+    try {
+      const purgeRes = await purgeAccountData(uid, mockEnv);
+      assert.equal(purgeRes.success, false);
+      assert.equal(purgeRes.purgeState, "PENDING_RETRY");
+      assert.ok(purgeRes.errors.some(e => e.includes("Backup") || e.includes("purge failed")));
     } finally {
       mockFirestoreFaultInjector = null;
     }
@@ -5646,6 +7321,43 @@ async function runTests() {
     assert.match(body.error, /Missing or invalid Bearer token/);
   });
 
+  await test("App Check: Public endpoints /health and /api/time remain accessible when enforce mode is active", async () => {
+    const enforceEnv = { ...mockEnv, APP_CHECK_ENFORCEMENT_MODE: "enforced" };
+
+    // 1. GET /health
+    const healthReq = new Request("https://refocus.workers.dev/health", { method: "GET" });
+    const healthRes = await worker.fetch(healthReq, enforceEnv, {});
+    assert.equal(healthRes.status, 200);
+    const healthBody = await healthRes.json();
+    assert.equal(healthBody.status, "healthy");
+
+    // 2. GET /api/time (public clock synchronization)
+    const timeReq = new Request("https://refocus.workers.dev/api/time", { method: "GET" });
+    const timeRes = await worker.fetch(timeReq, enforceEnv, {});
+    assert.equal(timeRes.status, 200);
+    const timeBody = await timeRes.json();
+    assert.ok(typeof timeBody.serverTime === "number" && timeBody.serverTime > 0);
+  });
+
+  await test("App Check: Enforce mode rejects sensitive endpoint /api/backup/status without App Check token", async () => {
+    const uid = "user_appcheck_backup_fail";
+    const token = createMockFirebaseIdToken(uid);
+    const enforceEnv = { ...mockEnv, APP_CHECK_ENFORCEMENT_MODE: "enforced" };
+
+    const req = new Request("https://refocus.workers.dev/api/backup/status", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`
+        // Missing X-Firebase-AppCheck
+      }
+    });
+
+    const res = await worker.fetch(req, enforceEnv, {});
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.match(body.error, /AppCheckUnauthorized/);
+  });
+
   // =========================================================================
   // Phase E: Rate Limiting & Resource Protection Tests
   // =========================================================================
@@ -5929,6 +7641,42 @@ async function runTests() {
     });
     const backupRes = await worker.fetch(backupReq, mockEnv, {});
     assert.equal(backupRes.status, 403, "Entitlement must strictly block expired user even if rate limit allows");
+
+    const leaseReq = new Request("https://refocus.workers.dev/api/subscription/lease", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${unentitledToken}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.202"
+      },
+      body: "{}"
+    });
+    const leaseRes = await worker.fetch(leaseReq, mockEnv, {});
+    assert.equal(leaseRes.status, 403, "An expired account must not receive a server-signed entitlement lease");
+
+    const backupInitReq = new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${unentitledToken}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.203"
+      },
+      body: JSON.stringify({ requestId: "req_unentitled_backup_init", totalRecords: 0 })
+    });
+    const backupInitRes = await worker.fetch(backupInitReq, mockEnv, {});
+    assert.equal(backupInitRes.status, 403, "An expired account must not initialize a protected backup");
+
+    const restoreReq = new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${unentitledToken}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.204"
+      },
+      body: JSON.stringify({ idempotencyKey: "req_unentitled_restore" })
+    });
+    const restoreRes = await worker.fetch(restoreReq, mockEnv, {});
+    assert.equal(restoreRes.status, 403, "An expired account must not reserve protected restore data");
   });
 
   await test("Rate Limit: Privacy - Rate limiter error log does not expose raw IP or UID in key", async () => {
@@ -8702,6 +10450,9 @@ async function runTests() {
       quarantineStatus: { nullValue: null }
     });
     mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${bkEligible}`, "2026-10-24T00:00:00Z");
+    mockFirestore.set(`users/${uid}/backup_snapshots/${bkEligible}`, {
+      status: { stringValue: "COMMITTED" }
+    });
     mockFirestore.set(`users/${uid}/backup_snapshots/${bkEligible}/daily_data/2026-10-15`, {
       dateString: { stringValue: "2026-10-15" }
     });
@@ -8709,6 +10460,7 @@ async function runTests() {
     const r4 = await pruneHistoricalCommittedBackups(mockEnv, uid, bkEligible);
     assert.equal(r4.pruned, true);
     assert.equal(mockFirestore.get(`users/${uid}/backup_manifests/${bkEligible}`), undefined);
+    assert.equal(mockFirestore.get(`users/${uid}/backup_snapshots/${bkEligible}`), undefined);
     assert.equal(mockFirestore.get(`users/${uid}/backup_snapshots/${bkEligible}/daily_data/2026-10-15`), undefined);
   });
 
@@ -9199,6 +10951,2615 @@ async function runTests() {
     assert.equal(statusDoc.activeBackupId.stringValue, body.backupId);
   });
 
+  // ---------------------------------------------------------------------------
+  // Re:Focus Subscription Restoration & Staging Hardening Tests
+  // ---------------------------------------------------------------------------
+
+  await test("Environment & Key Security: Razorpay key validation fails closed for missing and unknown environments", async () => {
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: undefined }).valid, false);
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: "unknown" }).valid, false);
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: "false" }).valid, false);
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: "true" }).valid, false);
+  });
+
+  await test("Environment & Key Security: production rejects test keys regardless of override-looking values", async () => {
+    for (const allowValue of [undefined, "false", "true", true]) {
+      const validation = validateRazorpayCredentials({
+        ...mockEnv,
+        ENVIRONMENT: "production",
+        ALLOW_TEST_KEYS_IN_PROD: allowValue,
+        RAZORPAY_KEY_ID: "rzp_test_mockKey123"
+      });
+      assert.equal(validation.valid, false);
+    }
+  });
+
+  await test("Environment & Key Security: test and staging continue to require test-mode keys", async () => {
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: "test" }).valid, true);
+    assert.equal(validateRazorpayCredentials({ ...mockEnv, ENVIRONMENT: "staging" }).valid, true);
+  });
+
+  await test("Environment & Plan Security: staging plan placeholder fails closed while production config remains distinct", async () => {
+    const config = JSON.parse(readFileSync(new URL("./wrangler.jsonc", import.meta.url), "utf8"));
+    const production = config;
+    const staging = config.env.staging;
+
+    assert.equal(production.vars.ENVIRONMENT, "production");
+    assert.equal(staging.vars.ENVIRONMENT, "staging");
+    assert.notEqual(production.name, staging.name);
+    assert.ok(production.vars.RAZORPAY_PLAN_ID);
+    assert.equal(production.vars.RAZORPAY_PLAN_ID.toUpperCase().includes("PLACEHOLDER"), false);
+    assert.ok(staging.vars.RAZORPAY_PLAN_ID.toUpperCase().includes("PLACEHOLDER"));
+    assert.notEqual(staging.vars.RAZORPAY_PLAN_ID, production.vars.RAZORPAY_PLAN_ID);
+
+    const validation = validateRazorpayPlanId({
+      ...mockEnv,
+      ENVIRONMENT: staging.vars.ENVIRONMENT,
+      RAZORPAY_PLAN_ID: staging.vars.RAZORPAY_PLAN_ID
+    });
+    assert.equal(validation.valid, false);
+    assert.match(validation.error, /placeholder/i);
+  });
+
+  await test("Environment & Key Security: Staging environment rejects rzp_live_* keys", async () => {
+    const stagingEnvWithLiveKey = {
+      ...mockEnv,
+      ENVIRONMENT: "staging",
+      FIREBASE_PROJECT_ID: "refocusstaging",
+      RAZORPAY_PLAN_ID: "plan_staging_test_fixture",
+      RAZORPAY_KEY_ID: "rzp_live_invalidKey123"
+    };
+    const uid = "user_staging_key_test";
+    const token = createMockFirebaseIdToken(uid, "refocusstaging");
+    const req = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: "plan_staging_test_fixture" })
+    });
+    const res = await worker.fetch(req, stagingEnvWithLiveKey, {});
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.match(body.error, /requires Razorpay test key/);
+  });
+
+  await test("Environment & Key Security: Production environment rejects rzp_test_* keys", async () => {
+    const prodEnvWithTestKey = {
+      ...mockEnv,
+      ENVIRONMENT: "production",
+      FIREBASE_PROJECT_ID: "refocus-504119",
+      RAZORPAY_KEY_ID: "rzp_test_mockKey123"
+    };
+    const uid = "user_prod_key_test";
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+    });
+    const res = await worker.fetch(req, prodEnvWithTestKey, {});
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.match(body.error, /rejects Razorpay test key/);
+  });
+
+  await test("POST /api/restore-subscription rejects unauthenticated requests (401)", async () => {
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 401);
+  });
+
+  await test("POST /api/restore-subscription restores active subscription from subscription_map and writes ACTIVE to Firestore", async () => {
+    const uid = "user_restore_active_999";
+    const subId = "sub_restore_test_active_123";
+    const token = createMockFirebaseIdToken(uid);
+
+    // Setup subscription in Razorpay
+    const nowSec = Math.floor(Date.now() / 1000);
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      current_start: nowSec,
+      current_end: nowSec + 30 * 86400,
+      notes: { firebase_uid: uid }
+    });
+
+    // Setup subscription_map mapping in Firestore
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_TdtgehXIhzQ8U9" }
+    });
+
+    // User doc initially has NO subscription or EXPIRED
+    mockFirestore.delete(`users/${uid}/subscription/status`);
+
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.restored, true);
+    assert.equal(body.status, "ACTIVE");
+    assert.equal(body.subscriptionId, subId);
+
+    // Verify Firestore status document was updated to ACTIVE
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.ok(subDoc);
+    assert.equal(subDoc.subscriptionStatus?.stringValue, "ACTIVE");
+    assert.equal(subDoc.premium?.booleanValue, true);
+    assert.equal(subDoc.subscriptionId?.stringValue, subId);
+  });
+
+  await test("POST /api/restore-subscription rejects restoring subscription belonging to different Firebase UID (anti-hijacking)", async () => {
+    const legitUid = "legit_user_owner";
+    const attackerUid = "attacker_user_attempting_restore";
+    const subId = "sub_hijack_target_456";
+    const attackerToken = createMockFirebaseIdToken(attackerUid);
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400,
+      notes: { firebase_uid: legitUid }
+    });
+
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: legitUid },
+      planId: { stringValue: "plan_TdtgehXIhzQ8U9" }
+    });
+
+    // Attacker tries to pass the victim's subscriptionId in the request body
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${attackerToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ subscriptionId: subId })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // Must NOT restore victim's subscription to attacker
+    assert.equal(body.restored, false);
+
+    // Verify attacker's status document was NOT made active
+    const attackerDoc = mockFirestore.get(`users/${attackerUid}/subscription/status`);
+    assert.equal(attackerDoc?.premium?.booleanValue, undefined);
+  });
+
+  await test("POST /api/restore-subscription returns an owned created subscription for safe checkout resumption without granting access", async () => {
+    const uid = "user_created_sub_recovery";
+    const subId = "sub_created_recovery";
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "created",
+      plan_id: mockEnv.RAZORPAY_PLAN_ID,
+      notes: { firebase_uid: uid }
+    });
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${createMockFirebaseIdToken(uid)}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ subscription_id: subId })
+    });
+
+    const response = await worker.fetch(req, mockEnv, {});
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.status, "CREATED");
+    assert.equal(body.subscriptionId, subId);
+    assert.ok(body.keyId);
+    assert.equal(body.amount, 7900);
+    assert.equal(body.currency, "INR");
+    assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined);
+  });
+
+  await test("POST /api/restore-subscription does not convert transient or malformed Razorpay responses into a definitive no-subscription result", async () => {
+    const uid = "user_restore_gateway_recovery_failure";
+    const subId = "sub_restore_gateway_recovery_failure";
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: mockEnv.RAZORPAY_PLAN_ID,
+      notes: { firebase_uid: uid }
+    });
+    const requestRestore = () => worker.fetch(new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${createMockFirebaseIdToken(uid)}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ subscription_id: subId })
+    }), mockEnv, {});
+
+    for (const response of [
+      new Response(JSON.stringify({ error: "temporary gateway outage" }), { status: 503 }),
+      new Response("not-json", { status: 200 })
+    ]) {
+      mockRazorpayFaultInjector = (url) => url.endsWith(`/subscriptions/${subId}`) ? response : undefined;
+      try {
+        const result = await requestRestore();
+        assert.equal(result.status, 500);
+        assert.notEqual(mockFirestore.get(`users/${uid}/subscription/status`)?.premium?.booleanValue, true);
+      } finally {
+        mockRazorpayFaultInjector = null;
+      }
+    }
+  });
+
+  await test("POST /api/restore-subscription handles account with no active subscriptions cleanly (200, restored: false)", async () => {
+    const uid = "user_no_subs_restore";
+    const token = createMockFirebaseIdToken(uid);
+    mockFirestore.delete(`users/${uid}/subscription/status`);
+
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.restored, false);
+    assert.match(body.message, /No active subscription found/);
+  });
+
+  await test("POST /api/restore-subscription does NOT grant ACTIVE or premium for authenticated mandate (mandatePending)", async () => {
+    const uid = "user_mandate_auth_restore";
+    const subId = "sub_mandate_auth_test_999";
+    const token = createMockFirebaseIdToken(uid);
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "authenticated",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      notes: { firebase_uid: uid }
+    });
+
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_TdtgehXIhzQ8U9" }
+    });
+
+    mockFirestore.delete(`users/${uid}/subscription/status`);
+
+    const req = new Request("https://refocus.workers.dev/api/restore-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.restored, false);
+    assert.equal(body.mandatePending, true);
+    assert.equal(body.status, "AUTHENTICATED");
+
+    // Verify Firestore status document was NOT made ACTIVE or premium
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(subDoc?.premium?.booleanValue, undefined);
+  });
+
+  await test("POST /api/ensure-subscription preserves ACTIVE status and premium: true for paid subscribers (never resets to EXPIRED)", async () => {
+    const uid = "paid_active_user_ensure_test";
+    const googleSub = "google_sub_paid_user_777";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const futureMs = Date.now() + 20 * 86400 * 1000;
+
+    // User already had trial identities created previously
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-01-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-01-08T00:00:00Z" } // Expired trial
+    });
+
+    // But user has an ACTIVE subscription
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      subscriptionId: { stringValue: "sub_paid_existing_777" },
+      currentPeriodEnd: { timestampValue: new Date(futureMs).toISOString() }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // Must return ACTIVE and premium: true, NEVER EXPIRED!
+    assert.equal(body.subscriptionStatus, "ACTIVE");
+    assert.equal(body.premium, true);
+
+    const docAfter = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(docAfter.subscriptionStatus?.stringValue, "ACTIVE");
+    assert.equal(docAfter.premium?.booleanValue, true);
+  });
+
+  await test("POST /api/ensure-subscription self-heals fresh install / missing status doc by discovering active subscription from subscription_map", async () => {
+    const uid = "fresh_install_paid_user";
+    const subId = "sub_fresh_install_paid_888";
+    const googleSub = "google_sub_fresh_install_888";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // Razorpay has active subscription
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      current_start: nowSec,
+      current_end: nowSec + 30 * 86400,
+      notes: { firebase_uid: uid }
+    });
+
+    // subscription_map has mapping
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_TdtgehXIhzQ8U9" }
+    });
+
+    // Past trial identity exists (past trial expired)
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-01-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-01-08T00:00:00Z" }
+    });
+
+    // Clean install: users/{uid}/subscription/status DOES NOT EXIST
+    mockFirestore.delete(`users/${uid}/subscription/status`);
+
+    const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // Must discover and restore active subscription, NOT write EXPIRED!
+    assert.equal(body.subscriptionStatus, "ACTIVE");
+    assert.equal(body.premium, true);
+
+    const docAfter = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.ok(docAfter);
+    assert.equal(docAfter.subscriptionStatus?.stringValue, "ACTIVE");
+    assert.equal(docAfter.premium?.booleanValue, true);
+    assert.equal(docAfter.subscriptionId?.stringValue, subId);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Backup & Restore Comprehensive Audit Defect Verification Suite
+  // ---------------------------------------------------------------------------
+
+  await test("AUDIT-TEST-01: Both 'count' and 'totalReelsCount' serialize and persist non-zero values, including isSkullDay and totalTimeSpentMillis", async () => {
+    const uid = "user_audit_01";
+    const token = setupPhase1User(uid);
+    const reqId = "req_audit_01";
+
+    const dailyRecords = [
+      {
+        dateString: "2026-10-25",
+        count: 42,
+        dailyGoal: 50,
+        isSkullDay: true,
+        totalTimeSpentMillis: 1800000
+      },
+      {
+        dateString: "2026-10-26",
+        totalReelsCount: 77,
+        dailyGoal: 60,
+        isSkullDay: false,
+        totalTimeSpentMillis: 3600000
+      }
+    ];
+
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: reqId, dailyRecords, defaultDailyLimit: 60 })
+    }), mockEnv);
+
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    const backupId = body.backupId;
+
+    // Verify snapshot documents in mockFirestore
+    const snap1 = mockFirestore.get(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-25`);
+    assert.ok(snap1, "Snapshot doc for 2026-10-25 must exist");
+    assert.equal(snap1.totalReelsCount?.integerValue, "42", "Count from 'count' property must be preserved as totalReelsCount");
+    assert.equal(snap1.count?.integerValue, "42", "Count from 'count' property must be mirrored to count");
+    assert.equal(snap1.isSkullDay?.booleanValue, true, "isSkullDay must be preserved");
+    assert.equal(snap1.totalTimeSpentMillis?.integerValue, "1800000", "totalTimeSpentMillis must be preserved");
+
+    const snap2 = mockFirestore.get(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-26`);
+    assert.ok(snap2, "Snapshot doc for 2026-10-26 must exist");
+    assert.equal(snap2.totalReelsCount?.integerValue, "77", "totalReelsCount must be preserved");
+    assert.equal(snap2.count?.integerValue, "77", "count must be mirrored");
+    assert.equal(snap2.totalTimeSpentMillis?.integerValue, "3600000");
+
+    // Restore verification: fetch via /api/restore
+    const restoreRes = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "restore_audit_01", backupId })
+    }), mockEnv);
+
+    assert.equal(restoreRes.status, 200);
+    const restoreBody = await restoreRes.json();
+    assert.equal(restoreBody.dailyRecords.length, 2);
+    const restoredRec1 = restoreBody.dailyRecords.find(r => r.dateString === "2026-10-25");
+    assert.equal(restoredRec1.totalReelsCount, 42);
+    assert.equal(restoredRec1.count, 42);
+    assert.equal(restoredRec1.isSkullDay, true);
+    assert.equal(restoredRec1.totalTimeSpentMillis, 1800000);
+  });
+
+  await test("AUDIT-TEST-02: Chunked backup handles >200 records using either 'dailyRecords' or 'records' key", async () => {
+    const uid = "user_audit_02";
+    const token = setupPhase1User(uid);
+    const reqId = "req_audit_02";
+
+    // 1. Init
+    const initRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: reqId, totalRecords: 250, totalChunks: 2 })
+    }), mockEnv);
+    assert.equal(initRes.status, 200);
+    const { backupId } = await initRes.json();
+
+    // 2. Chunk 0 using 'records' key (Android client format)
+    const chunk0Records = [];
+    for (let i = 0; i < 200; i++) {
+      chunk0Records.push({ dateString: `2025-02-${String(i % 28 + 1).padStart(2, "0")}_${i}`, count: i + 1 });
+    }
+    const chunk0Res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/chunk", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, chunkIndex: 0, records: chunk0Records })
+    }), mockEnv);
+    assert.equal(chunk0Res.status, 200, "Chunk 0 must accept 'records' payload key");
+
+    // 3. Chunk 1 using 'dailyRecords' key
+    const chunk1Records = [];
+    for (let i = 200; i < 250; i++) {
+      chunk1Records.push({ dateString: `2025-02-${String(i % 28 + 1).padStart(2, "0")}_${i}`, totalReelsCount: i + 1 });
+    }
+    const chunk1Res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/chunk", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, chunkIndex: 1, dailyRecords: chunk1Records })
+    }), mockEnv);
+    assert.equal(chunk1Res.status, 200, "Chunk 1 must accept 'dailyRecords' payload key");
+
+    // 4. Finalize
+    const finRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/finalize", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, requestId: reqId, totalRecords: 250, defaultDailyLimit: 45 })
+    }), mockEnv);
+    assert.equal(finRes.status, 200);
+    const finBody = await finRes.json();
+    assert.equal(finBody.success, true);
+    assert.ok(finBody.nextEligibleTimeMs > 0);
+  });
+
+  await test("AUDIT-TEST-03: Legacy user without backup_manifests or activeBackupId successfully restores from daily_data", async () => {
+    const uid = "user_audit_legacy_03";
+    const token = setupPhase1User(uid);
+
+    // Seed legacy Firestore records directly into users/{uid}/daily_data
+    mockFirestore.set(`users/${uid}/daily_data/2026-09-01`, {
+      dateString: { stringValue: "2026-09-01" },
+      totalReelsCount: { integerValue: "88" },
+      dailyGoal: { integerValue: "50" },
+      isSkullDay: { booleanValue: true },
+      totalTimeSpentMillis: { integerValue: "2500000" }
+    });
+    mockFirestore.set(`users/${uid}/daily_data/2026-09-02`, {
+      dateString: { stringValue: "2026-09-02" },
+      count: { integerValue: "99" }, // legacy 'count' field
+      dailyGoal: { integerValue: "60" }
+    });
+    mockFirestore.set(`users/${uid}/settings/preferences`, {
+      defaultDailyLimit: { integerValue: "75" }
+    });
+    // Ensure no backup manifests or activeBackupId exist
+    mockFirestore.delete(`users/${uid}/backup/status`);
+
+    const restoreRes = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "restore_legacy_03" })
+    }), mockEnv);
+
+    assert.equal(restoreRes.status, 200, "Legacy user restore must succeed with 200");
+    const restoreBody = await restoreRes.json();
+    assert.equal(restoreBody.success, true);
+    assert.equal(restoreBody.dailyRecords.length, 2);
+    assert.equal(restoreBody.defaultDailyLimit, 75);
+
+    const rec1 = restoreBody.dailyRecords.find(r => r.dateString === "2026-09-01");
+    assert.equal(rec1.totalReelsCount, 88);
+    assert.equal(rec1.isSkullDay, true);
+    assert.equal(rec1.totalTimeSpentMillis, 2500000);
+
+    const rec2 = restoreBody.dailyRecords.find(r => r.dateString === "2026-09-02");
+    assert.equal(rec2.totalReelsCount, 99);
+
+    // Complete ACK
+    const ackRes = await worker.fetch(new Request("https://refocus.workers.dev/api/restore/ack", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "restore_legacy_03" })
+    }), mockEnv);
+    assert.equal(ackRes.status, 200);
+  });
+
+  await test("AUDIT-TEST-04: Independent Backup and Restore quotas - performing backup does not exhaust restore and vice versa", async () => {
+    const uid = "user_audit_quotas_04";
+    const token = setupPhase1User(uid);
+
+    // 1. Perform Backup
+    const bkRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({
+        requestId: "bk_quota_04",
+        dailyRecords: [{ dateString: "2026-10-27", totalReelsCount: 10 }]
+      })
+    }), mockEnv);
+    assert.equal(bkRes.status, 200);
+    const { backupId } = await bkRes.json();
+
+    // Second backup on same day is restricted (409)
+    const bk2Res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({
+        requestId: "bk_quota_04_second",
+        dailyRecords: [{ dateString: "2026-10-27", totalReelsCount: 15 }]
+      })
+    }), mockEnv);
+    assert.equal(bk2Res.status, 409, "Second backup on same day must be rejected");
+
+    // 2. Restore must STILL be permitted today despite backup being exhausted!
+    const restRes = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_quota_04", backupId })
+    }), mockEnv);
+    assert.equal(restRes.status, 200, "Restore must remain permitted independently");
+
+    // ACK the restore
+    const ackRes = await worker.fetch(new Request("https://refocus.workers.dev/api/restore/ack", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_quota_04" })
+    }), mockEnv);
+    assert.equal(ackRes.status, 200);
+
+    // Second restore on same day is now restricted
+    const rest2Res = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_quota_04_second", backupId })
+    }), mockEnv);
+    assert.equal(rest2Res.status, 409, "Second restore on same day must be rejected");
+  });
+
+  await test("AUDIT-TEST-05: Calendar day reset across IST midnight allows backup even within 24h rolling window", async () => {
+    const uid = "user_audit_midnight_05";
+    const token = setupPhase1User(uid);
+
+    // Seed backup yesterday at 23:30 IST (e.g. 2026-10-26 18:00:00 UTC)
+    const yesterdayMs = new Date("2026-10-26T18:00:00Z").getTime();
+    const yesterdayIst = "2026-10-26";
+    mockFirestore.set(`users/${uid}/backup/status`, {
+      status: { stringValue: "SUCCESS" },
+      lastBackupDate: { stringValue: yesterdayIst },
+      lastBackupTimeMs: { integerValue: yesterdayMs.toString() },
+      activeBackupId: { stringValue: "yesterday_backup" }
+    });
+    mockFirestore.set(`daily_quota_claims/${uid}_${yesterdayIst}_BACKUP`, {
+      status: { stringValue: "COMPLETED" },
+      claimDate: { stringValue: yesterdayIst },
+      committedAtMs: { integerValue: yesterdayMs.toString() }
+    });
+
+    // Today at 08:00 IST (2026-10-27 02:30:00 UTC) - only 8.5 hours later, but NEW calendar day
+    const statusRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/status", {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(statusRes.status, 200);
+    const statusBody = await statusRes.json();
+    assert.equal(statusBody.isRestricted, false, "Must not be restricted on new calendar day");
+    assert.equal(statusBody.canBackupNow, true, "canBackupNow must be true on new calendar day");
+  });
+
+  await test("AUDIT-TEST-06: Failed backup/restore operations clean up quota reservation and allow immediate retry", async () => {
+    const uid = "user_audit_cleanup_06";
+    const token = setupPhase1User(uid);
+
+    // 1. Client calls /api/backup/init
+    const initRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: "init_fail_06", totalRecords: 200 })
+    }), mockEnv);
+    assert.equal(initRes.status, 200);
+    const { backupId } = await initRes.json();
+
+    // 2. Client encounters an error and aborts via /api/backup/abort
+    const abortRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/abort", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, requestId: "init_fail_06", reason: "CLIENT_NETWORK_ERROR" })
+    }), mockEnv);
+    assert.equal(abortRes.status, 200);
+
+    // 3. User immediately retries - must succeed and not be locked out
+    const retryInitRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: "init_retry_06", totalRecords: 200 })
+    }), mockEnv);
+    assert.equal(retryInitRes.status, 200, "Retry after abort must be immediately accepted");
+  });
+
+  await test("AUDIT-TEST-07: App Check enforcement mode audit allows valid requests without failing when project number is omitted", async () => {
+    const uid = "user_audit_appcheck_07";
+    const token = setupPhase1User(uid);
+
+    const auditEnv = { ...mockEnv, APP_CHECK_ENFORCEMENT_MODE: "audit", FIREBASE_PROJECT_NUMBER: undefined };
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/status", {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), auditEnv);
+
+    assert.equal(res.status, 200, "Audit mode must not reject requests when Play Integrity attestation is not yet enforced");
+  });
+
+  await test("AUDIT-TEST-08: Snapshot retrieval when parent document is missing self-heals and retrieves subcollection", async () => {
+    const uid = "user_audit_parent_08";
+    const token = setupPhase1User(uid);
+    const backupId = "bk_audit_parent_08";
+    const nowMs = Date.now();
+    const todayIst = getIstDateString(nowMs);
+
+    // Manifest exists and is COMMITTED, but parent document users/${uid}/backup_snapshots/${backupId} is MISSING
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" },
+      recordCount: { integerValue: "1" },
+      committedAtMs: { integerValue: nowMs.toString() },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, new Date(nowMs).toISOString());
+
+    mockFirestore.set(`users/${uid}/backup/status`, {
+      status: { stringValue: "SUCCESS" },
+      activeBackupId: { stringValue: backupId },
+      lastBackupDate: { stringValue: todayIst },
+      lastBackupTimeMs: { integerValue: nowMs.toString() }
+    });
+
+    // Child subcollection document exists
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-25`, {
+      dateString: { stringValue: "2026-10-25" },
+      totalReelsCount: { integerValue: "42" },
+      count: { integerValue: "42" }
+    });
+
+    // Ensure parent document does not exist initially
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId}`), false);
+
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_parent_08", backupId })
+    }), mockEnv);
+
+    assert.equal(res.status, 200, "Restore must succeed after self-healing parent document");
+    const body = await res.json();
+    assert.equal(body.dailyRecords.length, 1);
+    assert.equal(body.dailyRecords[0].dateString, "2026-10-25");
+    assert.equal(body.dailyRecords[0].totalReelsCount, 42);
+    // Verify parent doc was created
+    assert.equal(mockFirestore.has(`users/${uid}/backup_snapshots/${backupId}`), true);
+  });
+
+  await test("AUDIT-TEST-09: Explicitly missing snapshot does not silently return stale root records", async () => {
+    const uid = "user_audit_stale_09";
+    const token = setupPhase1User(uid);
+
+    // Stale records from a past root-level upload
+    mockFirestore.set(`users/${uid}/daily_data/2025-01-01`, {
+      dateString: { stringValue: "2025-01-01" },
+      totalReelsCount: { integerValue: "99" }
+    });
+
+    // Restore targeting a specific non-existent snapshot ID
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_stale_09", backupId: "bk_non_existent_snapshot" })
+    }), mockEnv);
+
+    // Must NOT return 200 with the stale 2025-01-01 record! Must return 404 error
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.equal(body.code, "SNAPSHOT_NOT_FOUND_OR_COMMITTED");
+  });
+
+  await test("AUDIT-TEST-10: Multi-page Firestore pagination retrieves >300 documents across page boundaries", async () => {
+    const uid = "user_audit_page_10";
+    const token = setupPhase1User(uid);
+    const backupId = "bk_audit_page_10";
+    const nowMs = Date.now();
+
+    // Create parent snapshot and manifest
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" }
+    });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" },
+      recordCount: { integerValue: "350" },
+      committedAtMs: { integerValue: nowMs.toString() },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, new Date(nowMs).toISOString());
+
+    // Seed 350 child records
+    for (let i = 0; i < 350; i++) {
+      const day = String(i + 1).padStart(3, "0");
+      const dStr = `2025-01-${day}`;
+      mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/${dStr}`, {
+        dateString: { stringValue: dStr },
+        totalReelsCount: { integerValue: "5" },
+        count: { integerValue: "5" }
+      });
+    }
+
+    const docs = await listFirestoreDocuments(`users/${uid}/backup_snapshots/${backupId}/daily_data`, mockEnv, 1000);
+    assert.equal(docs.length, 350, "Pagination loop must follow nextPageToken and retrieve all 350 documents");
+  });
+
+  await test("AUDIT-TEST-11: Multi-chunk restore streams and fetches every chunk with valid pagination", async () => {
+    const uid = "user_audit_stream_11";
+    const token = setupPhase1User(uid);
+    const backupId = "bk_audit_stream_11";
+    const nowMs = Date.now();
+
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" }
+    });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" },
+      recordCount: { integerValue: "250" },
+      committedAtMs: { integerValue: nowMs.toString() },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, new Date(nowMs).toISOString());
+
+    for (let i = 0; i < 250; i++) {
+      const day = String(i + 1).padStart(3, "0");
+      const dStr = `2025-02-${day}`;
+      mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/${dStr}`, {
+        dateString: { stringValue: dStr },
+        totalReelsCount: { integerValue: "10" },
+        count: { integerValue: "10" }
+      });
+    }
+
+    // 1. Initial reservation
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/restore", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ idempotencyKey: "rest_stream_11", backupId })
+    }), mockEnv);
+    assert.equal(res.status, 200);
+    const resBody = await res.json();
+    assert.equal(resBody.totalRecords, 250);
+    assert.equal(resBody.totalChunks, 2);
+
+    // 2. Fetch chunk 0 (200 records)
+    const chunk0Res = await worker.fetch(new Request(`https://refocus.workers.dev/api/restore/chunk?idempotencyKey=rest_stream_11&backupId=${backupId}&chunkIndex=0`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(chunk0Res.status, 200);
+    const chunk0Body = await chunk0Res.json();
+    assert.equal(chunk0Body.chunkIndex, 0);
+    assert.equal(chunk0Body.records.length, 200);
+    assert.equal(chunk0Body.isLastChunk, false);
+
+    // 3. Fetch chunk 1 (remaining 50 records)
+    const chunk1Res = await worker.fetch(new Request(`https://refocus.workers.dev/api/restore/chunk?idempotencyKey=rest_stream_11&backupId=${backupId}&chunkIndex=1`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(chunk1Res.status, 200);
+    const chunk1Body = await chunk1Res.json();
+    assert.equal(chunk1Body.chunkIndex, 1);
+    assert.equal(chunk1Body.records.length, 50);
+    assert.equal(chunk1Body.isLastChunk, true);
+  });
+
+  await test("AUDIT-TEST-12: count = 25 with totalReelsCount = 0 normalizes to 25 (and totalReelsCount = 35 with count = 0 normalizes to 35)", async () => {
+    const uid = "user_audit_norm_12";
+    const token = setupPhase1User(uid);
+    const backupId = "bk_audit_norm_12";
+    const nowMs = Date.now();
+
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" }
+    });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" },
+      recordCount: { integerValue: "2" },
+      committedAtMs: { integerValue: nowMs.toString() },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, new Date(nowMs).toISOString());
+
+    // Record A: count = 25, totalReelsCount = 0
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-01`, {
+      dateString: { stringValue: "2026-10-01" },
+      count: { integerValue: "25" },
+      totalReelsCount: { integerValue: "0" }
+    });
+
+    // Record B: count = 0, totalReelsCount = 35
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-02`, {
+      dateString: { stringValue: "2026-10-02" },
+      count: { integerValue: "0" },
+      totalReelsCount: { integerValue: "35" }
+    });
+
+    const records = await fetchSnapshotRecords(uid, backupId, mockEnv);
+    assert.equal(records.length, 2);
+    const recA = records.find(r => r.dateString === "2026-10-01");
+    const recB = records.find(r => r.dateString === "2026-10-02");
+    assert.equal(recA.totalReelsCount, 25, "count: 25 must win over totalReelsCount: 0");
+    assert.equal(recB.totalReelsCount, 35, "totalReelsCount: 35 must win over count: 0");
+  });
+
+  await test("AUDIT-TEST-13: Legitimate zero-count records (totalReelsCount = 0, count = 0) are strictly preserved as 0", async () => {
+    const uid = "user_audit_zero_13";
+    const backupId = "bk_audit_zero_13";
+    const nowMs = Date.now();
+
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" }
+    });
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "COMMITTED" },
+      recordCount: { integerValue: "1" },
+      committedAtMs: { integerValue: nowMs.toString() },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, new Date(nowMs).toISOString());
+
+    mockFirestore.set(`users/${uid}/backup_snapshots/${backupId}/daily_data/2026-10-03`, {
+      dateString: { stringValue: "2026-10-03" },
+      count: { integerValue: "0" },
+      totalReelsCount: { integerValue: "0" },
+      isSkullDay: { booleanValue: true }
+    });
+
+    const records = await fetchSnapshotRecords(uid, backupId, mockEnv);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].totalReelsCount, 0, "Legitimate zero count must be preserved as 0");
+    assert.equal(records[0].count, 0);
+    assert.equal(records[0].isSkullDay, true, "isSkullDay metadata must be preserved on zero count record");
+  });
+
+  await test("SEC-BKP-001: POST /api/backup/finalize idempotent retry after successful commit returns 200 OK with idempotent: true", async () => {
+    const uid = "user_bkp_idemp_finalize";
+    const token = setupPhase1User(uid);
+    const reqId = "req_finalize_idemp_1";
+
+    const initRes = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: reqId, totalRecords: 10 })
+    }), mockEnv);
+    assert.equal(initRes.status, 200);
+    const { backupId } = await initRes.json();
+
+    const finRes1 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/finalize", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, requestId: reqId, defaultDailyLimit: 60 })
+    }), mockEnv);
+    assert.equal(finRes1.status, 200);
+    const finBody1 = await finRes1.json();
+    assert.equal(finBody1.success, true);
+    assert.equal(finBody1.backupId, backupId);
+
+    // Retrying finalize with same backupId and requestId must return 200 OK with idempotent: true
+    const finRes2 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/finalize", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ backupId, requestId: reqId, defaultDailyLimit: 60 })
+    }), mockEnv);
+    assert.equal(finRes2.status, 200, "Idempotent retry must return 200 OK");
+    const finBody2 = await finRes2.json();
+    assert.equal(finBody2.success, true);
+    assert.equal(finBody2.idempotent, true);
+    assert.equal(finBody2.backupId, backupId);
+  });
+
+  await test("SEC-BKP-001: POST /api/backup/init idempotent retry with matching requestId returns 200 OK with existing backupId", async () => {
+    const uid = "user_bkp_idemp_init";
+    const token = setupPhase1User(uid);
+    const reqId = "req_init_idemp_1";
+
+    const initRes1 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: reqId, totalRecords: 50 })
+    }), mockEnv);
+    assert.equal(initRes1.status, 200);
+    const initBody1 = await initRes1.json();
+    assert.ok(initBody1.backupId);
+
+    // Retrying init with the same requestId while upload is in progress returns existing session idempotently
+    const initRes2 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: reqId, totalRecords: 50 })
+    }), mockEnv);
+    assert.equal(initRes2.status, 200);
+    const initBody2 = await initRes2.json();
+    assert.equal(initBody2.success, true);
+    assert.equal(initBody2.idempotent, true);
+    assert.equal(initBody2.backupId, initBody1.backupId);
+    assert.equal(initBody2.fencingToken, initBody1.fencingToken);
+  });
+
+  await test("SEC-BKP-001: POST /api/backup/init rejects distinct concurrent request while upload is active (within 60s lease) with 409 BACKUP_IN_PROGRESS", async () => {
+    const uid = "user_bkp_concurrent_init";
+    const token = setupPhase1User(uid);
+
+    const initRes1 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: "req_init_concurrent_1", totalRecords: 50 })
+    }), mockEnv);
+    assert.equal(initRes1.status, 200);
+
+    // Distinct requestId within 60s must be rejected as BACKUP_IN_PROGRESS
+    const initRes2 = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+      body: JSON.stringify({ requestId: "req_init_concurrent_2", totalRecords: 50 })
+    }), mockEnv);
+    assert.equal(initRes2.status, 409);
+    const body2 = await initRes2.json();
+    assert.equal(body2.success, false);
+    assert.equal(body2.code, "BACKUP_IN_PROGRESS");
+  });
+
+  await test("SEC-BKP-001: POST /api/backup/init returns 409 BACKUP_CONCURRENT_CONFLICT when batch commit fails OCC precondition", async () => {
+    const uid = "user_bkp_occ_conflict";
+    const token = setupPhase1User(uid);
+
+    mockFirestoreFaultInjector = (urlStr, options) => {
+      if (urlStr.includes(":commit") && options.method === "POST") {
+        return new Response(JSON.stringify({ error: "Precondition Failed" }), { status: 412 });
+      }
+      return undefined;
+    };
+
+    try {
+      const res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/init", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+        body: JSON.stringify({ requestId: "req_bkp_occ_1", totalRecords: 100 })
+      }), mockEnv);
+
+      assert.equal(res.status, 409);
+      const body = await res.json();
+      assert.equal(body.code, "BACKUP_CONCURRENT_CONFLICT");
+      assert.equal(body.success, false);
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("SEC-BKP-001: POST /api/backup/finalize on concurrent 412 recovers if manifest committed concurrently", async () => {
+    const uid = "user_bkp_finalize_race";
+    const token = setupPhase1User(uid);
+    const backupId = "bk_finalize_race_01";
+    const nowMs = Date.now();
+
+    mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+      backupId: { stringValue: backupId },
+      status: { stringValue: "UPLOADING" },
+      recordCount: { integerValue: "50" },
+      activeRestorePinCount: { integerValue: "0" }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, "2026-10-24T00:00:00Z");
+
+    let commitAttempted = false;
+    mockFirestoreFaultInjector = (urlStr, options) => {
+      if (urlStr.includes(":commit") && options.method === "POST" && !commitAttempted) {
+        commitAttempted = true;
+        mockFirestore.set(`users/${uid}/backup_manifests/${backupId}`, {
+          backupId: { stringValue: backupId },
+          status: { stringValue: "COMMITTED" },
+          recordCount: { integerValue: "50" },
+          committedAtMs: { integerValue: nowMs.toString() },
+          activeRestorePinCount: { integerValue: "0" }
+        });
+        mockDocUpdateTimes.set(`users/${uid}/backup_manifests/${backupId}`, "2026-10-24T00:00:05Z");
+        return new Response(JSON.stringify({ error: "Precondition Failed" }), { status: 412 });
+      }
+      return undefined;
+    };
+
+    try {
+      const res = await worker.fetch(new Request("https://refocus.workers.dev/api/backup/finalize", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "CF-Connecting-IP": "1.1.1.1" },
+        body: JSON.stringify({ backupId, requestId: "req_race_fin", totalRecords: 50 })
+      }), mockEnv);
+
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.success, true);
+      assert.equal(body.idempotent, true);
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("SEC-DEL-002: POST /api/account/request-deletion creates durable account_tombstones with PENDING_DELETION", async () => {
+    const uid = "user_del002_req";
+    const token = setupPhase1User(uid);
+
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/account/request-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.accountStatus, "PENDING_DELETION");
+    assert.ok(body.scheduledFor);
+
+    // Verify durable tombstone was recorded in account_tombstones
+    const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.ok(tombstone, "Durable account_tombstones record must be created");
+    assert.equal(tombstone.purgeState?.stringValue, "PENDING_DELETION");
+    assert.equal(tombstone.accountStatus?.stringValue, "PENDING_DELETION");
+    assert.equal(tombstone.deletionScheduledFor?.timestampValue, body.scheduledFor);
+  });
+
+  await test("SEC-DEL-002: Scheduled purge discovery ignores unexpired PENDING_DELETION but purges expired PENDING_DELETION autonomously", async () => {
+    for (const key of [...mockFirestore.keys()]) {
+      if (key.startsWith("account_tombstones/")) mockFirestore.delete(key);
+    }
+
+    const now = Date.now();
+    const unexpiredUid = "user_del002_unexpired";
+    const expiredUid = "user_del002_expired";
+
+    // 1. Unexpired account (scheduled 5 days in the future)
+    mockFirestore.set(`account_tombstones/${unexpiredUid}`, {
+      uid: { stringValue: unexpiredUid },
+      accountStatus: { stringValue: "PENDING_DELETION" },
+      purgeState: { stringValue: "PENDING_DELETION" },
+      deletionScheduledFor: { timestampValue: new Date(now + 5 * 24 * 3600 * 1000).toISOString() },
+      updatedAt: { timestampValue: new Date(now).toISOString() }
+    });
+
+    // 2. Expired account (scheduled 1 hour in the past)
+    mockFirestore.set(`account_tombstones/${expiredUid}`, {
+      uid: { stringValue: expiredUid },
+      accountStatus: { stringValue: "PENDING_DELETION" },
+      purgeState: { stringValue: "PENDING_DELETION" },
+      deletionScheduledFor: { timestampValue: new Date(now - 3600 * 1000).toISOString() },
+      updatedAt: { timestampValue: new Date(now - 7 * 24 * 3600 * 1000).toISOString() }
+    });
+    mockFirestore.set(`users/${expiredUid}/daily_data/2026-10-15`, { totalReelsCount: { integerValue: 30 } });
+
+    // Discovery sweep should include expiredUid but exclude unexpiredUid
+    const discovery = await listPendingAccountTombstones(mockEnv, 25);
+    assert.equal(discovery.success, true);
+    assert.ok(discovery.uids.includes(expiredUid), "Expired PENDING_DELETION must be discovered");
+    assert.ok(!discovery.uids.includes(unexpiredUid), "Unexpired PENDING_DELETION must NOT be discovered");
+
+    // Scheduled sweep purges the expired account autonomously
+    const sweep = await processPendingAccountPurges(mockEnv, 25);
+    assert.equal(sweep.success, true);
+    assert.equal(sweep.succeeded, 1);
+
+    const expiredTombstone = mockFirestore.get(`account_tombstones/${expiredUid}`);
+    assert.equal(expiredTombstone.purgeState?.stringValue, "COMPLETED");
+    assert.equal(expiredTombstone.accountStatus?.stringValue, "DELETED");
+    assert.equal(mockFirestore.get(`users/${expiredUid}/daily_data/2026-10-15`), undefined, "Expired user data must be purged");
+  });
+
+  await test("SEC-DEL-002: POST /api/account/cancel-deletion removes tombstone and prevents scheduled purge", async () => {
+    const uid = "user_del002_cancel";
+    const token = setupPhase1User(uid);
+
+    // 1. Request deletion
+    const reqDelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/request-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(reqDelRes.status, 200);
+    assert.ok(mockFirestore.has(`account_tombstones/${uid}`));
+
+    // 2. Cancel deletion during grace period
+    const cancelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/cancel-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(cancelRes.status, 200);
+    const cancelBody = await cancelRes.json();
+    assert.equal(cancelBody.accountStatus, "ACTIVE");
+
+    // Tombstone must be cleared or set to CANCELLED
+    const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.ok(!tombstone || tombstone.purgeState?.stringValue === "CANCELLED");
+
+    // Scheduled discovery must NOT return this user
+    const discovery = await listPendingAccountTombstones(mockEnv, 25);
+    assert.ok(!discovery.uids.includes(uid), "Cancelled account must not be queued for purge");
+  });
+
+
+  await test("SEC-DEL-003: POST /api/account/cancel-deletion is rejected with 409 Conflict when purge is IN_PROGRESS", async () => {
+    const uid = "user_del003_inprogress";
+    const token = setupPhase1User(uid);
+
+    // Account is pending deletion, but purge lock is actively held
+    const futureGrace = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    mockFirestore.set(`users/${uid}/account/status`, {
+      accountStatus: { stringValue: "PENDING_DELETION" },
+      deletionScheduledFor: { timestampValue: futureGrace }
+    });
+    const nowMs = Date.now();
+    mockFirestore.set(`account_tombstones/${uid}`, {
+      uid: { stringValue: uid },
+      accountStatus: { stringValue: "DELETED" },
+      purgeState: { stringValue: "IN_PROGRESS" },
+      claimId: { stringValue: "claim_active_worker" },
+      leaseExpiresAtMs: { integerValue: (nowMs + 45000).toString() },
+      updatedAt: { timestampValue: new Date(nowMs).toISOString() }
+    });
+    mockDocUpdateTimes.set(`account_tombstones/${uid}`, new Date(nowMs).toISOString());
+
+    const cancelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/cancel-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+
+    assert.equal(cancelRes.status, 409);
+    const body = await cancelRes.json();
+    assert.equal(body.code, "PURGE_IN_PROGRESS");
+
+    // Verify tombstone is preserved as IN_PROGRESS and status is not restored to ACTIVE
+    const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.equal(tombstone.purgeState.stringValue, "IN_PROGRESS");
+    assert.notEqual(mockFirestore.get(`users/${uid}/account/status`).accountStatus.stringValue, "ACTIVE");
+  });
+
+  await test("SEC-DEL-003: POST /api/account/cancel-deletion is rejected with 410 Gone when purge is PENDING_RETRY", async () => {
+    const uid = "user_del003_pending_retry";
+    const token = setupPhase1User(uid);
+
+    mockFirestore.set(`users/${uid}/account/status`, {
+      accountStatus: { stringValue: "PENDING_DELETION" }
+    });
+    mockFirestore.set(`account_tombstones/${uid}`, {
+      uid: { stringValue: uid },
+      accountStatus: { stringValue: "DELETED" },
+      purgeState: { stringValue: "PENDING_RETRY" },
+      updatedAt: { timestampValue: new Date().toISOString() }
+    });
+
+    const cancelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/cancel-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+
+    assert.equal(cancelRes.status, 410);
+    const body = await cancelRes.json();
+    assert.equal(body.code, "ACCOUNT_ALREADY_PURGED");
+
+    const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.equal(tombstone.purgeState.stringValue, "PENDING_RETRY");
+    assert.notEqual(mockFirestore.get(`users/${uid}/account/status`).accountStatus.stringValue, "ACTIVE");
+  });
+
+  await test("SEC-DEL-003: POST /api/account/cancel-deletion OCC race condition: concurrent purge claim between read and cancel patch returns 409", async () => {
+    const uid = "user_del003_occ_race";
+    const token = setupPhase1User(uid);
+
+    const futureGrace = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    mockFirestore.set(`users/${uid}/account/status`, {
+      accountStatus: { stringValue: "PENDING_DELETION" },
+      deletionScheduledFor: { timestampValue: futureGrace }
+    });
+    const initialTombstoneTime = "2026-11-02T05:00:00.000000Z";
+    mockFirestore.set(`account_tombstones/${uid}`, {
+      uid: { stringValue: uid },
+      accountStatus: { stringValue: "PENDING_DELETION" },
+      purgeState: { stringValue: "PENDING_DELETION" },
+      deletionScheduledFor: { timestampValue: futureGrace },
+      updatedAt: { timestampValue: initialTombstoneTime }
+    });
+    mockDocUpdateTimes.set(`account_tombstones/${uid}`, initialTombstoneTime);
+
+    // Inject concurrent race: when PATCH to account_tombstones is called, simulate another worker having claimed the lock
+    let raceInjected = false;
+    mockFirestoreFaultInjector = async (urlStr, options) => {
+      if (options.method === "PATCH" && urlStr.includes(`account_tombstones/${uid}`) && !raceInjected) {
+        raceInjected = true;
+        // Concurrent worker claims lock
+        const racingUpdateTime = "2026-11-02T05:01:00.000000Z";
+        mockFirestore.set(`account_tombstones/${uid}`, {
+          uid: { stringValue: uid },
+          accountStatus: { stringValue: "DELETED" },
+          purgeState: { stringValue: "IN_PROGRESS" },
+          leaseExpiresAtMs: { integerValue: (Date.now() + 60000).toString() },
+          updatedAt: { timestampValue: racingUpdateTime }
+        });
+        mockDocUpdateTimes.set(`account_tombstones/${uid}`, racingUpdateTime);
+        // Precondition on initialTombstoneTime fails with 412
+        return new Response(JSON.stringify({ error: "Precondition Failed: updateTime mismatch" }), { status: 412 });
+      }
+      return undefined;
+    };
+
+    try {
+      const cancelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/cancel-deletion", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+      }), mockEnv);
+
+      assert.equal(cancelRes.status, 409);
+      const body = await cancelRes.json();
+      assert.equal(body.code, "PURGE_IN_PROGRESS");
+
+      // Verify status doc was NOT restored to ACTIVE
+      const statusDoc = mockFirestore.get(`users/${uid}/account/status`);
+      assert.notEqual(statusDoc?.accountStatus?.stringValue, "ACTIVE");
+    } finally {
+      mockFirestoreFaultInjector = null;
+    }
+  });
+
+  await test("SEC-DEL-003: Cancelled account tombstone is retained as CANCELLED and prevents future purges", async () => {
+    const uid = "user_del003_cancelled_retention";
+    const token = setupPhase1User(uid);
+
+    // 1. Request deletion
+    const reqDelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/request-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(reqDelRes.status, 200);
+
+    // 2. Set daily data
+    mockFirestore.set(`users/${uid}/daily_data/2026-11-01`, { reelsCount: { integerValue: "5" } });
+
+    // 3. Cancel deletion
+    const cancelRes = await worker.fetch(new Request("https://refocus.workers.dev/api/account/cancel-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(cancelRes.status, 200);
+
+    // Tombstone must be durable with purgeState CANCELLED
+    const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.ok(tombstone, "Tombstone must exist");
+    assert.equal(tombstone.purgeState.stringValue, "CANCELLED");
+
+    // 4. Directly calling claimPurgeLockAtomic must reject
+    const claimRes = await claimPurgeLockAtomic(uid, Date.now(), mockEnv);
+    assert.equal(claimRes.claimed, false);
+    assert.equal(claimRes.cancelled, true);
+
+    // 5. Directly calling purgeAccountData must safely no-op
+    const purgeRes = await purgeAccountData(uid, mockEnv);
+    assert.equal(purgeRes.success, true);
+    assert.equal(purgeRes.cancelled, true);
+    assert.equal(purgeRes.purgeState, "CANCELLED");
+
+    // User's daily data MUST be untouched
+    assert.ok(mockFirestore.get(`users/${uid}/daily_data/2026-11-01`), "Daily data must NOT be purged for cancelled account");
+  });
+
+  await test("SEC-DEL-003: POST /api/account/request-deletion rejected when purge is IN_PROGRESS (409) or PENDING_RETRY (410)", async () => {
+    const uidProg = "user_del003_req_del_inprogress";
+    const tokenProg = setupPhase1User(uidProg);
+    mockFirestore.set(`account_tombstones/${uidProg}`, {
+      uid: { stringValue: uidProg },
+      purgeState: { stringValue: "IN_PROGRESS" }
+    });
+
+    const resProg = await worker.fetch(new Request("https://refocus.workers.dev/api/account/request-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${tokenProg}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(resProg.status, 409);
+
+    const uidRetry = "user_del003_req_del_retry";
+    const tokenRetry = setupPhase1User(uidRetry);
+    mockFirestore.set(`account_tombstones/${uidRetry}`, {
+      uid: { stringValue: uidRetry },
+      purgeState: { stringValue: "PENDING_RETRY" }
+    });
+
+    const resRetry = await worker.fetch(new Request("https://refocus.workers.dev/api/account/request-deletion", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${tokenRetry}`, "CF-Connecting-IP": "1.1.1.1" }
+    }), mockEnv);
+    assert.equal(resRetry.status, 410);
+  });
+
+
+  await test("SEC-DEL-004: Webhook subscription.charged for DELETED account does not resurrect subscription and triggers gateway mandate cancellation", async () => {
+    const uid = "user_del004_purged";
+    const subId = "sub_del004_purged_mandate";
+    mockFirestore.set(`users/${uid}/account/status`, {
+      accountStatus: { stringValue: "DELETED" },
+      purgeState: { stringValue: "COMPLETED" }
+    });
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid }
+    });
+
+    let gatewayCancelCalled = false;
+    let cancelCycleEnd = null;
+    mockRazorpayFaultInjector = (url, options) => {
+      if (url.includes(`/subscriptions/${subId}/cancel`) && options.method === "POST") {
+        gatewayCancelCalled = true;
+        const b = JSON.parse(options.body || "{}");
+        cancelCycleEnd = b.cancel_at_cycle_end;
+        return new Response(JSON.stringify({ id: subId, status: "cancelled" }), { status: 200 });
+      }
+      return undefined;
+    };
+
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const payload = {
+        event: "subscription.charged",
+        contains: ["subscription", "payment"],
+        payload: {
+          subscription: {
+            entity: {
+              id: subId,
+              plan_id: (mockEnv.RAZORPAY_PLAN_ID || "plan_TdtgehXIhzQ8U9"),
+              current_start: nowSec,
+              current_end: nowSec + 30 * 86400,
+              notes: { firebase_uid: uid }
+            }
+          },
+          payment: {
+            entity: {
+              id: "pay_del004_123",
+              amount: 7900,
+              currency: "INR",
+              status: "captured",
+              notes: { firebase_uid: uid }
+            }
+          }
+        }
+      };
+
+      const rawBody = JSON.stringify(payload);
+      const secret = "test_webhook_secret_123";
+      const hmac = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+
+      const res = await worker.fetch(new Request("https://refocus.workers.dev/api/razorpay-webhook", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Razorpay-Signature": hmac,
+          "X-Razorpay-Event-Id": "evt_del004_purge_charge_1"
+        },
+        body: rawBody
+      }), { ...mockEnv, RAZORPAY_WEBHOOK_SECRET: secret });
+
+      assert.equal(res.status, 200);
+      // Subscription doc must NOT be created/resurrected in Firestore
+      assert.equal(mockFirestore.get(`users/${uid}/subscription/status`), undefined, "Purged user subscription must not be resurrected");
+      // Gateway cancel must have been called immediately (cancel_at_cycle_end: 0)
+      assert.equal(gatewayCancelCalled, true, "Mandate must be cancelled at gateway for deleted user");
+      assert.equal(cancelCycleEnd, 0, "Gateway cancellation must be immediate");
+      // subscription_map must be purged
+      assert.equal(mockFirestore.get(`subscription_map/${subId}`), undefined, "subscription_map must be deleted");
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
+  await test("SEC-DEL-004: Webhook subscription.charged for PENDING_DELETION account preserves cancelAtPeriodEnd: true", async () => {
+    const uid = "user_del004_pending_del";
+    const subId = "sub_del004_pending_sub";
+    mockFirestore.set(`users/${uid}/account/status`, {
+      accountStatus: { stringValue: "PENDING_DELETION" }
+    });
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid }
+    });
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const payload = {
+      event: "subscription.charged",
+      contains: ["subscription", "payment"],
+      payload: {
+        subscription: {
+          entity: {
+            id: subId,
+            plan_id: (mockEnv.RAZORPAY_PLAN_ID || "plan_TdtgehXIhzQ8U9"),
+            current_start: nowSec,
+            current_end: nowSec + 30 * 86400,
+            cancel_at_cycle_end: 0, // Upstream entity might say 0, but user is PENDING_DELETION!
+            notes: { firebase_uid: uid }
+          }
+        },
+        payment: {
+          entity: {
+            id: "pay_del004_pending_1",
+            amount: 7900,
+            currency: "INR",
+            status: "captured",
+            notes: { firebase_uid: uid }
+          }
+        }
+      }
+    };
+
+    const rawBody = JSON.stringify(payload);
+    const secret = "test_webhook_secret_123";
+    const hmac = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+
+    const res = await worker.fetch(new Request("https://refocus.workers.dev/api/razorpay-webhook", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Razorpay-Signature": hmac,
+        "X-Razorpay-Event-Id": "evt_del004_pending_charge_1"
+      },
+      body: rawBody
+    }), { ...mockEnv, RAZORPAY_WEBHOOK_SECRET: secret });
+
+    assert.equal(res.status, 200);
+    const subDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.ok(subDoc);
+    assert.equal(subDoc.cancelAtPeriodEnd?.booleanValue, true, "cancelAtPeriodEnd must remain true for PENDING_DELETION user");
+  });
+
+  await test("SEC-DEL-005: purgeAccountData deletes subscription_map entries and active daily_quota_claims for the purged user", async () => {
+    const uid = "user_del005_map_purge";
+    const subId = "sub_del005_mapped_123";
+    const nowMs = Date.now();
+    const todayIst = getIstDateString(nowMs);
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_monthly" }
+    });
+    mockFirestore.set(`daily_quota_claims/${uid}_${todayIst}_BACKUP`, {
+      status: { stringValue: "IN_PROGRESS" }
+    });
+
+    const purgeRes = await purgeAccountData(uid, mockEnv);
+    assert.equal(purgeRes.success, true);
+    assert.equal(purgeRes.purgeState, "COMPLETED");
+
+    // Verify subscription_map and daily_quota_claims deleted
+    assert.equal(mockFirestore.get(`subscription_map/${subId}`), undefined, "subscription_map must be purged under Right to Erasure");
+    assert.equal(mockFirestore.get(`daily_quota_claims/${uid}_${todayIst}_BACKUP`), undefined, "daily_quota_claims must be purged");
+  });
+
+  await test("SEC-DEL-006: purgeAccountData discovers and purges historical daily_quota_claims from 30 days ago without deleting another user's claims", async () => {
+    const uid = "user_del006_quota_target";
+    const otherUid = "user_del006_quota_other";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`daily_quota_claims/${uid}_2026-09-01_BACKUP`, {
+      uid: { stringValue: uid },
+      status: { stringValue: "COMPLETED" }
+    });
+    mockFirestore.set(`daily_quota_claims/${uid}_2026-09-15_RESTORE`, {
+      uid: { stringValue: uid },
+      status: { stringValue: "ACKNOWLEDGED" }
+    });
+    mockFirestore.set(`daily_quota_claims/${otherUid}_2026-09-01_BACKUP`, {
+      uid: { stringValue: otherUid },
+      status: { stringValue: "COMPLETED" }
+    });
+    mockFirestore.set(`daily_quota_claims/${otherUid}_2026-09-15_RESTORE`, {
+      uid: { stringValue: otherUid },
+      status: { stringValue: "ACKNOWLEDGED" }
+    });
+
+    const purgeRes = await purgeAccountData(uid, mockEnv);
+    assert.equal(purgeRes.success, true);
+    assert.equal(purgeRes.purgeState, "COMPLETED");
+
+    // Target user's historical claims must be deleted
+    assert.equal(mockFirestore.get(`daily_quota_claims/${uid}_2026-09-01_BACKUP`), undefined, "Historical backup claim must be purged");
+    assert.equal(mockFirestore.get(`daily_quota_claims/${uid}_2026-09-15_RESTORE`), undefined, "Historical restore claim must be purged");
+
+    // Other user's claims must remain completely intact
+    assert.ok(mockFirestore.get(`daily_quota_claims/${otherUid}_2026-09-01_BACKUP`), "Other user's backup claim must not be purged");
+    assert.ok(mockFirestore.get(`daily_quota_claims/${otherUid}_2026-09-15_RESTORE`), "Other user's restore claim must not be purged");
+  });
+
+  await test("SEC-DEL-006: purgeAccountData preserves subscription_map when gateway cancellation fails, and purges subscription_map on subsequent retry when gateway succeeds", async () => {
+    const uid = "user_del006_gw_fail";
+    const subId = "sub_del006_transient_fail";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`subscription_map/${subId}`, {
+      firebaseUid: { stringValue: uid },
+      planId: { stringValue: "plan_monthly" }
+    });
+
+    // Mock Razorpay gateway failure (503 Service Unavailable)
+    const originalFetch = globalThis.fetch;
+    let gatewayShouldFail = true;
+    globalThis.fetch = async (url, opts) => {
+      const urlStr = typeof url === "string" ? url : url.url;
+      if (urlStr && urlStr.includes(`/v1/subscriptions/${subId}/cancel`)) {
+        if (gatewayShouldFail) {
+          return new Response(JSON.stringify({ error: { code: "SERVER_ERROR", description: "Gateway unavailable" } }), { status: 503 });
+        }
+        return new Response(JSON.stringify({ id: subId, status: "cancelled" }), { status: 200 });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const failPurgeRes = await purgeAccountData(uid, mockEnv);
+      assert.equal(failPurgeRes.success, false);
+      assert.equal(failPurgeRes.purgeState, "PENDING_RETRY");
+
+      // subscription_map must be preserved so retry knows which subscription to cancel
+      assert.ok(mockFirestore.get(`subscription_map/${subId}`), "subscription_map entry must be preserved on gateway failure");
+      const tombstone = mockFirestore.get(`account_tombstones/${uid}`);
+      assert.equal(tombstone?.pendingSubscriptionId?.stringValue, subId);
+
+      // Now gateway recovers
+      gatewayShouldFail = false;
+      const retryPurgeRes = await purgeAccountData(uid, mockEnv);
+      assert.equal(retryPurgeRes.success, true);
+      assert.equal(retryPurgeRes.purgeState, "COMPLETED");
+
+      // subscription_map must now be purged
+      assert.equal(mockFirestore.get(`subscription_map/${subId}`), undefined, "subscription_map entry must be purged after gateway cancellation succeeds");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  await test("SEC-DEL-006: purgeAccountData purges trial_registry by UID while preserving non-identifying trial_identities and razorpay_events", async () => {
+    const uid = "user_del006_trial_cleanup";
+    const identityKey = "sha256_mock_hw_identity_hash_999";
+    const eventId = "evt_mock_dedup_888";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`trial_registry/${uid}`, {
+      uid: { stringValue: uid },
+      trialStartedAt: { timestampValue: "2026-09-01T00:00:00Z" }
+    });
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-09-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-09-08T00:00:00Z" }
+    });
+    mockFirestore.set(`razorpay_events/${eventId}`, {
+      processedAt: { timestampValue: "2026-09-01T00:00:00Z" }
+    });
+
+    const purgeRes = await purgeAccountData(uid, mockEnv);
+    assert.equal(purgeRes.success, true);
+    assert.equal(purgeRes.purgeState, "COMPLETED");
+
+    // trial_registry with UID must be purged
+    assert.equal(mockFirestore.get(`trial_registry/${uid}`), undefined, "trial_registry keyed by UID must be deleted");
+
+    // Non-identifying fraud prevention and event dedup records must be preserved
+    assert.ok(mockFirestore.get(`trial_identities/${identityKey}`), "trial_identities must be preserved for abuse prevention");
+    assert.ok(mockFirestore.get(`razorpay_events/${eventId}`), "razorpay_events must be preserved for webhook idempotency");
+  });
+
+
+
+  await test("SEC-DEL-007: purgeAccountData with candidate subscription fails closed when gateway credentials are missing or invalid", async () => {
+    const uid = "user_del007_missing_creds";
+    const subId = "sub_del007_active_mandate";
+
+    mockFirestore.set(`users/${uid}/account/status`, { accountStatus: { stringValue: "PENDING_DELETION" } });
+    mockFirestore.set(`users/${uid}/subscription/status`, { subscriptionId: { stringValue: subId } });
+    mockFirestore.set(`subscription_map/${subId}`, { uid: { stringValue: uid } });
+
+    const envWithoutCreds = { ...mockEnv, RAZORPAY_KEY_ID: undefined, RAZORPAY_KEY_SECRET: undefined };
+
+    const purgeRes = await purgeAccountData(uid, envWithoutCreds);
+    assert.equal(purgeRes.success, false, "Purge must not report success when gateway credentials are missing");
+    assert.equal(purgeRes.purgeState, "PENDING_RETRY", "Purge must fail closed to PENDING_RETRY");
+    assert.equal(purgeRes.gatewaySuccess, false, "gatewaySuccess must be false");
+
+    // Must preserve subscription_map and subscription status document for retry
+    assert.ok(mockFirestore.get(`subscription_map/${subId}`), "subscription_map must be preserved for retry");
+    assert.ok(mockFirestore.get(`users/${uid}/subscription/status`), "subscription status doc must be preserved for retry");
+
+    const tomb = mockFirestore.get(`account_tombstones/${uid}`);
+    assert.equal(tomb.purgeState.stringValue, "PENDING_RETRY");
+    assert.equal(tomb.pendingSubscriptionId.stringValue, subId);
+  });
+
+  await test("SEC-SUB-002: POST /api/cancel-subscription authoritatively updates Firestore currentPeriodEnd and returns gateway currentPeriodEnd", async () => {
+    const uid = "user_cancel_authoritative_end";
+    const subId = "sub_cancel_authoritative_123";
+    const gatewayPeriodEndSec = 1800000000;
+    const expectedPeriodEndIso = new Date(gatewayPeriodEndSec * 1000).toISOString();
+
+    // Firestore record currently has no currentPeriodEnd timestamp
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      premium: { booleanValue: true }
+    });
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      current_end: gatewayPeriodEndSec
+    });
+
+    const token = createMockFirebaseIdToken(uid);
+    const req = new Request("https://refocus.workers.dev/api/cancel-subscription", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`
+      }
+    });
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+    assert.equal(body.cancelAtPeriodEnd, true);
+    assert.equal(body.currentPeriodEnd, expectedPeriodEndIso, "Response must return authoritative gateway currentPeriodEnd");
+
+    const updatedDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(updatedDoc.cancelAtPeriodEnd.booleanValue, true);
+    assert.equal(updatedDoc.subscriptionStatus.stringValue, "ACTIVE");
+    assert.equal(updatedDoc.currentPeriodEnd.timestampValue, expectedPeriodEndIso, "Firestore record must be updated with authoritative gateway currentPeriodEnd");
+  });
+
+
+  await test("SEC-SUB-003: POST /api/ensure-subscription reconciles expired paid subscription to EXPIRED (does not grant premium)", async () => {
+    const uid = "user_expired_paid_ensure_test";
+    const googleSub = "google_sub_expired_paid_999";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const pastMs = Date.now() - 5 * 86400 * 1000; // Ended 5 days ago
+
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-01-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-01-08T00:00:00Z" }
+    });
+
+    // Sub status document has stale ACTIVE status from when cycle was active, but period ended 5 days ago
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      subscriptionId: { stringValue: "sub_expired_mandate_999" },
+      currentPeriodEnd: { timestampValue: new Date(pastMs).toISOString() }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({})
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.subscriptionStatus, "EXPIRED", "Expired paid subscriber must transition to EXPIRED");
+    assert.equal(body.premium, false, "Expired paid subscriber must not receive premium: true");
+
+    const docAfter = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(docAfter.subscriptionStatus?.stringValue, "EXPIRED");
+    assert.equal(docAfter.premium?.booleanValue, false);
+  });
+
+  await test("SEC-SUB-004: Webhook refund.processed revokes subscription even if document lacks latestPaymentId", async () => {
+    const uid = "user_refund_missing_latest_payment_id";
+    const subId = "sub_refund_no_pay_id_1";
+    const refundPaymentId = "pay_refund_no_id_1";
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    // Subscription status document restored without latestPaymentId
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId },
+      premium: { booleanValue: true },
+      currentPeriodEnd: { timestampValue: new Date((nowSec + 15 * 86400) * 1000).toISOString() }
+    });
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "active",
+      plan_id: "plan_TdtgehXIhzQ8U9"
+    });
+
+    const res = await sendWebhook({
+      event: "refund.processed",
+      created_at: nowSec,
+      payload: {
+        payment: { entity: { id: refundPaymentId, subscription_id: subId, notes: { firebase_uid: uid } } },
+        refund: { entity: { id: "rfnd_no_pay_id_test", payment_id: refundPaymentId, created_at: nowSec } }
+      }
+    }, "evt_refund_missing_payment_id_test");
+
+    assert.equal(res.status, 200);
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionStatus.stringValue, "CANCELLED");
+    assert.equal(doc.premium.booleanValue, false);
+    assert.ok(doc.refundedAt);
+  });
+
+
+  await test("SEC-SUB-005: POST /api/ensure-subscription preserves concurrent renewal and does not clobber newer state on 412", async () => {
+    const uid = "user_ensure_concurrent_renewal";
+    const googleSub = "google_sub_concurrent_renewal_555";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const pastMs = Date.now() - 2 * 86400 * 1000;
+    const futureMs = Date.now() + 25 * 86400 * 1000;
+    const subId = "sub_concurrent_555";
+
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-01-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-01-08T00:00:00Z" }
+    });
+
+    // Initial state: expired period
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      subscriptionId: { stringValue: subId },
+      currentPeriodEnd: { timestampValue: new Date(pastMs).toISOString() }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/subscription/status`, "2026-10-01T00:00:00Z");
+
+    mockRazorpaySubscriptions.set(subId, {
+      id: subId,
+      status: "cancelled",
+      plan_id: "plan_TdtgehXIhzQ8U9"
+    });
+
+    // Intercept fetch so right after the initial GET of subscription status, a concurrent renewal commits
+    let interceptedOnce = false;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const urlStr = url?.toString() || "";
+      if (!interceptedOnce && urlStr.includes(`/v1/subscriptions/${subId}`)) {
+        interceptedOnce = true;
+        // Concurrent renewal commits now in Firestore
+        mockFirestore.set(`users/${uid}/subscription/status`, {
+          subscriptionStatus: { stringValue: "ACTIVE" },
+          premium: { booleanValue: true },
+          subscriptionId: { stringValue: subId },
+          currentPeriodEnd: { timestampValue: new Date(futureMs).toISOString() }
+        });
+        mockDocUpdateTimes.set(`users/${uid}/subscription/status`, "2026-10-09T12:00:00Z");
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({})
+      });
+
+      const res = await worker.fetch(req, mockEnv, {});
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.premium, true, "Refreshed state must return premium: true");
+      assert.equal(body.subscriptionStatus, "ACTIVE");
+      assert.equal(body.subscriptionId, subId);
+      assert.equal(body.currentPeriodEnd, new Date(futureMs).toISOString());
+
+      // Concurrent renewal MUST NOT have been overwritten by EXPIRED!
+      const finalDoc = mockFirestore.get(`users/${uid}/subscription/status`);
+      assert.equal(finalDoc.subscriptionStatus.stringValue, "ACTIVE", "Concurrent renewal must be preserved as ACTIVE");
+      assert.equal(finalDoc.premium.booleanValue, true);
+      assert.equal(finalDoc.currentPeriodEnd.timestampValue, new Date(futureMs).toISOString());
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  await test("SEC-SUB-006: POST /api/ensure-subscription does not mutate Firestore to EXPIRED on transient Razorpay outage", async () => {
+    const uid = "user_ensure_gateway_outage";
+    const googleSub = "google_sub_gateway_outage_666";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const pastMs = Date.now() - 1 * 86400 * 1000;
+    const subId = "sub_gateway_outage_666";
+
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: "2026-01-01T00:00:00Z" },
+      trialEnd: { timestampValue: "2026-01-08T00:00:00Z" }
+    });
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      subscriptionId: { stringValue: subId },
+      currentPeriodEnd: { timestampValue: new Date(pastMs).toISOString() }
+    });
+
+    mockRazorpayFaultInjector = (url) => {
+      if (url.includes(subId)) {
+        return new Response(JSON.stringify({ error: { code: "GATEWAY_TIMEOUT" } }), { status: 504 });
+      }
+      return undefined;
+    };
+
+    try {
+      const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({})
+      });
+
+      const res = await worker.fetch(req, mockEnv, {});
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.premium, false, "Immediate response locks expired period");
+
+      // Firestore must NOT be mutated to EXPIRED without authoritative evidence from Razorpay
+      const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+      assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE", "Status doc must remain intact during gateway outage");
+      assert.equal(doc.premium.booleanValue, true);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
+  await test("SEC-SUB-007: reconcileSubscriptionActivation rejects period fallback from mismatched prior subscriptionId", async () => {
+    const uid = "user_sub_boundary_guard_777";
+    const oldSubId = "sub_old_111";
+    const newSubId = "sub_new_222";
+    const pastStartMs = Date.now() - 60 * 86400 * 1000;
+    const pastEndMs = Date.now() - 30 * 86400 * 1000;
+
+    // Prior subscription on account from 30 days ago
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "CANCELLED" },
+      subscriptionId: { stringValue: oldSubId },
+      currentPeriodStart: { timestampValue: new Date(pastStartMs).toISOString() },
+      currentPeriodEnd: { timestampValue: new Date(pastEndMs).toISOString() }
+    });
+
+    // Webhook arrives for new subscription, but current_start / current_end are missing
+    const activationResult = await reconcileSubscriptionActivation(uid, {
+      id: newSubId,
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      updated_at: Math.floor(Date.now() / 1000)
+      // current_start and current_end omitted
+    }, mockEnv, "evt_test_sub_boundary_777");
+
+    assert.equal(activationResult.success, false, "Must fail closed when billing period cannot be established");
+    assert.match(activationResult.message, /Missing authoritative billing period/);
+
+    // Prior doc must not be modified or overwritten with new subscription ID using stale dates
+    const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+    assert.equal(doc.subscriptionId.stringValue, oldSubId);
+  });
+
+  await test("SEC-SUB-008: isEventStale checks Firestore updateTime metadata when updatedAt field is missing", async () => {
+    const uid = "user_stale_update_time_guard";
+    const subId = "sub_update_time_888";
+    const commitTimeIso = "2026-10-15T12:00:00Z";
+    const commitTimeMs = new Date(commitTimeIso).getTime();
+
+    // Document in mockFirestore has updateTime metadata from Firestore REST GET, but no explicit updatedAt field
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: subId }
+    });
+    mockDocUpdateTimes.set(`users/${uid}/subscription/status`, commitTimeIso);
+
+    // An incoming event generated before commitTime must be rejected as stale
+    const isStaleBefore = await reconcileSubscriptionActivation(uid, {
+      id: subId,
+      plan_id: "plan_TdtgehXIhzQ8U9",
+      updated_at: Math.floor((commitTimeMs - 10000) / 1000), // 10 seconds before commitTime
+      current_start: Math.floor(Date.now() / 1000),
+      current_end: Math.floor(Date.now() / 1000) + 30 * 86400
+    }, mockEnv, "evt_stale_before_commit");
+
+    // The webhook handler drops it as stale
+    assert.equal(isStaleBefore.message, "Ignored stale or out-of-order webhook event.");
+  });
+
+  await test("SEC-SUB-009: POST /api/ensure-subscription does not revert to TRIAL during Razorpay outage even if trial is technically active", async () => {
+    const uid = "user_ensure_outage_no_trial_overwrite";
+    const googleSub = "google_sub_outage_no_trial_999";
+    const identityKey = await computeTrialIdentityHash(googleSub, mockEnv.TRIAL_SECRET_KEY);
+    const token = createMockFirebaseIdToken(uid, "refocus-504119", false, googleSub);
+    const pastMs = Date.now() - 1 * 86400 * 1000;
+    const futureTrialMs = Date.now() + 3 * 86400 * 1000; // Trial would still have 3 days left
+    const subId = "sub_outage_no_trial_999";
+
+    mockFirestore.set(`trial_identities/${identityKey}`, {
+      claimedAt: { timestampValue: new Date(Date.now() - 4 * 86400 * 1000).toISOString() },
+      trialEnd: { timestampValue: new Date(futureTrialMs).toISOString() }
+    });
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      subscriptionId: { stringValue: subId },
+      currentPeriodEnd: { timestampValue: new Date(pastMs).toISOString() }
+    });
+
+    mockRazorpayFaultInjector = (url) => {
+      if (url.includes(subId)) {
+        return new Response(JSON.stringify({ error: { code: "GATEWAY_TIMEOUT" } }), { status: 504 });
+      }
+      return undefined;
+    };
+
+    try {
+      const req = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({})
+      });
+
+      const res = await worker.fetch(req, mockEnv, {});
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.premium, false);
+
+      // Crucial: Document in Firestore must NOT have been converted to TRIAL!
+      const doc = mockFirestore.get(`users/${uid}/subscription/status`);
+      assert.equal(doc.subscriptionStatus.stringValue, "ACTIVE", "Must not overwrite paid subscription with TRIAL during gateway outage");
+      assert.equal(doc.subscriptionId.stringValue, subId);
+    } finally {
+      mockRazorpayFaultInjector = null;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // FRESH-INSTALL DATA LOSS PREVENTION & COMPREHENSIVE ENDPOINT SECURITY TESTS
+  // -------------------------------------------------------------------------
+
+  await test("Anti-Data-Loss: POST /api/backup rejects empty dailyRecords when active backup exists", async () => {
+    const uid = "user_fresh_install_anti_loss_1";
+    const token = createMockFirebaseIdToken(uid);
+
+    // 1. User has an active premium entitlement
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() }
+    });
+
+    // 2. User has an existing active backup on the server with 50 historical records
+    mockFirestore.set(`users/${uid}/backup/status`, {
+      status: { stringValue: "SUCCESS" },
+      activeBackupId: { stringValue: "2026-10-01_1_prior_backup" },
+      lastBackupDate: { stringValue: "2026-10-01" },
+      lastBackupTimeMs: { integerValue: (Date.now() - 2 * 86400000).toString() },
+      recordCount: { integerValue: "50" }
+    });
+
+    // 3. User uninstalls & reinstalls. Fresh app sends empty dailyRecords: []
+    const req = new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.1"
+      },
+      body: JSON.stringify({
+        requestId: "req_fresh_install_empty_attempt_1",
+        defaultDailyLimit: 60,
+        dailyRecords: []
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 409, "Must reject empty overwrite of non-empty remote backup with 409 Conflict");
+    const body = await res.json();
+    assert.equal(body.code, "DESTRUCTIVE_EMPTY_BACKUP_REJECTED");
+    assert.equal(body.success, false);
+
+    // Verify remote active backup status was NOT corrupted or overwritten
+    const statusDoc = mockFirestore.get(`users/${uid}/backup/status`);
+    assert.equal(statusDoc.activeBackupId.stringValue, "2026-10-01_1_prior_backup");
+    assert.equal(statusDoc.recordCount.integerValue, "50");
+  });
+
+  await test("Anti-Data-Loss: POST /api/backup rejects all-zero reel counts when active backup exists", async () => {
+    const uid = "user_fresh_install_anti_loss_zeroes";
+    const token = createMockFirebaseIdToken(uid);
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() }
+    });
+
+    mockFirestore.set(`users/${uid}/backup/status`, {
+      status: { stringValue: "SUCCESS" },
+      activeBackupId: { stringValue: "2026-10-01_1_prior_backup_zeroes" },
+      lastBackupDate: { stringValue: "2026-10-01" },
+      lastBackupTimeMs: { integerValue: (Date.now() - 2 * 86400000).toString() },
+      recordCount: { integerValue: "25" }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.2"
+      },
+      body: JSON.stringify({
+        requestId: "req_fresh_install_zeroes_attempt",
+        defaultDailyLimit: 60,
+        dailyRecords: [
+          { dateString: "2026-10-03", count: 0, totalReelsCount: 0 },
+          { dateString: "2026-10-04", count: 0, totalReelsCount: 0 }
+        ]
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, "DESTRUCTIVE_EMPTY_BACKUP_REJECTED");
+  });
+
+  await test("Anti-Data-Loss: POST /api/backup/init rejects totalRecords: 0 when active backup exists", async () => {
+    const uid = "user_fresh_install_anti_loss_init";
+    const token = createMockFirebaseIdToken(uid);
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() }
+    });
+
+    mockFirestore.set(`users/${uid}/backup/status`, {
+      status: { stringValue: "SUCCESS" },
+      activeBackupId: { stringValue: "2026-10-01_1_prior_backup_init" },
+      lastBackupDate: { stringValue: "2026-10-01" },
+      lastBackupTimeMs: { integerValue: (Date.now() - 2 * 86400000).toString() },
+      recordCount: { integerValue: "100" }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/backup/init", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.3"
+      },
+      body: JSON.stringify({
+        requestId: "req_fresh_install_init_zero",
+        totalRecords: 0,
+        totalChunks: 1
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 409);
+    const body = await res.json();
+    assert.equal(body.code, "DESTRUCTIVE_EMPTY_BACKUP_REJECTED");
+  });
+
+  await test("Security: Authenticated POST rejects foreign/mismatched client-supplied UID in body", async () => {
+    const callerUid = "user_genuine_token_owner";
+    const victimUid = "user_victim_target";
+    const token = createMockFirebaseIdToken(callerUid);
+
+    const req = new Request("https://refocus.workers.dev/api/account/status", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "198.51.100.4"
+      }
+    });
+
+    // Valid authenticated token succeeds on own resource
+    const resOwn = await worker.fetch(req, mockEnv, {});
+    assert.equal(resOwn.status, 200);
+
+    // Malicious request supplying victimUid in body
+    const reqMismatched = new Request("https://refocus.workers.dev/api/ensure-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.4"
+      },
+      body: JSON.stringify({
+        uid: victimUid
+      })
+    });
+
+    const resMismatched = await worker.fetch(reqMismatched, mockEnv, {});
+    assert.equal(resMismatched.status, 403, "Must reject body UID mismatch with 403 Forbidden");
+    const body = await resMismatched.json();
+    assert.equal(body.code, "UID_MISMATCH");
+  });
+
+  await test("Security: Unexpected HTTP methods rejected with 405 Method Not Allowed", async () => {
+    const uid = "user_method_test";
+    const token = createMockFirebaseIdToken(uid);
+
+    const getOnBackup = new Request("https://refocus.workers.dev/api/backup", {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "CF-Connecting-IP": "198.51.100.5" }
+    });
+    const res1 = await worker.fetch(getOnBackup, mockEnv, {});
+    assert.equal(res1.status, 405);
+
+    const postOnTime = new Request("https://refocus.workers.dev/api/time", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "198.51.100.5", "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const res2 = await worker.fetch(postOnTime, mockEnv, {});
+    assert.equal(res2.status, 405);
+  });
+
+  await test("Rate Limiting: Exceeding threshold returns 429 with Retry-After header and safe response", async () => {
+    const uid = "user_rate_limit_429_test";
+    const token = createMockFirebaseIdToken(uid);
+
+    // Call /api/backup/abort repeatedly up to limit (20 req / 60s)
+    for (let i = 0; i < 20; i++) {
+      const req = new Request("https://refocus.workers.dev/api/backup/abort", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "CF-Connecting-IP": `198.51.100.10_${i}`
+        },
+        body: JSON.stringify({ reason: "TEST" })
+      });
+      const res = await worker.fetch(req, mockEnv, {});
+      assert.equal(res.status, 200, `Request ${i + 1} should be allowed`);
+    }
+
+    // 21st request should be rate-limited
+    const blockedReq = new Request("https://refocus.workers.dev/api/backup/abort", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.100.11"
+      },
+      body: JSON.stringify({ reason: "TEST" })
+    });
+    const blockedRes = await worker.fetch(blockedReq, mockEnv, {});
+    assert.equal(blockedRes.status, 429);
+    assert.ok(blockedRes.headers.get("Retry-After"), "Must include Retry-After header");
+    const body = await blockedRes.json();
+    assert.equal(body.success, false);
+    assert.ok(body.retryAfter > 0);
+  });
+
+  await test("Anti-Data-Loss: Genuinely new user without remote backup initializes safely", async () => {
+    const uid = "user_genuinely_new_account";
+    const token = createMockFirebaseIdToken(uid);
+
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      premium: { booleanValue: true },
+      planId: { stringValue: "reeltrak_pro_monthly" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() }
+    });
+
+    // Brand new user: NO existing backup status doc in Firestore
+    mockFirestore.delete(`users/${uid}/backup/status`);
+
+    const req = new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.1"
+      },
+      body: JSON.stringify({
+        requestId: "req_new_user_initial_backup",
+        defaultDailyLimit: 60,
+        dailyRecords: [
+          { dateString: "2026-10-09", count: 12, totalReelsCount: 12 }
+        ]
+      })
+    });
+
+    const res = await worker.fetch(req, mockEnv, {});
+    assert.equal(res.status, 200, "Should successfully initialize backup for genuinely new user");
+    const body = await res.json();
+    assert.equal(body.success, true);
+  });
+
+  await test("Rate Limiting: Public endpoints enforce IP rate limiting with Retry-After", async () => {
+    const ip = "203.0.113.88";
+
+    // Exhaust /api/time limit (30 req / 60s)
+    for (let i = 0; i < 30; i++) {
+      const req = new Request("https://refocus.workers.dev/api/time", {
+        method: "GET",
+        headers: { "CF-Connecting-IP": ip }
+      });
+      const res = await worker.fetch(req, mockEnv, {});
+      assert.equal(res.status, 200);
+    }
+
+    // 31st request from same IP must be rate limited
+    const blocked = new Request("https://refocus.workers.dev/api/time", {
+      method: "GET",
+      headers: { "CF-Connecting-IP": ip }
+    });
+    const blockedRes = await worker.fetch(blocked, mockEnv, {});
+    assert.equal(blockedRes.status, 429);
+    assert.ok(blockedRes.headers.get("Retry-After"));
+    const body = await blockedRes.json();
+    assert.ok(body.retryAfter > 0);
+  });
+
+  await test("Rate Limiting: Concurrent requests burst correctly enforces ceiling with 429 and Retry-After", async () => {
+    const uid = "user_concurrent_rate_test";
+    const token = createMockFirebaseIdToken(uid);
+    const ip = "198.51.200.50";
+
+    // Setup active entitlement so business logic would otherwise succeed
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_mock_active" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() },
+      premium: { booleanValue: true }
+    });
+
+    // /api/backup/status limit is 30/min. Fire 35 concurrent requests
+    const promises = [];
+    for (let i = 0; i < 35; i++) {
+      const req = new Request("https://refocus.workers.dev/api/backup/status", {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "CF-Connecting-IP": ip
+        }
+      });
+      promises.push(worker.fetch(req, mockEnv, {}));
+    }
+
+    const responses = await Promise.all(promises);
+    const successCount = responses.filter(r => r.status === 200).length;
+    const rateLimited = responses.filter(r => r.status === 429);
+
+    assert.equal(successCount, 30, "Exactly 30 requests must succeed under 30/min quota");
+    assert.equal(rateLimited.length, 5, "Remaining 5 concurrent requests must be rejected with 429");
+    for (const r of rateLimited) {
+      assert.ok(r.headers.get("Retry-After"), "429 responses must include Retry-After header");
+    }
+  });
+
+  await test("Rate Limiting: Isolate independence vs shared Cloudflare RateLimiter binding", async () => {
+    // 1. Isolate independence: In-memory store without binding is isolate-local
+    const isolate1Store = new Map();
+    const isolate2Store = new Map();
+    isolate1Store.set("test_key", { timestamps: [Date.now(), Date.now()], windowMs: 60000 });
+    assert.equal(isolate2Store.has("test_key"), false, "Isolate 2 store must be completely independent from Isolate 1");
+
+    // 2. Shared Cloudflare RateLimiter binding: Coordinates across isolates when bound
+    let bindingCallCount = 0;
+    const mockRateLimiterBinding = {
+      limit: async ({ key }) => {
+        bindingCallCount++;
+        if (key.includes("blocked")) {
+          return { success: false };
+        }
+        return { success: true };
+      }
+    };
+    const envWithLimiter = { ...mockEnv, RATE_LIMITER: mockRateLimiterBinding };
+
+    const uid = "user_shared_binding_test";
+    const token = createMockFirebaseIdToken(uid);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_mock_active" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() },
+      premium: { booleanValue: true }
+    });
+
+    const req = new Request("https://refocus.workers.dev/api/backup/status", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "CF-Connecting-IP": "198.51.200.75"
+      }
+    });
+    const res = await worker.fetch(req, envWithLimiter, {});
+    assert.equal(res.status, 200);
+    assert.ok(bindingCallCount > 0, "Cloudflare RATE_LIMITER binding must be invoked for shared enforcement");
+  });
+
+  await test("Rate Limiting: Fail-closed 503 on sensitive endpoints when limiter storage fails", async () => {
+    const brokenBinding = {
+      limit: async () => {
+        throw new Error("Cloudflare KV / RateLimiter Storage Outage");
+      }
+    };
+    const envWithBrokenLimiter = { ...mockEnv, RATE_LIMITER: brokenBinding };
+
+    const uid = "user_fail_closed_test";
+    const token = createMockFirebaseIdToken(uid);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_mock_active" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() },
+      premium: { booleanValue: true }
+    });
+
+    // 1. Sensitive endpoint: /api/backup MUST fail closed with 503 Service Unavailable (NEVER fail open)
+    const backupReq = new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.80"
+      },
+      body: JSON.stringify({ requestId: "req_fail_closed_1", dailyRecords: [{ dateString: "2026-10-10", totalReelsCount: 5 }] })
+    });
+    const backupRes = await worker.fetch(backupReq, envWithBrokenLimiter, {});
+    assert.equal(backupRes.status, 503, "Sensitive backup endpoint must fail closed with 503 on limiter failure");
+    const backupJson = await backupRes.json();
+    assert.equal(backupJson.code, "RATE_LIMITER_UNAVAILABLE");
+    assert.ok(backupRes.headers.get("Retry-After"), "503 must include Retry-After header");
+
+    // 2. Sensitive endpoint: /api/create-subscription MUST fail closed with 503
+    const subReq = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.81"
+      },
+      body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+    });
+    const subRes = await worker.fetch(subReq, envWithBrokenLimiter, {});
+    assert.equal(subRes.status, 503, "Payment endpoint must fail closed with 503 on limiter failure");
+
+    // 3. Non-sensitive endpoint: /health gracefully degrades (200)
+    const healthReq = new Request("https://refocus.workers.dev/health", {
+      method: "GET",
+      headers: { "CF-Connecting-IP": "198.51.200.82" }
+    });
+    const healthRes = await worker.fetch(healthReq, envWithBrokenLimiter, {});
+    assert.equal(healthRes.status, 200, "Non-sensitive health check can gracefully degrade");
+  });
+
+  await test("Rate Limiting: Strict per-user isolation prevents noisy neighbor lockout", async () => {
+    const userA = "user_isolation_a";
+    const userB = "user_isolation_b";
+    const tokenA = createMockFirebaseIdToken(userA);
+    const tokenB = createMockFirebaseIdToken(userB);
+
+    for (const u of [userA, userB]) {
+      mockFirestore.set(`users/${u}/subscription/status`, {
+        subscriptionStatus: { stringValue: "ACTIVE" },
+        subscriptionId: { stringValue: "sub_mock_active" },
+        currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() },
+        premium: { booleanValue: true }
+      });
+    }
+
+    // Exhaust userA quota on /api/create-subscription (limit is 5/min)
+    for (let i = 0; i < 5; i++) {
+      const req = new Request("https://refocus.workers.dev/api/create-subscription", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${tokenA}`,
+          "Content-Type": "application/json",
+          "CF-Connecting-IP": `198.51.200.9${i}`
+        },
+        body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+      });
+      await worker.fetch(req, mockEnv, {});
+    }
+
+    // User A's 6th request must be blocked
+    const reqA6 = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${tokenA}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.99"
+      },
+      body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+    });
+    const resA6 = await worker.fetch(reqA6, mockEnv, {});
+    assert.equal(resA6.status, 429, "User A must be rate-limited after 5 requests");
+
+    // User B making a request to the same endpoint must NOT be blocked
+    const reqB1 = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${tokenB}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.100"
+      },
+      body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+    });
+    const resB1 = await worker.fetch(reqB1, mockEnv, {});
+    assert.notEqual(resB1.status, 429, "User B must not be affected by User A's rate limit");
+  });
+
+  await test("Endpoint Security: GET /health and GET /api/time reject non-GET methods with 405", async () => {
+    const postHealth = new Request("https://refocus.workers.dev/health", {
+      method: "POST",
+      headers: { "CF-Connecting-IP": "198.51.200.110" }
+    });
+    const postHealthRes = await worker.fetch(postHealth, mockEnv, {});
+    assert.equal(postHealthRes.status, 405);
+
+    const putTime = new Request("https://refocus.workers.dev/api/time", {
+      method: "PUT",
+      headers: { "CF-Connecting-IP": "198.51.200.111" }
+    });
+    const putTimeRes = await worker.fetch(putTime, mockEnv, {});
+    assert.equal(putTimeRes.status, 405);
+  });
+
+  await test("Rate Limiting: Strict shared rate limiter enforcement fails closed with 503 when binding is missing", async () => {
+    // Environment where shared rate limiting is mandatory but binding was not provisioned
+    const strictEnvMissingBinding = {
+      ...mockEnv,
+      REQUIRE_SHARED_RATE_LIMITER: "true",
+      RATE_LIMITER: undefined
+    };
+
+    const uid = "user_strict_shared_test";
+    const token = createMockFirebaseIdToken(uid);
+    mockFirestore.set(`users/${uid}/subscription/status`, {
+      subscriptionStatus: { stringValue: "ACTIVE" },
+      subscriptionId: { stringValue: "sub_mock_active" },
+      currentPeriodEnd: { timestampValue: new Date(Date.now() + 86400000).toISOString() },
+      premium: { booleanValue: true }
+    });
+
+    // 1. Sensitive route: /api/create-subscription MUST fail closed with 503
+    const subReq = new Request("https://refocus.workers.dev/api/create-subscription", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.120"
+      },
+      body: JSON.stringify({ planId: "plan_TdtgehXIhzQ8U9" })
+    });
+    const subRes = await worker.fetch(subReq, strictEnvMissingBinding, {});
+    assert.equal(subRes.status, 503, "Sensitive endpoint must fail closed when shared limiter binding is missing");
+    const subJson = await subRes.json();
+    assert.equal(subJson.code, "RATE_LIMITER_UNAVAILABLE");
+
+    // 2. Sensitive route: /api/backup MUST fail closed with 503
+    const backupReq = new Request("https://refocus.workers.dev/api/backup", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "198.51.200.121"
+      },
+      body: JSON.stringify({ requestId: "req_strict_1", dailyRecords: [{ dateString: "2026-10-10", totalReelsCount: 3 }] })
+    });
+    const backupRes = await worker.fetch(backupReq, strictEnvMissingBinding, {});
+    assert.equal(backupRes.status, 503, "Backup endpoint must fail closed when shared limiter binding is missing");
+
+    // 3. Non-sensitive route: /health succeeds (200)
+    const healthReq = new Request("https://refocus.workers.dev/health", {
+      method: "GET",
+      headers: { "CF-Connecting-IP": "198.51.200.122" }
+    });
+    const healthRes = await worker.fetch(healthReq, strictEnvMissingBinding, {});
+    assert.equal(healthRes.status, 200, "Health probe can gracefully degrade");
+
+    // 4. Non-sensitive route: /api/time succeeds (200)
+    const timeReq = new Request("https://refocus.workers.dev/api/time", {
+      method: "GET",
+      headers: { "CF-Connecting-IP": "198.51.200.123" }
+    });
+    const timeRes = await worker.fetch(timeReq, strictEnvMissingBinding, {});
+    assert.equal(timeRes.status, 200, "Time sync probe can gracefully degrade");
+  });
+
   console.log(`\n========================================`);
   console.log(`Test Results: ${passed} Passed, ${failed} Failed`);
   if (failed > 0) {
@@ -9212,4 +13573,3 @@ async function runTests() {
 }
 
 runTests();
-
